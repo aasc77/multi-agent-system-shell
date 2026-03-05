@@ -157,6 +157,17 @@ class TaskQueue:
                 return task
         return None
 
+    def get_current_task(self) -> Optional[dict]:
+        """Return the first task with status *in_progress*, or ``None``."""
+        for task in self._tasks:
+            if task["status"] == STATUS_IN_PROGRESS:
+                return task
+        return None
+
+    def get_all_tasks(self) -> list[dict]:
+        """Return a copy of all task dicts."""
+        return list(self._tasks)
+
     def all_done(self) -> bool:
         """Return ``True`` when no tasks are *pending* or *in_progress*."""
         return all(

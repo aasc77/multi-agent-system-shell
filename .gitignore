@@ -13,5 +13,9 @@ venv/
 .vscode/
 .idea/
 
+# Runtime artifacts
+projects/*/.mcp-configs/
+projects/*/orchestrator.log
+
 # OS
 .DS_Store

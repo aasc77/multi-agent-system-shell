@@ -49,25 +49,26 @@ logger.info("MAS Orchestrator starting -- project: %s", args.project)
 logger.info("=" * 50)
 
 # --- Components ---
-# Build a plain dict config for components that expect dict (tmux_comm, lifecycle)
-agents_dict = {name: vars(agent) for name, agent in config.agents.items()}
-sm_config = vars(config.state_machine) if hasattr(config, "state_machine") else {}
-# Convert ConfigNode lists/dicts back to plain types for StateMachine
-if hasattr(sm_config.get("states", None), "__dict__"):
-    sm_config["states"] = vars(sm_config["states"])
-if isinstance(sm_config.get("transitions"), list):
-    sm_config["transitions"] = [
-        vars(t) if hasattr(t, "__dict__") else t for t in sm_config["transitions"]
-    ]
+def to_dict(obj):
+    """Recursively convert ConfigNode objects to plain dicts."""
+    if hasattr(obj, "__dict__") and type(obj).__name__ == "ConfigNode":
+        return {k: to_dict(v) for k, v in vars(obj).items()}
+    if isinstance(obj, list):
+        return [to_dict(item) for item in obj]
+    return obj
 
-nats_config = vars(config.nats) if hasattr(config, "nats") else {}
-tmux_config = vars(config.tmux) if hasattr(config, "tmux") else {}
+
+# Build a plain dict config for components that expect dict (tmux_comm, lifecycle)
+agents_dict = {name: to_dict(agent) for name, agent in config.agents.items()}
+sm_config = to_dict(config.state_machine) if hasattr(config, "state_machine") else {}
+nats_config = to_dict(config.nats) if hasattr(config, "nats") else {}
+tmux_config = to_dict(config.tmux) if hasattr(config, "tmux") else {}
 
 # Plain dict for components
 component_config = {
     "agents": agents_dict,
     "tmux": tmux_config,
-    "tasks": vars(config.tasks) if hasattr(config, "tasks") else {},
+    "tasks": to_dict(config.tasks) if hasattr(config, "tasks") else {},
     "nats": nats_config,
 }
 
@@ -145,6 +146,10 @@ async def main():
     # Start router (subscribes to outbox subjects)
     await router.start()
     logger.info("Message router started -- subscribed to agent outboxes")
+
+    # Wait for agents to connect before publishing first task
+    logger.info("Waiting for agents to connect...")
+    await asyncio.sleep(3)
 
     # Process first task
     result = await lifecycle.process_next_task()

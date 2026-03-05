@@ -138,6 +138,11 @@ class StateMachine:
         transitions = _validate_transitions_present(config)
         _validate_transition_details(transitions, state_names, agents)
 
+    @property
+    def initial_state(self) -> str:
+        """Return the initial state name."""
+        return self._initial
+
     # ------------------------------------------------------------------
     # Trigger handling
     # ------------------------------------------------------------------

@@ -213,7 +213,15 @@ class NatsClient:
         self._require_connected()
         subject = self.outbox_subject(role)
         durable = f"{role}-{_OUTBOX_SUFFIX}"
-        await self._js.subscribe(subject, cb=callback, durable=durable)
+        try:
+            await self._js.subscribe(subject, cb=callback, durable=durable)
+        except Exception:
+            # Consumer may be stale from previous run -- delete and retry
+            try:
+                await self._js.delete_consumer(self._stream_name, durable)
+            except Exception:
+                pass
+            await self._js.subscribe(subject, cb=callback, durable=durable)
 
     async def subscribe_all_outboxes(self, callback: MessageCallback) -> None:
         """Subscribe to every agent's outbox with a durable consumer.

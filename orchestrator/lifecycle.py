@@ -228,20 +228,55 @@ class TaskLifecycleManager:
                 await self._execute_action(transition)
 
     # ------------------------------------------------------------------
+    # Public helpers (used by Console and Router)
+    # ------------------------------------------------------------------
+
+    async def execute_action(self, action: str, action_args: dict, transition: Any) -> None:
+        """Public entry point for the router to execute a transition's action."""
+        await self._execute_action(transition)
+
+        # Check completion rule: return to initial + no assign_to_agent = completed
+        to_state = transition.to_state
+        initial = self._state_machine.initial_state
+
+        if to_state == initial and action != ACTION_ASSIGN_TO_AGENT:
+            if self.current_task is not None:
+                task_id = self.current_task["id"]
+                logger.info("Task %s completed", task_id)
+                self._task_queue.mark_completed(task_id)
+                self._task_queue.save()
+                await self._advance_to_next_task()
+
+    def skip_current_task(self) -> None:
+        """Mark the current task as stuck and clear it."""
+        if self.current_task is None:
+            raise LifecycleError("No active task to skip")
+        task_id = self.current_task["id"]
+        self._task_queue.mark_stuck(task_id)
+        self._task_queue.save()
+        self._state_machine.reset()
+        self.current_task = None
+
+    def get_recent_logs(self, count: int = 10) -> list[str]:
+        """Return recent log entries (placeholder -- reads from log file)."""
+        return []
+
+    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     async def _advance_to_next_task(self) -> None:
-        """Check for all_done, then advance ``current_task`` to the next pending task.
+        """Check for all_done, then start the next pending task.
 
         If all tasks are finished (``completed`` or ``stuck``), sends the
-        ``all_done`` message.  Otherwise sets ``current_task`` to the next
-        pending task, or ``None`` if none remain.
+        ``all_done`` message.  Otherwise resets the state machine and
+        processes the next pending task through the full lifecycle.
         """
         await self._check_all_done()
 
         if not self._task_queue.all_done():
-            self.current_task = self._task_queue.get_next_pending()
+            self._state_machine.reset()
+            await self.process_next_task()
         else:
             self.current_task = None
 
