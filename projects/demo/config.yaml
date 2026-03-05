@@ -7,8 +7,9 @@ agents:
     working_dir: ./workspace
     system_prompt: "You are a writer agent."
   executor:
-    runtime: script
-    command: "python3 agents/echo_agent.py --role executor"
+    runtime: claude_code
+    working_dir: ./workspace
+    system_prompt: "You are an executor agent."
 
 state_machine:
   initial: idle

@@ -308,6 +308,9 @@ ensure_clean_session() {
     echo "Creating new tmux session '$SESSION_NAME'..."
     tmux_cmd new-session -d -s "$SESSION_NAME" -n "$CONTROL_WINDOW" -x 200 -y 50
     tmux_cmd set-option -t "$SESSION_NAME" pane-border-status top
+    # Remove CLAUDECODE env var so claude_code agents can launch in tmux panes
+    tmux_cmd set-environment -g -u CLAUDECODE 2>/dev/null || true
+    tmux_cmd set-environment -t "$SESSION_NAME" -u CLAUDECODE 2>/dev/null || true
 }
 
 ensure_clean_session
@@ -371,7 +374,7 @@ build_launch_command() {
 
     if [ "$runtime" = "$RUNTIME_CLAUDE_CODE" ]; then
         local mcp_config_path="${MCP_DIR}/${agent_name}.json"
-        launch_cmd="claude --mcp-config ${mcp_config_path}"
+        launch_cmd="unset CLAUDECODE; claude --mcp-config ${mcp_config_path}"
     elif [ "$runtime" = "$RUNTIME_SCRIPT" ]; then
         launch_cmd="$command"
     fi
@@ -422,9 +425,13 @@ setup_agent_panes
 # -----------------------------------------------------------------------
 # Finalize: select control window and print success message
 # -----------------------------------------------------------------------
-tmux_cmd select-window -t "${SESSION_NAME}:${CONTROL_WINDOW}"
+tmux_cmd select-window -t "${SESSION_NAME}:${AGENTS_WINDOW}"
 
 echo "Session '$SESSION_NAME' created successfully with ${CONTROL_WINDOW} and ${AGENTS_WINDOW} windows."
-echo "Attach with: tmux attach -t $SESSION_NAME"
 
-exit 0
+# Auto-attach if running in an interactive terminal
+if [ -t 0 ] && [ "$DRY_RUN" != "true" ]; then
+    exec tmux attach -t "$SESSION_NAME"
+else
+    echo "Attach with: tmux attach -t $SESSION_NAME"
+fi

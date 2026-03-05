@@ -2,250 +2,233 @@
  * MCP Stdio Bridge for Claude Code Agents
  *
  * Provides check_messages and send_message tools backed by NATS JetStream.
- * The agent's identity is baked in via AGENT_ROLE env var -- tools are
- * parameterless regarding identity.
+ * The agent's identity is baked in via AGENT_ROLE env var.
  *
  * Requirements: R2 (MCP bridge per agent), R3 (Communication Flow)
+ *
+ * Usage:
+ *   AGENT_ROLE=writer NATS_URL=nats://localhost:4222 node index.js
  */
 
 'use strict';
 
+const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
+const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
+const {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} = require('@modelcontextprotocol/sdk/types.js');
 const nats = require('nats');
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/** NATS subject prefix for all agent communication. */
 const SUBJECT_PREFIX = 'agents';
-
-/** Subject suffixes for inbox / outbox channels. */
 const CHANNEL_INBOX = 'inbox';
 const CHANNEL_OUTBOX = 'outbox';
-
-/** Envelope type used for outbox messages (PRD R3). */
+const STREAM_NAME = 'AGENTS';
 const OUTBOX_MESSAGE_TYPE = 'agent_complete';
 
-/** MCP tool names -- single source of truth for registration & dispatch. */
 const TOOL_CHECK_MESSAGES = 'check_messages';
 const TOOL_SEND_MESSAGE = 'send_message';
-
-/** Error messages. */
-const ERR_MISSING_AGENT_ROLE = 'AGENT_ROLE environment variable is required';
-const ERR_MISSING_NATS_URL = 'NATS_URL environment variable is required';
-const ERR_NOT_CONNECTED = 'Not connected to NATS. Call connect() first.';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Build a fully-qualified NATS subject.
- * @param {string} role   - Agent role (e.g. "writer").
- * @param {string} channel - Channel suffix ("inbox" or "outbox").
- * @returns {string} e.g. "agents.writer.inbox"
- */
 function buildSubject(role, channel) {
   return `${SUBJECT_PREFIX}.${role}.${channel}`;
 }
 
 // ---------------------------------------------------------------------------
-// McpBridge
+// State
 // ---------------------------------------------------------------------------
 
-class McpBridge {
-  /**
-   * Create an MCP bridge instance.
-   *
-   * Reads configuration from environment variables:
-   * - `AGENT_ROLE` (required) -- the agent identity, e.g. "writer"
-   * - `NATS_URL`   (required) -- NATS server URL, e.g. "nats://localhost:4222"
-   * - `WORKSPACE_DIR` (optional) -- working directory, defaults to `process.cwd()`
-   *
-   * @param {object} [opts] - Optional overrides (mainly for testing).
-   * @throws {Error} If AGENT_ROLE or NATS_URL are missing.
-   */
-  constructor(opts = {}) {
-    const agentRole = process.env.AGENT_ROLE;
-    const natsUrl = process.env.NATS_URL;
-    const workspaceDir = process.env.WORKSPACE_DIR || process.cwd();
+const agentRole = process.env.AGENT_ROLE;
+const natsUrl = process.env.NATS_URL;
 
-    if (!agentRole) {
-      throw new Error(ERR_MISSING_AGENT_ROLE);
-    }
-    if (!natsUrl) {
-      throw new Error(ERR_MISSING_NATS_URL);
-    }
+if (!agentRole) {
+  process.stderr.write('Error: AGENT_ROLE environment variable is required\n');
+  process.exit(1);
+}
+if (!natsUrl) {
+  process.stderr.write('Error: NATS_URL environment variable is required\n');
+  process.exit(1);
+}
 
-    /** @type {string} */
-    this.agentRole = agentRole;
-    /** @type {string} */
-    this.natsUrl = natsUrl;
-    /** @type {string} */
-    this.workspaceDir = workspaceDir;
+const inboxSubject = buildSubject(agentRole, CHANNEL_INBOX);
+const outboxSubject = buildSubject(agentRole, CHANNEL_OUTBOX);
+const sc = nats.StringCodec();
 
-    /** @type {string} NATS subject for pulling task assignments. */
-    this.inboxSubject = buildSubject(this.agentRole, CHANNEL_INBOX);
-    /** @type {string} NATS subject for publishing results. */
-    this.outboxSubject = buildSubject(this.agentRole, CHANNEL_OUTBOX);
+let nc = null;
+let js = null;
 
-    /** @private */
-    this._conn = null;
-    /** @private */
-    this._js = null;
-    /** @private */
-    this._sc = nats.StringCodec();
+// ---------------------------------------------------------------------------
+// NATS connection
+// ---------------------------------------------------------------------------
 
-    /**
-     * Maps MCP tool names to their handler methods.
-     * Adding a new tool only requires a new entry here and a corresponding
-     * handler method -- no switch/case to update.
-     * @private
-     * @type {Map<string, function>}
-     */
-    this._toolHandlers = new Map([
-      [TOOL_CHECK_MESSAGES, (params) => this._handleCheckMessages(params)],
-      [TOOL_SEND_MESSAGE, (params) => this._handleSendMessage(params)],
-    ]);
-  }
+async function connectNats() {
+  nc = await nats.connect({ servers: natsUrl });
+  js = nc.jetstream();
+  process.stderr.write(`MCP bridge connected to NATS as "${agentRole}"\n`);
+}
 
-  /**
-   * Returns the list of MCP tool definitions.
-   * @returns {Array<object>} Tool definitions with name, description, and inputSchema.
-   */
-  getTools() {
-    return [
-      {
-        name: TOOL_CHECK_MESSAGES,
-        description: `Pull messages from the agent inbox (${this.inboxSubject})`,
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
-      },
-      {
-        name: TOOL_SEND_MESSAGE,
-        description: `Publish a message to the agent outbox (${this.outboxSubject})`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            content: {
-              type: 'object',
-              description: 'Message content to publish',
-            },
-          },
-          required: ['content'],
-        },
-      },
-    ];
-  }
+// ---------------------------------------------------------------------------
+// Tool: check_messages
+// ---------------------------------------------------------------------------
 
-  /**
-   * Connect to NATS and create a JetStream context.
-   * @throws {Error} If NATS connection fails.
-   */
-  async connect() {
-    this._conn = await nats.connect({ servers: this.natsUrl });
-    this._js = this._conn.jetstream();
-  }
+async function handleCheckMessages() {
+  const durableName = `${agentRole}-${CHANNEL_INBOX}-mcp`;
 
-  /**
-   * Start the MCP stdio server (placeholder for full stdio implementation).
-   * @throws {Error} If NATS connection fails.
-   */
-  async start() {
-    await this.connect();
-  }
+  try {
+    const jsm = await nc.jetstreamManager();
 
-  /**
-   * Dispatch an MCP tool call by name.
-   *
-   * Uses an internal handler map so new tools can be registered without
-   * modifying a switch/case block.
-   *
-   * @param {string} toolName - Name of the MCP tool to invoke.
-   * @param {object} params   - Parameters passed to the tool.
-   * @returns {Promise<any>} Tool-specific result.
-   * @throws {Error} If not connected or tool name is unrecognized.
-   */
-  async handleToolCall(toolName, params) {
-    if (!this._conn) {
-      throw new Error(ERR_NOT_CONNECTED);
+    // Ensure consumer exists
+    try {
+      await jsm.consumers.info(STREAM_NAME, durableName);
+    } catch {
+      await jsm.consumers.add(STREAM_NAME, {
+        durable_name: durableName,
+        filter_subject: inboxSubject,
+        ack_policy: nats.AckPolicy.Explicit,
+      });
     }
 
-    const handler = this._toolHandlers.get(toolName);
-    if (!handler) {
-      throw new Error(`Unknown tool: ${toolName}`);
-    }
-
-    return handler(params);
-  }
-
-  /**
-   * Pull messages from the inbox subject via JetStream subscribe.
-   *
-   * Uses a durable consumer so messages persist across agent restarts
-   * (PRD R3 -- durable consumers).
-   *
-   * @returns {Promise<Array<object>>} Parsed inbox messages.
-   * @private
-   */
-  async _handleCheckMessages() {
-    const durableName = `${this.agentRole}-${CHANNEL_INBOX}`;
-    const sub = await this._js.subscribe(this.inboxSubject, {
-      durable: durableName,
-    });
-
+    const consumer = await js.consumers.get(STREAM_NAME, durableName);
     const messages = [];
-    for await (const msg of sub) {
-      const data = this._sc.decode(msg.data);
-      try {
-        messages.push(JSON.parse(data));
-      } catch {
-        messages.push({ raw: data });
+
+    try {
+      const batch = await consumer.fetch({ max_messages: 20, expires: 2000 });
+      for await (const msg of batch) {
+        const data = sc.decode(msg.data);
+        try {
+          messages.push(JSON.parse(data));
+        } catch {
+          messages.push({ raw: data });
+        }
+        msg.ack();
       }
+    } catch {
+      // fetch can throw if no messages available -- that's fine
     }
 
-    return messages;
-  }
+    if (messages.length === 0) {
+      return { content: [{ type: 'text', text: 'No new messages.' }] };
+    }
 
-  /**
-   * Publish a message to the outbox subject via JetStream.
-   *
-   * Wraps the caller-provided content in the outbox envelope schema
-   * (PRD R3 -- type: "agent_complete") before publishing.
-   *
-   * @param {object} params           - Tool parameters.
-   * @param {object} [params.content] - Message content to publish.
-   * @returns {Promise<{published: boolean, seq: number}>} Publish acknowledgement.
-   * @private
-   */
-  async _handleSendMessage(params) {
-    const content = params.content || {};
-
-    const envelope = {
-      type: OUTBOX_MESSAGE_TYPE,
-      ...content,
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(messages, null, 2),
+      }],
     };
-
-    const payload = this._sc.encode(JSON.stringify(envelope));
-    const ack = await this._js.publish(this.outboxSubject, payload);
-    return { published: true, seq: ack.seq };
-  }
-
-  /**
-   * Process a raw inbox message string.
-   *
-   * Used for detecting special message types like "all_done" (PRD R3).
-   * Note: all_done messages are returned but do NOT trigger outbox responses.
-   *
-   * @param {string} raw - JSON string from the NATS inbox.
-   * @returns {object} Parsed message.
-   * @throws {SyntaxError} If raw is not valid JSON.
-   */
-  processInboxMessage(raw) {
-    return JSON.parse(raw);
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `Error checking messages: ${err.message}` }],
+      isError: true,
+    };
   }
 }
 
-module.exports = { McpBridge };
+// ---------------------------------------------------------------------------
+// Tool: send_message
+// ---------------------------------------------------------------------------
+
+async function handleSendMessage(params) {
+  const content = params.content || {};
+
+  const envelope = {
+    type: OUTBOX_MESSAGE_TYPE,
+    ...content,
+  };
+
+  try {
+    const payload = sc.encode(JSON.stringify(envelope));
+    const ack = await js.publish(outboxSubject, payload);
+    return {
+      content: [{
+        type: 'text',
+        text: `Message published to ${outboxSubject} (seq: ${ack.seq})`,
+      }],
+    };
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `Error publishing message: ${err.message}` }],
+      isError: true,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
+
+const server = new Server(
+  { name: 'mas-bridge', version: '0.1.0' },
+  { capabilities: { tools: {} } },
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: TOOL_CHECK_MESSAGES,
+      description: `Pull messages from the agent inbox (${inboxSubject}). Call this when nudged or to check for new task assignments.`,
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
+    {
+      name: TOOL_SEND_MESSAGE,
+      description: `Publish a message to the agent outbox (${outboxSubject}). Use this to send task results back to the orchestrator.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: {
+            type: 'object',
+            description: 'Message content. Must include "status" (pass/fail) and "summary" fields.',
+            properties: {
+              status: { type: 'string', enum: ['pass', 'fail'] },
+              summary: { type: 'string' },
+            },
+            required: ['status', 'summary'],
+          },
+        },
+        required: ['content'],
+      },
+    },
+  ],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: params } = request.params;
+
+  switch (name) {
+    case TOOL_CHECK_MESSAGES:
+      return handleCheckMessages();
+    case TOOL_SEND_MESSAGE:
+      return handleSendMessage(params || {});
+    default:
+      return {
+        content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+        isError: true,
+      };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
+  await connectNats();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  process.stderr.write(`MCP bridge ready for "${agentRole}"\n`);
+}
+
+main().catch((err) => {
+  process.stderr.write(`MCP bridge fatal error: ${err.message}\n`);
+  process.exit(1);
+});

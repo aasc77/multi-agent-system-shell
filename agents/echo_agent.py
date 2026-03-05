@@ -139,6 +139,8 @@ class EchoAgent:
         summary = f"Echoed task: {task_id} - {title}"
         if description:
             summary += f" ({description})"
+        print(f"  Received task: {task_id} - {title}")
+        print(f"  Responding: agent_complete / pass")
         return {
             _KEY_TYPE: MSG_TYPE_AGENT_COMPLETE,
             _KEY_STATUS: STATUS_PASS,
@@ -177,7 +179,10 @@ class EchoAgent:
         elif msg_type == MSG_TYPE_ALL_DONE:
             self.should_exit = True
             if self._nc is not None:
-                await self._nc.drain()
+                try:
+                    await self._nc.drain()
+                except Exception:
+                    await self._nc.close()
         else:
             logger.debug("Unknown message type '%s', ignoring", msg_type)
 
@@ -195,6 +200,7 @@ class EchoAgent:
             await self.process_message(msg.data)
 
         await nc.subscribe(self.inbox_subject, cb=_on_message)
+        print(f"Echo agent [{self.role}] connected to {self.nats_url}, listening on {self.inbox_subject}")
 
         # Block until should_exit is set
         while not self.should_exit:
