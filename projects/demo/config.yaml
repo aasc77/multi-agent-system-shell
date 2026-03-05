@@ -39,3 +39,19 @@ state_machine:
       trigger: agent_complete
       source_agent: executor
       status: pass
+    - from: waiting_writer
+      to: idle
+      trigger: agent_complete
+      source_agent: writer
+      status: fail
+      action: flag_human
+      action_args:
+        reason: "Writer agent failed"
+    - from: waiting_executor
+      to: idle
+      trigger: agent_complete
+      source_agent: executor
+      status: fail
+      action: flag_human
+      action_args:
+        reason: "Executor agent failed"
