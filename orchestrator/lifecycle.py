@@ -295,7 +295,7 @@ class TaskLifecycleManager:
             if target_agent is not None:
                 msg = self._build_task_assignment_message(action_args)
                 await self._nats_client.publish_to_inbox(target_agent, msg)
-                self._tmux_comm.nudge(target_agent)
+                self._tmux_comm.nudge(target_agent, force=True)
 
     def _build_task_assignment_message(
         self, action_args: dict[str, Any],

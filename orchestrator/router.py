@@ -173,6 +173,11 @@ class MessageRouter:
                 await msg.ack()
                 return
 
+            logger.info(
+                "Transition: %s -> %s (trigger=%s, agent=%s, status=%s)",
+                result.from_state, result.to_state, msg_type, role, status,
+            )
+
             # --- Hand off to lifecycle manager ---
             await self._lifecycle_manager.execute_action(
                 result.action, result.action_args, result

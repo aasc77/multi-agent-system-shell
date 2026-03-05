@@ -128,19 +128,23 @@ class TmuxComm:
         target = self.get_target(agent)
         self._tmux_send_keys(target, text)
 
-    def nudge(self, agent: str) -> bool:
+    def nudge(self, agent: str, force: bool = False) -> bool:
         """Nudge an agent pane with the configured nudge prompt.
 
         Respects per-agent cooldown and safe-nudge checks.  Tracks
         consecutive skips and escalates after ``max_nudge_retries``.
         Claude Code agents skip the busy-check (they queue input).
 
+        Args:
+            agent: Agent name.
+            force: If ``True``, skip cooldown check (used for task assignments).
+
         Returns:
             ``True`` if the nudge was sent, ``False`` if skipped.
         """
         target = self.get_target(agent)
 
-        if self._is_within_cooldown(agent):
+        if not force and self._is_within_cooldown(agent):
             return False
 
         # Claude Code agents handle input queuing -- skip busy check
@@ -250,9 +254,23 @@ class TmuxComm:
 
     @staticmethod
     def _tmux_send_keys(target: str, text: str) -> None:
-        """Low-level wrapper: execute ``tmux send-keys`` with Enter."""
+        """Low-level wrapper: execute ``tmux send-keys`` with Enter.
+
+        Sends text and Enter separately to work with Claude Code's TUI
+        input handler, which may not process them correctly when sent
+        atomically in a single send-keys invocation.
+        """
+        # Send text first
         subprocess.run(
-            ["tmux", "send-keys", "-t", target, text, "Enter"],
+            ["tmux", "send-keys", "-t", target, text],
+            capture_output=True,
+            text=True,
+        )
+        # Brief delay for the TUI to register the text
+        time.sleep(0.3)
+        # Send Enter separately
+        subprocess.run(
+            ["tmux", "send-keys", "-t", target, "Enter"],
             capture_output=True,
             text=True,
         )

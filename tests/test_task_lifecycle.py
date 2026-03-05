@@ -322,7 +322,7 @@ class TestAssignToAgent:
     ):
         """Must nudge the target agent's tmux pane after publishing."""
         await lifecycle.process_next_task()
-        mock_tmux_comm.nudge.assert_called_with("writer")
+        mock_tmux_comm.nudge.assert_called_with("writer", force=True)
 
     @pytest.mark.asyncio
     async def test_nudge_happens_after_nats_publish(
@@ -331,7 +331,7 @@ class TestAssignToAgent:
         """Nudge must happen AFTER the NATS publish, not before."""
         call_order = []
         mock_nats_client.publish_to_inbox.side_effect = lambda *a, **kw: call_order.append("publish")
-        mock_tmux_comm.nudge.side_effect = lambda *a: (call_order.append("nudge"), True)[1]
+        mock_tmux_comm.nudge.side_effect = lambda *a, **kw: (call_order.append("nudge"), True)[1]
         await lifecycle.process_next_task()
         assert call_order.index("publish") < call_order.index("nudge")
 
