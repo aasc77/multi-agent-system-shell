@@ -16,13 +16,51 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# --- Outbox message payload keys (PRD R3 — "Outbox message schema") ---
+_MSG_KEY_TYPE = "type"
+_MSG_KEY_STATUS = "status"
+
+# --- Transition config key (PRD R4) ---
+_KEY_TRIGGER = "trigger"
+
+# --- NATS subject parsing (subject format: agents.<role>.outbox) ---
+_SUBJECT_SEPARATOR = "."
+_SUBJECT_ROLE_INDEX = 1
+_MIN_SUBJECT_PARTS = 2
+_FALLBACK_ROLE = "unknown"
+
+# --- Log message templates ---
+_LOG_UNRECOGNIZED = "Unrecognized outbox message from %s: %s"
+_LOG_NO_MATCHING_TRANSITION = (
+    "No matching transition for %s from %s in state %s"
+)
+_LOG_HANDLER_ERROR = "Error handling message"
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
 
 class RouterError(Exception):
     """Raised when the message router encounters an error."""
 
 
+# ---------------------------------------------------------------------------
+# Message Router
+# ---------------------------------------------------------------------------
+
+
 class MessageRouter:
     """Routes incoming agent outbox messages to the state machine.
+
+    Subscribes to all agent outbox NATS subjects, parses incoming JSON
+    messages, validates required fields, dispatches to the state machine,
+    and hands off transition results to the lifecycle manager.
 
     Args:
         nats_client: NatsClient instance for subscribing to outbox subjects.
@@ -46,9 +84,9 @@ class MessageRouter:
 
         # Build set of known trigger types from transitions
         self._known_triggers: set[str] = {
-            t.get("trigger")
+            t.get(_KEY_TRIGGER)
             for t in state_machine.transitions
-            if t.get("trigger")
+            if t.get(_KEY_TRIGGER)
         }
 
     # ------------------------------------------------------------------
@@ -100,30 +138,21 @@ class MessageRouter:
                 payload = json.loads(msg.data.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 role = self._extract_role(msg.subject)
-                logger.warning(
-                    "Unrecognized outbox message from %s: %s", role, msg.data
-                )
-                await msg.ack()
+                await self._discard_unrecognized(msg, role, msg.data)
                 return
 
             role = self._extract_role(msg.subject)
-            msg_type = payload.get("type")
-            status = payload.get("status")
+            msg_type = payload.get(_MSG_KEY_TYPE)
+            status = payload.get(_MSG_KEY_STATUS)
 
             # --- Validate required fields (missing, empty, or None) ---
             if not msg_type or not status:
-                logger.warning(
-                    "Unrecognized outbox message from %s: %s", role, payload
-                )
-                await msg.ack()
+                await self._discard_unrecognized(msg, role, payload)
                 return
 
             # --- Check if type is a known trigger ---
             if msg_type not in self._known_triggers:
-                logger.warning(
-                    "Unrecognized outbox message from %s: %s", role, payload
-                )
-                await msg.ack()
+                await self._discard_unrecognized(msg, role, payload)
                 return
 
             # --- Dispatch to state machine ---
@@ -136,7 +165,7 @@ class MessageRouter:
             if result is None:
                 # Valid type but no matching transition for current state
                 logger.warning(
-                    "No matching transition for %s from %s in state %s",
+                    _LOG_NO_MATCHING_TRANSITION,
                     msg_type,
                     role,
                     self._state_machine.current_state,
@@ -151,7 +180,7 @@ class MessageRouter:
             await msg.ack()
 
         except Exception:
-            logger.exception("Error handling message")
+            logger.exception(_LOG_HANDLER_ERROR)
             await msg.ack()
 
     # ------------------------------------------------------------------
@@ -159,9 +188,23 @@ class MessageRouter:
     # ------------------------------------------------------------------
 
     @staticmethod
+    async def _discard_unrecognized(
+        msg: Any, role: str, payload_or_data: Any,
+    ) -> None:
+        """Log a warning for an unrecognized message and ACK it.
+
+        This covers three cases (PRD R3 — "Unrecognized messages"):
+        - Invalid JSON (payload_or_data is raw ``msg.data``)
+        - Missing/empty required fields (``type`` or ``status``)
+        - Unknown trigger type not in any transition
+        """
+        logger.warning(_LOG_UNRECOGNIZED, role, payload_or_data)
+        await msg.ack()
+
+    @staticmethod
     def _extract_role(subject: str) -> str:
-        """Extract the agent role from a NATS subject (agents.<role>.outbox)."""
-        parts = subject.split(".")
-        if len(parts) >= 2:
-            return parts[1]
-        return "unknown"
+        """Extract the agent role from a NATS subject (``agents.<role>.outbox``)."""
+        parts = subject.split(_SUBJECT_SEPARATOR)
+        if len(parts) >= _MIN_SUBJECT_PARTS:
+            return parts[_SUBJECT_ROLE_INDEX]
+        return _FALLBACK_ROLE
