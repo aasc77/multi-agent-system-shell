@@ -1,0 +1,16 @@
+{
+  "name": "mas-mcp-bridge",
+  "version": "0.1.0",
+  "description": "MCP stdio bridge for Multi-Agent System Shell",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest --verbose",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "nats": "^2.18.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
