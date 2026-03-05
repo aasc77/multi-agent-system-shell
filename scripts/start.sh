@@ -319,12 +319,22 @@ setup_control_window() {
     # Configure the control window with two panes:
     #   Pane 0: orchestrator process
     #   Pane 1: nats-monitor (horizontal split for side-by-side layout)
+    local nats_subjects="${NATS_URL##*://}"
+    nats_subjects="${nats_subjects%%/*}"
+
     tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" \
-        "echo 'orchestrator: python3 -m orchestrator'" Enter
+        "cd ${ROOT_DIR} && python3 -m orchestrator ${PROJECT}" Enter
 
     tmux_cmd split-window -h -t "${SESSION_NAME}:${CONTROL_WINDOW}"
-    tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" \
-        "echo 'nats-monitor: nats sub agents.>'" Enter
+
+    local monitor_script="${SCRIPT_DIR}/nats-monitor.sh"
+    if [ -f "$monitor_script" ]; then
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" \
+            "bash ${monitor_script}" Enter
+    else
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" \
+            "nats sub 'agents.>'" Enter
+    fi
 }
 
 setup_control_window
