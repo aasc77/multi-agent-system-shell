@@ -6,68 +6,93 @@
 #
 # Usage:
 #   ./scripts/setup-nats.sh
+#
+# Environment variables for testing:
+#   _TEST_DRY_RUN               -- "true" to print commands instead of executing
+#   _TEST_NATS_SERVER_INSTALLED -- "true"/"false" to override nats-server installed check
+#   _TEST_NATS_CLI_INSTALLED    -- "true"/"false" to override nats CLI installed check
+#   _TEST_NATS_RUNNING          -- "true"/"false" to override nats running check
 
 set -euo pipefail
 
-# -----------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------
-readonly NATS_PORT=4222
-readonly NATS_STORE_DIR="/tmp/nats-store"
-readonly NATS_TAP="nats-io/nats-tools"
-readonly NATS_FORMULA="nats-io/nats-tools/nats"
+DRY_RUN="${_TEST_DRY_RUN:-false}"
 
-# -----------------------------------------------------------------------
-# Installation
-# -----------------------------------------------------------------------
-install_nats_server() {
-    # Install nats-server via Homebrew if not already present.
-    if command -v nats-server &>/dev/null; then
-        return
-    fi
-
-    echo "Installing nats-server via brew..."
-    brew install nats-server 2>/dev/null || {
-        echo "Error: Failed to install nats-server" >&2
-        exit 1
-    }
-}
-
-install_nats_cli() {
-    # Install the nats CLI tool via Homebrew if not already present.
-    if command -v nats &>/dev/null; then
-        return
-    fi
-
-    echo "Installing nats CLI via brew..."
-    brew tap "$NATS_TAP" 2>/dev/null || true
-    brew install "$NATS_FORMULA" 2>/dev/null || {
-        echo "Warning: Failed to install nats CLI" >&2
-    }
-}
-
-# -----------------------------------------------------------------------
-# Startup
-# -----------------------------------------------------------------------
-start_nats_server() {
-    # Start NATS with JetStream if not already running.
-    if pgrep -x nats-server &>/dev/null; then
-        echo "NATS server is already running."
-        return
-    fi
-
-    echo "Starting NATS server with JetStream..."
-    nats-server --jetstream --store_dir "$NATS_STORE_DIR" -p "$NATS_PORT" &
-    disown
-    sleep 1
-    echo "NATS server started."
-}
-
-# -----------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------
 echo "Setting up NATS server..."
-install_nats_server
-install_nats_cli
-start_nats_server
+
+# -----------------------------------------------------------------------
+# Check/install nats-server
+# -----------------------------------------------------------------------
+nats_server_installed() {
+    if [ -n "${_TEST_NATS_SERVER_INSTALLED:-}" ]; then
+        [ "$_TEST_NATS_SERVER_INSTALLED" = "true" ]
+        return
+    fi
+    command -v nats-server &>/dev/null
+}
+
+if ! nats_server_installed; then
+    echo "Installing nats-server via brew..."
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[DRY-RUN] brew install nats-server"
+    else
+        brew install nats-server 2>/dev/null || {
+            echo "Error: Failed to install nats-server" >&2
+            exit 1
+        }
+    fi
+else
+    echo "nats-server already installed. Skipping."
+fi
+
+# -----------------------------------------------------------------------
+# Check/install nats CLI
+# -----------------------------------------------------------------------
+nats_cli_installed() {
+    if [ -n "${_TEST_NATS_CLI_INSTALLED:-}" ]; then
+        [ "$_TEST_NATS_CLI_INSTALLED" = "true" ]
+        return
+    fi
+    command -v nats &>/dev/null
+}
+
+if ! nats_cli_installed; then
+    echo "Installing nats CLI via brew..."
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[DRY-RUN] brew tap nats-io/nats-tools"
+        echo "[DRY-RUN] brew install nats-io/nats-tools/nats"
+    else
+        brew tap nats-io/nats-tools 2>/dev/null || true
+        brew install nats-io/nats-tools/nats 2>/dev/null || {
+            echo "Warning: Failed to install nats CLI" >&2
+        }
+    fi
+else
+    echo "nats CLI already installed. Skipping."
+fi
+
+# -----------------------------------------------------------------------
+# Start NATS with JetStream
+# -----------------------------------------------------------------------
+nats_is_running() {
+    if [ -n "${_TEST_NATS_RUNNING:-}" ]; then
+        [ "$_TEST_NATS_RUNNING" = "true" ]
+        return
+    fi
+    pgrep -x nats-server &>/dev/null
+}
+
+if nats_is_running; then
+    echo "NATS server is already running. Skipping start."
+else
+    echo "Starting nats-server with JetStream enabled..."
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[DRY-RUN] nats-server -js --store_dir /tmp/nats-store -p 4222 &"
+    else
+        nats-server -js --store_dir /tmp/nats-store -p 4222 &
+        disown
+        sleep 1
+    fi
+    echo "nats-server started with -js flag."
+fi
+
 echo "NATS setup complete."
