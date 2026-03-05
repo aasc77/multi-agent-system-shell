@@ -8,31 +8,42 @@
 # Usage:
 #   ./scripts/stop.sh <project> [--kill-nats]
 #
+# Options:
+#   --kill-nats  Also stop nats-server process (default: leave running)
+#
 # Environment variables for testing:
 #   _TEST_DRY_RUN        -- "true" to print commands instead of executing
 #   _TEST_SESSION_EXISTS -- "true"/"false" to override tmux session check
 
 set -euo pipefail
 
-ROOT_DIR="$(pwd)"
+# -----------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------
+readonly ROOT_DIR="$(pwd)"
+readonly MCP_CONFIGS_DIR_NAME=".mcp-configs"
+readonly FLAG_KILL_NATS="--kill-nats"
+
 DRY_RUN="${_TEST_DRY_RUN:-false}"
 
 # -----------------------------------------------------------------------
 # Argument validation
 # -----------------------------------------------------------------------
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <project> [--kill-nats]" >&2
+    echo "Usage: $0 <project> [${FLAG_KILL_NATS}]" >&2
     echo "  project: Name of the project directory under projects/" >&2
     exit 1
 fi
 
+# -----------------------------------------------------------------------
 # Parse arguments
+# -----------------------------------------------------------------------
 PROJECT=""
 KILL_NATS=false
 
 for arg in "$@"; do
     case "$arg" in
-        --kill-nats)
+        "${FLAG_KILL_NATS}")
             KILL_NATS=true
             ;;
         *)
@@ -44,14 +55,15 @@ for arg in "$@"; do
 done
 
 if [ -z "$PROJECT" ]; then
-    echo "Usage: $0 <project> [--kill-nats]" >&2
+    echo "Usage: $0 <project> [${FLAG_KILL_NATS}]" >&2
     exit 1
 fi
 
 SESSION_NAME="$PROJECT"
 
 # -----------------------------------------------------------------------
-# Check if session exists
+# session_exists -- Check whether the tmux session is running.
+# Respects _TEST_SESSION_EXISTS env var for testability.
 # -----------------------------------------------------------------------
 session_exists() {
     if [ -n "${_TEST_SESSION_EXISTS:-}" ]; then
@@ -79,7 +91,7 @@ fi
 # -----------------------------------------------------------------------
 # Clean up MCP configs
 # -----------------------------------------------------------------------
-MCP_DIR="${ROOT_DIR}/projects/${PROJECT}/.mcp-configs"
+MCP_DIR="${ROOT_DIR}/projects/${PROJECT}/${MCP_CONFIGS_DIR_NAME}"
 if [ -d "$MCP_DIR" ]; then
     echo "Cleaning up MCP configs at $MCP_DIR..."
     rm -rf "$MCP_DIR"
@@ -87,7 +99,7 @@ if [ -d "$MCP_DIR" ]; then
 fi
 
 # -----------------------------------------------------------------------
-# Kill NATS if --kill-nats flag
+# Kill NATS if --kill-nats flag provided
 # -----------------------------------------------------------------------
 if [ "$KILL_NATS" = true ]; then
     echo "Stopping nats-server..."
