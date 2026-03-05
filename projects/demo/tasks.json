@@ -4,14 +4,14 @@
       "id": "demo-1",
       "title": "Echo test",
       "description": "Test the echo agent functionality",
-      "status": "in_progress",
+      "status": "pending",
       "attempts": 0
     },
     {
       "id": "demo-2",
       "title": "Validate pipeline",
       "description": "Validate the writer-executor pipeline flow",
-      "status": "in_progress",
+      "status": "pending",
       "attempts": 0
     }
   ]
