@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_LOG_ENTRIES = 10
 
+# --- Command names (used as dispatch keys and in help text) ---
 _CMD_STATUS = "status"
 _CMD_TASKS = "tasks"
 _CMD_SKIP = "skip"
@@ -41,6 +42,25 @@ _ALL_COMMANDS = [
     _CMD_LOG,
     _CMD_HELP,
 ]
+
+# --- Response message templates ---
+_MSG_EMPTY_CMD = "Empty command. Type 'help' for available commands."
+_MSG_UNKNOWN_CMD = "Unknown command: '{}'. Type 'help' for available commands."
+_MSG_NO_ACTIVE_TASK = "No active task"
+_MSG_NO_TASKS = "No tasks in queue."
+_MSG_SKIP_OK = "Current task marked as stuck and skipped."
+_MSG_SKIP_FAIL = "Skip failed: {}"
+_MSG_NUDGE_USAGE = "Usage: nudge <agent>. Available agents: {}"
+_MSG_NUDGE_OK = "Nudge sent to {}."
+_MSG_NUDGE_SKIP = "Nudge skipped for {} (agent busy or not ready)."
+_MSG_MSG_USAGE = "Usage: msg <agent> <text>"
+_MSG_MSG_NO_TEXT = "Usage: msg <agent> <text>. No text provided for {}."
+_MSG_MSG_OK = "Message sent to {}."
+_MSG_MSG_BUSY = "Agent {} is busy -- message not sent. Warning: try again later."
+_MSG_TMUX_ERROR = "Error: agent not found or {} failed - {}"
+_MSG_PAUSE_OK = "Outbox processing paused."
+_MSG_RESUME_OK = "Outbox processing resumed."
+_MSG_NO_LOGS = "No log entries."
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +109,19 @@ class Console:
         # Extract agent names from config
         self._agent_names = list(config.get("agents", {}).keys())
 
+        # Build dispatch table once (all handlers are stable bound methods)
+        self._dispatch: dict[str, Any] = {
+            _CMD_STATUS: self._cmd_status,
+            _CMD_TASKS: self._cmd_tasks,
+            _CMD_SKIP: self._cmd_skip,
+            _CMD_NUDGE: self._cmd_nudge,
+            _CMD_MSG: self._cmd_msg,
+            _CMD_PAUSE: self._cmd_pause,
+            _CMD_RESUME: self._cmd_resume,
+            _CMD_LOG: self._cmd_log,
+            _CMD_HELP: self._cmd_help,
+        }
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -106,26 +139,14 @@ class Console:
         """Parse and dispatch a typed command, returning a result string."""
         parts = cmd.strip().split()
         if not parts:
-            return "Empty command. Type 'help' for available commands."
+            return _MSG_EMPTY_CMD
 
         command = parts[0].lower()
         args = parts[1:]
 
-        dispatch = {
-            _CMD_STATUS: self._cmd_status,
-            _CMD_TASKS: self._cmd_tasks,
-            _CMD_SKIP: self._cmd_skip,
-            _CMD_NUDGE: self._cmd_nudge,
-            _CMD_MSG: self._cmd_msg,
-            _CMD_PAUSE: self._cmd_pause,
-            _CMD_RESUME: self._cmd_resume,
-            _CMD_LOG: self._cmd_log,
-            _CMD_HELP: self._cmd_help,
-        }
-
-        handler = dispatch.get(command)
+        handler = self._dispatch.get(command)
         if handler is None:
-            return f"Unknown command: '{command}'. Type 'help' for available commands."
+            return _MSG_UNKNOWN_CMD.format(command)
 
         return handler(args)
 
@@ -146,12 +167,7 @@ class Console:
             "NATS: connected" if self._nats_client.is_connected else "NATS: disconnected"
         )
 
-        if current_task:
-            task_id = current_task.get("id", "unknown")
-            task_title = current_task.get("title", "")
-            task_line = f"Active task: {task_id} - {task_title}"
-        else:
-            task_line = "No active task"
+        task_line = self._format_active_task(current_task)
 
         return (
             f"State: {state}\n"
@@ -164,84 +180,73 @@ class Console:
         """List all tasks with status markers."""
         all_tasks = self._task_queue.get_all_tasks()
         if not all_tasks:
-            return "No tasks in queue."
+            return _MSG_NO_TASKS
 
-        lines = []
-        for task in all_tasks:
-            task_id = task.get("id", "unknown")
-            title = task.get("title", "")
-            status = task.get("status", "unknown")
-            lines.append(f"  [{status}] {task_id} - {title}")
-
+        lines = [
+            f"  [{t.get('status', 'unknown')}] {t.get('id', 'unknown')} - {t.get('title', '')}"
+            for t in all_tasks
+        ]
         return "Tasks:\n" + "\n".join(lines)
 
     def _cmd_skip(self, args: list[str]) -> str:
         """Mark current task as stuck and advance to next pending."""
         try:
             self._lifecycle_manager.skip_current_task()
-            return "Current task marked as stuck and skipped."
+            return _MSG_SKIP_OK
         except Exception as exc:
-            return f"Skip failed: {exc}"
+            return _MSG_SKIP_FAIL.format(exc)
 
     def _cmd_nudge(self, args: list[str]) -> str:
         """Trigger a nudge to the named agent's tmux pane."""
         if not args:
-            return "Usage: nudge <agent>. Available agents: " + ", ".join(self._agent_names)
+            return _MSG_NUDGE_USAGE.format(", ".join(self._agent_names))
 
         agent_name = args[0]
-        try:
-            result = self._tmux_comm.nudge(agent_name)
-            if result:
-                return f"Nudge sent to {agent_name}."
-            else:
-                return f"Nudge skipped for {agent_name} (agent busy or not ready)."
-        except (KeyError, Exception) as exc:
-            return f"Error: agent not found or nudge failed - {exc}"
+        return self._safe_tmux_call(
+            operation="nudge",
+            call=lambda: self._tmux_comm.nudge(agent_name),
+            success_msg=_MSG_NUDGE_OK.format(agent_name),
+            skipped_msg=_MSG_NUDGE_SKIP.format(agent_name),
+        )
 
     def _cmd_msg(self, args: list[str]) -> str:
         """Type text into an agent's pane after safe-nudge check."""
         if not args:
-            return "Usage: msg <agent> <text>"
+            return _MSG_MSG_USAGE
         if len(args) < 2:
-            # Only agent name, no text
-            agent_name = args[0]
-            # Check if there's trailing whitespace that was stripped
-            return f"Usage: msg <agent> <text>. No text provided for {agent_name}."
+            return _MSG_MSG_NO_TEXT.format(args[0])
 
         agent_name = args[0]
         text = " ".join(args[1:])
 
-        try:
-            result = self._tmux_comm.send_msg(agent_name, text)
-            if result:
-                return f"Message sent to {agent_name}."
-            else:
-                return f"Agent {agent_name} is busy -- message not sent. Warning: try again later."
-        except (KeyError, Exception) as exc:
-            return f"Error: agent not found or message failed - {exc}"
+        return self._safe_tmux_call(
+            operation="message",
+            call=lambda: self._tmux_comm.send_msg(agent_name, text),
+            success_msg=_MSG_MSG_OK.format(agent_name),
+            skipped_msg=_MSG_MSG_BUSY.format(agent_name),
+        )
 
     def _cmd_pause(self, args: list[str]) -> str:
         """Pause outbox processing."""
         self._paused = True
-        return "Outbox processing paused."
+        return _MSG_PAUSE_OK
 
     def _cmd_resume(self, args: list[str]) -> str:
         """Resume outbox processing."""
         self._paused = False
-        return "Outbox processing resumed."
+        return _MSG_RESUME_OK
 
     def _cmd_log(self, args: list[str]) -> str:
-        """Show last 10 log entries."""
+        """Show last N log entries (default: 10)."""
         try:
             logs = self._lifecycle_manager.get_recent_logs(_MAX_LOG_ENTRIES)
         except AttributeError:
             logs = []
 
         if not logs:
-            return "No log entries."
+            return _MSG_NO_LOGS
 
-        entries = logs[-_MAX_LOG_ENTRIES:]
-        return "\n".join(entries)
+        return "\n".join(logs[-_MAX_LOG_ENTRIES:])
 
     def _cmd_help(self, args: list[str]) -> str:
         """List all commands with available agent names."""
@@ -259,3 +264,42 @@ class Console:
             "  help            - Show this help message\n"
             f"\nAvailable agents: {agent_list}"
         )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_active_task(task: dict[str, Any] | None) -> str:
+        """Format the active task line for the status display.
+
+        Returns a human-readable string for the current task, or a
+        'no active task' message if *task* is ``None``.
+        """
+        if task:
+            task_id = task.get("id", "unknown")
+            task_title = task.get("title", "")
+            return f"Active task: {task_id} - {task_title}"
+        return _MSG_NO_ACTIVE_TASK
+
+    @staticmethod
+    def _safe_tmux_call(
+        *,
+        operation: str,
+        call: Any,
+        success_msg: str,
+        skipped_msg: str,
+    ) -> str:
+        """Execute a tmux operation with unified error handling.
+
+        Args:
+            operation: Human-readable name (e.g. ``"nudge"``, ``"message"``).
+            call: Zero-arg callable that performs the tmux action.
+            success_msg: Returned when *call* returns a truthy value.
+            skipped_msg: Returned when *call* returns a falsy value.
+        """
+        try:
+            result = call()
+            return success_msg if result else skipped_msg
+        except Exception as exc:
+            return _MSG_TMUX_ERROR.format(operation, exc)

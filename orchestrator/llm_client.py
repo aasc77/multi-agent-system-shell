@@ -10,7 +10,7 @@ Requirements traced to PRD:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
@@ -24,6 +24,16 @@ _DEFAULT_BASE_URL = "http://localhost:11434"
 _DEFAULT_TEMPERATURE = 0.7
 _DEFAULT_DISABLE_THINKING = False
 _API_GENERATE_PATH = "/api/generate"
+_HTTP_OK = 200
+
+# --- Log message templates ---
+_LOG_HEALTH_NON_200 = "LLM health check failed: Ollama returned status %d"
+_LOG_HEALTH_UNREACHABLE = (
+    "LLM health check failed: Ollama unreachable at %s - %s"
+)
+_LOG_QUERY_SKIPPED = "LLM query skipped: LLM is not available / unavailable"
+_LOG_QUERY_FAILED = "LLM query failed: status %d - %s"
+_LOG_QUERY_ERROR = "LLM query error: %s"
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +59,13 @@ class LLMClient:
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
-        self._config = config
-        self._provider = config["provider"]
-        self._model = config["model"]
-        self._base_url = config.get("base_url", _DEFAULT_BASE_URL)
-        self._temperature = config.get("temperature", _DEFAULT_TEMPERATURE)
-        self._disable_thinking = config.get("disable_thinking", _DEFAULT_DISABLE_THINKING)
+        self._provider: str = config["provider"]
+        self._model: str = config["model"]
+        self._base_url: str = config.get("base_url", _DEFAULT_BASE_URL)
+        self._temperature: float = config.get("temperature", _DEFAULT_TEMPERATURE)
+        self._disable_thinking: bool = config.get(
+            "disable_thinking", _DEFAULT_DISABLE_THINKING
+        )
         self._is_available = False
 
     # ------------------------------------------------------------------
@@ -98,67 +109,63 @@ class LLMClient:
     async def health_check(self) -> bool:
         """Check if the Ollama server is reachable.
 
-        Non-fatal: returns True if reachable, False otherwise.
+        Non-fatal: returns ``True`` if reachable, ``False`` otherwise.
         Logs a warning if unreachable. Never raises.
         """
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(self._base_url)
-                if response.status_code == 200:
+                if response.status_code == _HTTP_OK:
                     self._is_available = True
                     return True
-                else:
-                    self._is_available = False
-                    logger.warning(
-                        "LLM health check failed: Ollama returned status %d",
-                        response.status_code,
-                    )
-                    return False
+                self._is_available = False
+                logger.warning(_LOG_HEALTH_NON_200, response.status_code)
+                return False
         except Exception as exc:
             self._is_available = False
-            logger.warning(
-                "LLM health check failed: Ollama unreachable at %s - %s",
-                self._base_url,
-                exc,
-            )
+            logger.warning(_LOG_HEALTH_UNREACHABLE, self._base_url, exc)
             return False
 
     # ------------------------------------------------------------------
     # Query interface
     # ------------------------------------------------------------------
 
-    async def query(self, prompt: str) -> Optional[str]:
+    async def query(self, prompt: str) -> str | None:
         """Send a prompt to the Ollama API and return the response.
 
-        Returns None if the LLM is unavailable or an error occurs.
+        Returns ``None`` if the LLM is unavailable or an error occurs.
         """
         if not self._is_available:
-            logger.warning("LLM query skipped: LLM is not available / unavailable")
+            logger.warning(_LOG_QUERY_SKIPPED)
             return None
 
         try:
             url = f"{self._base_url}{_API_GENERATE_PATH}"
-            payload = {
-                "model": self._model,
-                "prompt": prompt,
-                "temperature": self._temperature,
-                "stream": False,
-            }
+            payload = self._build_query_payload(prompt)
 
             async with httpx.AsyncClient() as client:
                 response = await client.post(url, json=payload)
 
-            if response.status_code != 200:
-                logger.warning(
-                    "LLM query failed: status %d - %s",
-                    response.status_code,
-                    response.text,
-                )
+            if response.status_code != _HTTP_OK:
+                logger.warning(_LOG_QUERY_FAILED, response.status_code, response.text)
                 return None
 
             data = response.json()
             return data.get("response", "")
 
         except Exception as exc:
-            logger.warning("LLM query error: %s", exc)
+            logger.warning(_LOG_QUERY_ERROR, exc)
             return None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _build_query_payload(self, prompt: str) -> dict[str, Any]:
+        """Build the JSON payload for an Ollama ``/api/generate`` request."""
+        return {
+            "model": self._model,
+            "prompt": prompt,
+            "temperature": self._temperature,
+            "stream": False,
+        }
