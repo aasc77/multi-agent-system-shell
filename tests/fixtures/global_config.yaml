@@ -1,0 +1,19 @@
+llm:
+  provider: ollama
+  model: qwen3:8b
+  base_url: http://localhost:11434
+  temperature: 0.3
+  disable_thinking: true
+
+nats:
+  url: nats://localhost:4222
+  stream: AGENTS
+  subjects_prefix: agents
+
+tasks:
+  max_attempts_per_task: 5
+
+tmux:
+  nudge_prompt: "You have new messages. Use check_messages with your role."
+  nudge_cooldown_seconds: 30
+  max_nudge_retries: 20

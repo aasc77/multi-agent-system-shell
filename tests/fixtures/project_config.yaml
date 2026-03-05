@@ -1,0 +1,38 @@
+project: demo
+
+tmux:
+  session_name: demo
+
+agents:
+  writer:
+    runtime: claude_code
+    working_dir: /tmp/demo
+    system_prompt: "You are a writer agent."
+  executor:
+    runtime: script
+    command: "python3 agents/echo_agent.py --role executor"
+
+state_machine:
+  initial: idle
+  states:
+    idle:
+      description: "No active task"
+    waiting_writer:
+      agent: writer
+    waiting_executor:
+      agent: executor
+  transitions:
+    - from: idle
+      to: waiting_writer
+      trigger: task_assigned
+      action: assign_to_agent
+      action_args:
+        target_agent: writer
+    - from: waiting_writer
+      to: waiting_executor
+      trigger: agent_complete
+      source_agent: writer
+      status: pass
+      action: assign_to_agent
+      action_args:
+        target_agent: executor

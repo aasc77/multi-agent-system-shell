@@ -1,0 +1,18 @@
+# Minimal project config - no tmux overrides at all
+# Should inherit all tmux settings from global
+project: minimal
+
+agents:
+  worker:
+    runtime: script
+    command: "echo hello"
+
+state_machine:
+  initial: idle
+  states:
+    idle:
+      description: "No active task"
+  transitions:
+    - from: idle
+      to: idle
+      trigger: task_assigned

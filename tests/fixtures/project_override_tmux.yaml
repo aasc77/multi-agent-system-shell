@@ -1,0 +1,21 @@
+# Project config that overrides only tmux.session_name
+# Should inherit tmux.nudge_prompt and tmux.nudge_cooldown_seconds from global
+project: override-test
+
+tmux:
+  session_name: my-custom-session
+
+agents:
+  writer:
+    runtime: claude_code
+    working_dir: /tmp/test
+
+state_machine:
+  initial: idle
+  states:
+    idle:
+      description: "No active task"
+  transitions:
+    - from: idle
+      to: idle
+      trigger: task_assigned
