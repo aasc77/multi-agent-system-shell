@@ -136,21 +136,20 @@ class TestDemoAgents:
         writer = demo_config_raw["agents"]["writer"]
         assert writer["runtime"] == "claude_code"
 
-    def test_executor_runtime_is_script(self, demo_config_raw):
-        """Executor agent must have runtime 'script'."""
+    def test_executor_runtime_is_claude_code(self, demo_config_raw):
+        """Executor agent must have runtime 'claude_code'."""
         executor = demo_config_raw["agents"]["executor"]
-        assert executor["runtime"] == "script"
+        assert executor["runtime"] == "claude_code"
 
-    def test_executor_command_references_echo_agent(self, demo_config_raw):
-        """Executor command must reference echo_agent.py."""
+    def test_executor_has_working_dir(self, demo_config_raw):
+        """Executor agent should have a working_dir specified."""
         executor = demo_config_raw["agents"]["executor"]
-        assert "command" in executor
-        assert "echo_agent.py" in executor["command"]
+        assert "working_dir" in executor
 
-    def test_executor_command_includes_role_flag(self, demo_config_raw):
-        """Executor command must include --role argument."""
+    def test_executor_has_system_prompt(self, demo_config_raw):
+        """Executor agent should have a system_prompt specified."""
         executor = demo_config_raw["agents"]["executor"]
-        assert "--role" in executor["command"]
+        assert "system_prompt" in executor
 
     def test_writer_has_working_dir(self, demo_config_raw):
         """Writer agent should have a working_dir specified."""

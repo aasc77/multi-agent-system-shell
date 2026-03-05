@@ -349,17 +349,23 @@ tmux_cmd new-window -t "$SESSION_NAME" -n "$AGENTS_WINDOW"
 
 # Extract per-agent details in a single Python call to avoid N+1 invocations.
 # Output format: one JSON object per line, each containing agent config fields.
-AGENT_DETAILS=$(python3 -c "
-import json, sys
+AGENT_DETAILS=$(_ROOT_DIR="$ROOT_DIR" python3 -c "
+import json, sys, os
 
+root_dir = os.environ.get('_ROOT_DIR', '.')
 agents = json.loads(sys.stdin.read())
 for name, cfg in agents.items():
+    wd = cfg.get('working_dir', '')
+    # Resolve relative paths against root_dir
+    if wd and not os.path.isabs(wd):
+        wd = os.path.normpath(os.path.join(root_dir, wd))
     print(json.dumps({
         'name': name,
         'runtime': cfg.get('runtime', ''),
         'command': cfg.get('command', ''),
-        'working_dir': cfg.get('working_dir', ''),
+        'working_dir': wd,
         'ssh_host': cfg.get('ssh_host', ''),
+        'system_prompt': cfg.get('system_prompt', ''),
     }))
 " <<< "$AGENTS_JSON")
 
@@ -370,11 +376,26 @@ build_launch_command() {
     local runtime="$2"
     local command="$3"
     local ssh_host="$4"
+    local working_dir="$5"
+    local system_prompt="$6"
     local launch_cmd=""
 
     if [ "$runtime" = "$RUNTIME_CLAUDE_CODE" ]; then
         local mcp_config_path="${MCP_DIR}/${agent_name}.json"
-        launch_cmd="unset CLAUDECODE; claude --mcp-config ${mcp_config_path}"
+        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message"
+
+        # Build Claude Code command with MCP config and tool permissions
+        launch_cmd="unset CLAUDECODE; claude --mcp-config ${mcp_config_path} --allowedTools ${allowed_tools}"
+
+        # Append system prompt if configured
+        if [ -n "$system_prompt" ]; then
+            launch_cmd="${launch_cmd} --append-system-prompt '${system_prompt}'"
+        fi
+
+        # Prepend cd to working directory if specified
+        if [ -n "$working_dir" ] && [ -d "$working_dir" ]; then
+            launch_cmd="cd ${working_dir} && ${launch_cmd}"
+        fi
     elif [ "$runtime" = "$RUNTIME_SCRIPT" ]; then
         launch_cmd="$command"
     fi
@@ -400,6 +421,8 @@ setup_agent_panes() {
         runtime=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['runtime'])")
         command=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['command'])")
         ssh_host=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['ssh_host'])")
+        working_dir=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['working_dir'])")
+        system_prompt=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['system_prompt'])")
 
         # Create additional panes (first pane already exists with new-window)
         if [ "$pane_idx" -gt 0 ]; then
@@ -408,7 +431,7 @@ setup_agent_panes() {
         fi
 
         local launch_cmd
-        launch_cmd=$(build_launch_command "$name" "$runtime" "$command" "$ssh_host")
+        launch_cmd=$(build_launch_command "$name" "$runtime" "$command" "$ssh_host" "$working_dir" "$system_prompt")
 
         tmux_cmd select-pane -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" -T "$name"
         tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" "$launch_cmd" Enter

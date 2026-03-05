@@ -781,12 +781,13 @@ class TestStuckBehavior:
         mock_task_queue.save.assert_called()
 
     @pytest.mark.asyncio
-    async def test_does_not_reset_state_machine_when_stuck(
+    async def test_does_not_reset_state_machine_when_stuck_and_all_done(
         self, lifecycle, mock_state_machine, mock_task_queue
     ):
-        """Must NOT reset state machine when task is stuck (no retry)."""
+        """Must NOT reset state machine when task is stuck and no tasks remain."""
         lifecycle.current_task = _make_task("task-1", status="in_progress", attempts=4)
         mock_task_queue.is_stuck.return_value = True
+        mock_task_queue.all_done.return_value = True
 
         await lifecycle.handle_unmatched_fail(task_id="task-1")
 

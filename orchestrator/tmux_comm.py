@@ -53,6 +53,9 @@ BUSY_PROCESSES: frozenset[str] = frozenset({
     "node", "python", "python3", "git", "npm", "pytest", "make",
 })
 
+# Runtime type for Claude Code agents (skip busy-check for these)
+_RUNTIME_CLAUDE_CODE = "claude_code"
+
 # Type alias for the escalation callback: receives the stuck agent's name.
 FlagHumanCallback = Callable[[str], None]
 
@@ -86,6 +89,12 @@ class TmuxComm:
         # Build pane mapping: agent_name -> 0-based pane index (config order)
         self._pane_mapping: dict[str, int] = {
             name: idx for idx, name in enumerate(config[_CFG_AGENTS])
+        }
+
+        # Track which agents are claude_code (skip busy-check for them)
+        self._claude_code_agents: set[str] = {
+            name for name, cfg in config[_CFG_AGENTS].items()
+            if isinstance(cfg, dict) and cfg.get("runtime") == _RUNTIME_CLAUDE_CODE
         }
 
         # Per-agent tracking
@@ -124,6 +133,7 @@ class TmuxComm:
 
         Respects per-agent cooldown and safe-nudge checks.  Tracks
         consecutive skips and escalates after ``max_nudge_retries``.
+        Claude Code agents skip the busy-check (they queue input).
 
         Returns:
             ``True`` if the nudge was sent, ``False`` if skipped.
@@ -133,9 +143,11 @@ class TmuxComm:
         if self._is_within_cooldown(agent):
             return False
 
-        if self._is_agent_busy(target):
-            self._record_skip(agent)
-            return False
+        # Claude Code agents handle input queuing -- skip busy check
+        if agent not in self._claude_code_agents:
+            if self._is_agent_busy(target):
+                self._record_skip(agent)
+                return False
 
         # Safe to nudge
         self.send_keys(agent, self._nudge_prompt)

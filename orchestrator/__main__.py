@@ -147,9 +147,9 @@ async def main():
     await router.start()
     logger.info("Message router started -- subscribed to agent outboxes")
 
-    # Wait for agents to connect before publishing first task
-    logger.info("Waiting for agents to connect...")
-    await asyncio.sleep(3)
+    # Wait for agents to initialize (Claude Code needs time to start + connect MCP)
+    logger.info("Waiting for agents to initialize...")
+    await asyncio.sleep(10)
 
     # Process first task
     result = await lifecycle.process_next_task()

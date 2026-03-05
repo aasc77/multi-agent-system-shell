@@ -63,6 +63,20 @@ TWO_AGENT_CONFIG = {
     },
 }
 
+SCRIPT_AGENTS_CONFIG = {
+    "tmux": {
+        "session_name": "demo",
+        "nudge_prompt": "You have new messages. Use check_messages with your role.",
+        "nudge_cooldown_seconds": 30,
+        "max_nudge_retries": 20,
+    },
+    "agents": {
+        "qa": {"runtime": "script", "command": "python3 agent.py --role qa"},
+        "dev": {"runtime": "script", "command": "python3 agent.py --role dev"},
+        "refactor": {"runtime": "script", "command": "python3 agent.py --role refactor"},
+    },
+}
+
 SINGLE_AGENT_CONFIG = {
     "tmux": {
         "session_name": "solo",
@@ -92,6 +106,12 @@ def comm_two():
 def comm_single():
     """Create a TmuxComm instance with 1-agent config."""
     return TmuxComm(SINGLE_AGENT_CONFIG)
+
+
+@pytest.fixture
+def script_comm():
+    """Create a TmuxComm instance with script-only agents (busy-check applies)."""
+    return TmuxComm(SCRIPT_AGENTS_CONFIG)
 
 
 def _mock_pane_command(agent_target, process_name):
@@ -256,32 +276,38 @@ class TestSendKeys:
 
 
 class TestSafeNudging:
-    """Before nudging, TmuxComm must check the foreground process."""
+    """Before nudging, TmuxComm must check the foreground process (script agents)."""
 
     @patch("subprocess.run")
-    def test_nudge_checks_pane_current_command(self, mock_run, comm):
-        """nudge must query #{pane_current_command} before sending."""
+    def test_nudge_checks_pane_current_command(self, mock_run, script_comm):
+        """nudge must query #{pane_current_command} before sending (script agents)."""
         mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
-        comm.nudge("qa")
+        script_comm.nudge("qa")
         # At least one call should contain 'pane_current_command' or 'display-message'
         all_args = str(mock_run.call_args_list)
         assert "pane_current_command" in all_args or "display-message" in all_args
 
     @patch("subprocess.run")
-    def test_nudge_sends_when_foreground_is_claude(self, mock_run, comm):
-        """Nudge must send text when foreground process is 'claude'."""
-        # First call: check command -> claude; Second call: send-keys
+    def test_nudge_sends_when_foreground_is_claude(self, mock_run, script_comm):
+        """Nudge must send text when foreground process is 'claude' (script agents)."""
         mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
-        result = comm.nudge("qa")
+        result = script_comm.nudge("qa")
         assert result is True  # nudge was sent
 
     @patch("subprocess.run")
-    def test_nudge_sends_configured_prompt(self, mock_run, comm):
+    def test_nudge_sends_configured_prompt(self, mock_run, script_comm):
         """Nudge must send the nudge_prompt text from config."""
         mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
-        comm.nudge("qa")
+        script_comm.nudge("qa")
         all_args = str(mock_run.call_args_list)
         assert "You have new messages" in all_args
+
+    @patch("subprocess.run")
+    def test_claude_code_agents_skip_busy_check(self, mock_run, comm):
+        """Claude Code agents must skip busy-check and always nudge."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
+        result = comm.nudge("qa")  # qa is claude_code in SAMPLE_CONFIG
+        assert result is True  # nudge sent despite node foreground
 
 
 # ===========================================================================
@@ -290,62 +316,62 @@ class TestSafeNudging:
 
 
 class TestSkipNudge:
-    """Nudge must be skipped when foreground process is not 'claude'."""
+    """Nudge must be skipped when foreground process is not 'claude' (script agents)."""
 
     @patch("subprocess.run")
-    def test_skip_when_foreground_is_node(self, mock_run, comm):
+    def test_skip_when_foreground_is_node(self, mock_run, script_comm):
         """Must skip nudge when foreground process is 'node'."""
         mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
-        result = comm.nudge("qa")
+        result = script_comm.nudge("qa")
         assert result is False
 
     @patch("subprocess.run")
-    def test_skip_when_foreground_is_python(self, mock_run, comm):
+    def test_skip_when_foreground_is_python(self, mock_run, script_comm):
         """Must skip nudge when foreground process is 'python'."""
         mock_run.return_value = MagicMock(returncode=0, stdout="python\n")
-        result = comm.nudge("qa")
+        result = script_comm.nudge("qa")
         assert result is False
 
     @patch("subprocess.run")
-    def test_skip_when_foreground_is_python3(self, mock_run, comm):
+    def test_skip_when_foreground_is_python3(self, mock_run, script_comm):
         """Must skip nudge when foreground process is 'python3'."""
         mock_run.return_value = MagicMock(returncode=0, stdout="python3\n")
-        result = comm.nudge("qa")
+        result = script_comm.nudge("qa")
         assert result is False
 
     @patch("subprocess.run")
-    def test_skip_when_foreground_is_git(self, mock_run, comm):
+    def test_skip_when_foreground_is_git(self, mock_run, script_comm):
         """Must skip nudge when foreground process is 'git'."""
         mock_run.return_value = MagicMock(returncode=0, stdout="git\n")
-        result = comm.nudge("qa")
+        result = script_comm.nudge("qa")
         assert result is False
 
     @patch("subprocess.run")
-    def test_skip_when_foreground_is_npm(self, mock_run, comm):
+    def test_skip_when_foreground_is_npm(self, mock_run, script_comm):
         """Must skip nudge when foreground process is 'npm'."""
         mock_run.return_value = MagicMock(returncode=0, stdout="npm\n")
-        result = comm.nudge("qa")
+        result = script_comm.nudge("qa")
         assert result is False
 
     @patch("subprocess.run")
-    def test_skip_when_foreground_is_pytest(self, mock_run, comm):
+    def test_skip_when_foreground_is_pytest(self, mock_run, script_comm):
         """Must skip nudge when foreground process is 'pytest'."""
         mock_run.return_value = MagicMock(returncode=0, stdout="pytest\n")
-        result = comm.nudge("qa")
+        result = script_comm.nudge("qa")
         assert result is False
 
     @patch("subprocess.run")
-    def test_skip_when_foreground_is_make(self, mock_run, comm):
+    def test_skip_when_foreground_is_make(self, mock_run, script_comm):
         """Must skip nudge when foreground process is 'make'."""
         mock_run.return_value = MagicMock(returncode=0, stdout="make\n")
-        result = comm.nudge("qa")
+        result = script_comm.nudge("qa")
         assert result is False
 
     @patch("subprocess.run")
-    def test_no_send_keys_when_skipped(self, mock_run, comm):
+    def test_no_send_keys_when_skipped(self, mock_run, script_comm):
         """When nudge is skipped, send-keys must NOT be called."""
         mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
-        comm.nudge("qa")
+        script_comm.nudge("qa")
         # Only the display-message check call should exist, no send-keys
         send_keys_calls = [
             c for c in mock_run.call_args_list
@@ -436,49 +462,49 @@ class TestCooldown:
 
 
 class TestConsecutiveSkipTracking:
-    """TmuxComm must track consecutive skipped nudges per agent."""
+    """TmuxComm must track consecutive skipped nudges per agent (script agents)."""
 
     @patch("subprocess.run")
-    def test_skip_increments_counter(self, mock_run, comm):
+    def test_skip_increments_counter(self, mock_run, script_comm):
         """Each skipped nudge must increment the consecutive skip counter."""
         mock_run.return_value = MagicMock(returncode=0, stdout="python\n")
-        comm.nudge("qa")
-        assert comm.get_consecutive_skips("qa") == 1
+        script_comm.nudge("qa")
+        assert script_comm.get_consecutive_skips("qa") == 1
 
     @patch("subprocess.run")
-    def test_multiple_skips_accumulate(self, mock_run, comm):
+    def test_multiple_skips_accumulate(self, mock_run, script_comm):
         """Multiple skips must accumulate."""
         mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
         # Bypass cooldown by manipulating timestamps
         for i in range(5):
-            comm._last_nudge_time["qa"] = 0  # Reset cooldown
-            comm.nudge("qa")
-        assert comm.get_consecutive_skips("qa") == 5
+            script_comm._last_nudge_time["qa"] = 0  # Reset cooldown
+            script_comm.nudge("qa")
+        assert script_comm.get_consecutive_skips("qa") == 5
 
     @patch("subprocess.run")
-    def test_successful_nudge_resets_counter(self, mock_run, comm):
+    def test_successful_nudge_resets_counter(self, mock_run, script_comm):
         """A successful nudge must reset the consecutive skip counter to 0."""
         # First: accumulate some skips
         mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
         for i in range(3):
-            comm._last_nudge_time["qa"] = 0
-            comm.nudge("qa")
-        assert comm.get_consecutive_skips("qa") == 3
+            script_comm._last_nudge_time["qa"] = 0
+            script_comm.nudge("qa")
+        assert script_comm.get_consecutive_skips("qa") == 3
 
         # Then: successful nudge
         mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
-        comm._last_nudge_time["qa"] = 0
-        comm.nudge("qa")
-        assert comm.get_consecutive_skips("qa") == 0
+        script_comm._last_nudge_time["qa"] = 0
+        script_comm.nudge("qa")
+        assert script_comm.get_consecutive_skips("qa") == 0
 
     @patch("subprocess.run")
-    def test_skip_counter_is_per_agent(self, mock_run, comm):
+    def test_skip_counter_is_per_agent(self, mock_run, script_comm):
         """Skip counters must be independent per agent."""
         mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
-        comm._last_nudge_time["qa"] = 0
-        comm.nudge("qa")
-        assert comm.get_consecutive_skips("qa") == 1
-        assert comm.get_consecutive_skips("dev") == 0
+        script_comm._last_nudge_time["qa"] = 0
+        script_comm.nudge("qa")
+        assert script_comm.get_consecutive_skips("qa") == 1
+        assert script_comm.get_consecutive_skips("dev") == 0
 
     @patch("subprocess.run")
     def test_initial_skip_count_is_zero(self, mock_run, comm):
@@ -506,7 +532,7 @@ class TestEscalation:
                 "nudge_cooldown_seconds": 0,  # No cooldown for test
                 "max_nudge_retries": 3,
             },
-            "agents": {"writer": {"runtime": "claude_code"}},
+            "agents": {"writer": {"runtime": "script", "command": "echo"}},
         }
         comm = TmuxComm(config)
         mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
@@ -530,7 +556,7 @@ class TestEscalation:
                 "nudge_cooldown_seconds": 0,
                 "max_nudge_retries": 5,
             },
-            "agents": {"writer": {"runtime": "claude_code"}},
+            "agents": {"writer": {"runtime": "script", "command": "echo"}},
         }
         comm = TmuxComm(config)
         mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
@@ -553,7 +579,7 @@ class TestEscalation:
                 "nudge_cooldown_seconds": 0,
                 "max_nudge_retries": 2,
             },
-            "agents": {"myagent": {"runtime": "claude_code"}},
+            "agents": {"myagent": {"runtime": "script", "command": "echo"}},
         }
         comm = TmuxComm(config)
         mock_run.return_value = MagicMock(returncode=0, stdout="git\n")
@@ -578,7 +604,7 @@ class TestEscalation:
                 "nudge_cooldown_seconds": 0,
                 "max_nudge_retries": 2,
             },
-            "agents": {"writer": {"runtime": "claude_code"}},
+            "agents": {"writer": {"runtime": "script", "command": "echo"}},
         }
         comm = TmuxComm(config)
         mock_run.return_value = MagicMock(returncode=0, stdout="npm\n")
@@ -605,7 +631,7 @@ class TestEscalation:
                 "nudge_cooldown_seconds": 0,
                 "max_nudge_retries": 2,
             },
-            "agents": {"writer": {"runtime": "claude_code"}},
+            "agents": {"writer": {"runtime": "script", "command": "echo"}},
         }
         comm = TmuxComm(config)
         mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
@@ -629,7 +655,7 @@ class TestEscalation:
                 "nudge_cooldown_seconds": 0,
                 "max_nudge_retries": 2,
             },
-            "agents": {"writer": {"runtime": "claude_code"}},
+            "agents": {"writer": {"runtime": "script", "command": "echo"}},
         }
         comm = TmuxComm(config)
 
@@ -796,12 +822,12 @@ class TestEdgeCases:
         assert isinstance(result, bool)
 
     @patch("subprocess.run")
-    def test_tmux_command_failure_handled(self, mock_run, comm):
+    def test_tmux_command_failure_handled(self, mock_run, script_comm):
         """If tmux command fails (non-zero exit), TmuxComm should handle gracefully."""
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="session not found")
         # Should not crash -- either return False or raise TmuxCommError
         try:
-            result = comm.nudge("qa")
+            result = script_comm.nudge("qa")
             assert result is False
         except TmuxCommError:
             pass  # Also acceptable
