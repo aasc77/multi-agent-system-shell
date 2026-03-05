@@ -1,0 +1,17 @@
+# Worktrees (agent-specific checkouts)
+.worktrees/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
