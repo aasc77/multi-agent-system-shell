@@ -1,0 +1,107 @@
+project: remote-test
+tmux:
+  session_name: remote-test
+
+nats:
+  url: nats://192.168.1.25:4222
+
+agents:
+  local1:
+    runtime: claude_code
+    working_dir: ./workspace
+    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+  remote1:
+    runtime: claude_code
+    ssh_host: dgx@192.168.1.51
+    remote_working_dir: ~/mas-workspace
+    remote_bridge_path: ~/mas-bridge/index.js
+    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+  remote2:
+    runtime: claude_code
+    ssh_host: angelserrano@192.168.1.31
+    remote_working_dir: ~/mas-workspace
+    remote_bridge_path: ~/mas-bridge/index.js
+    remote_node_path: ~/local/bin/node
+    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+  local2:
+    runtime: claude_code
+    working_dir: ./workspace
+    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+
+state_machine:
+  initial: idle
+  states:
+    idle: { description: "No active task" }
+    waiting_local1: { agent: local1 }
+    waiting_remote1: { agent: remote1 }
+    waiting_remote2: { agent: remote2 }
+    waiting_local2: { agent: local2 }
+  transitions:
+    - from: idle
+      to: waiting_local1
+      trigger: task_assigned
+      action: assign_to_agent
+      action_args: { target_agent: local1 }
+
+    - from: waiting_local1
+      to: waiting_remote1
+      trigger: agent_complete
+      source_agent: local1
+      status: pass
+      action: assign_to_agent
+      action_args: { target_agent: remote1 }
+
+    - from: waiting_remote1
+      to: waiting_remote2
+      trigger: agent_complete
+      source_agent: remote1
+      status: pass
+      action: assign_to_agent
+      action_args: { target_agent: remote2 }
+
+    - from: waiting_remote2
+      to: waiting_local2
+      trigger: agent_complete
+      source_agent: remote2
+      status: pass
+      action: assign_to_agent
+      action_args: { target_agent: local2 }
+
+    - from: waiting_local2
+      to: idle
+      trigger: agent_complete
+      source_agent: local2
+      status: pass
+
+    # Failures
+    - from: waiting_local1
+      to: idle
+      trigger: agent_complete
+      source_agent: local1
+      status: fail
+      action: flag_human
+      action_args: { reason: "local1 failed" }
+
+    - from: waiting_remote1
+      to: idle
+      trigger: agent_complete
+      source_agent: remote1
+      status: fail
+      action: flag_human
+      action_args: { reason: "remote1 failed" }
+
+    - from: waiting_remote2
+      to: idle
+      trigger: agent_complete
+      source_agent: remote2
+      status: fail
+      action: flag_human
+      action_args: { reason: "remote2 failed" }
+
+    - from: waiting_local2
+      to: idle
+      trigger: agent_complete
+      source_agent: local2
+      status: fail
+      action: flag_human
+      action_args: { reason: "local2 failed" }

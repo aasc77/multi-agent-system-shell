@@ -1,0 +1,77 @@
+project: collab
+tmux:
+  session_name: collab
+agents:
+  agent1:
+    runtime: claude_code
+    working_dir: ./workspace
+    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+  agent2:
+    runtime: claude_code
+    working_dir: ./workspace
+    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+  agent3:
+    runtime: claude_code
+    working_dir: ./workspace
+    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+
+state_machine:
+  initial: idle
+  states:
+    idle: { description: "No active task" }
+    waiting_agent1: { agent: agent1 }
+    waiting_agent2: { agent: agent2 }
+    waiting_agent3: { agent: agent3 }
+  transitions:
+    - from: idle
+      to: waiting_agent1
+      trigger: task_assigned
+      action: assign_to_agent
+      action_args: { target_agent: agent1 }
+
+    - from: waiting_agent1
+      to: waiting_agent2
+      trigger: agent_complete
+      source_agent: agent1
+      status: pass
+      action: assign_to_agent
+      action_args: { target_agent: agent2 }
+
+    - from: waiting_agent2
+      to: waiting_agent3
+      trigger: agent_complete
+      source_agent: agent2
+      status: pass
+      action: assign_to_agent
+      action_args: { target_agent: agent3 }
+
+    - from: waiting_agent3
+      to: idle
+      trigger: agent_complete
+      source_agent: agent3
+      status: pass
+
+    # Any fail goes back to idle (triggers retry via attempt counter)
+    - from: waiting_agent1
+      to: idle
+      trigger: agent_complete
+      source_agent: agent1
+      status: fail
+      action: flag_human
+      action_args: { reason: "agent1 failed" }
+
+    - from: waiting_agent2
+      to: idle
+      trigger: agent_complete
+      source_agent: agent2
+      status: fail
+      action: flag_human
+      action_args: { reason: "agent2 failed" }
+
+    - from: waiting_agent3
+      to: idle
+      trigger: agent_complete
+      source_agent: agent3
+      status: fail
+      action: flag_human
+      action_args: { reason: "agent3 failed" }

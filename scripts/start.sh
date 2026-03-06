@@ -188,6 +188,8 @@ generate_mcp_configs() {
     # Generate per-agent MCP config files (.json) for each claude_code agent.
     # Each config wires the MCP bridge with the agent's role, NATS URL,
     # and workspace directory.
+    # For remote agents (ssh_host set), uses remote_bridge_path and
+    # remote_working_dir from config; copies the MCP config to the remote.
     python3 -c "
 import json, os, sys
 
@@ -200,18 +202,41 @@ bridge_rel_path = os.environ['_MCP_BRIDGE_REL_PATH']
 server_name = os.environ['_MCP_SERVER_NAME']
 runtime_claude = os.environ['_RUNTIME_CLAUDE_CODE']
 
-bridge_path = os.path.join(root_dir, bridge_rel_path)
+local_bridge_path = os.path.join(root_dir, bridge_rel_path)
+_home_cache = {}
 
 for agent_name, agent_cfg in agents.items():
     if agent_cfg.get('runtime', '') != runtime_claude:
         continue
 
-    working_dir = agent_cfg.get('working_dir', project_dir)
+    ssh_host = agent_cfg.get('ssh_host', '')
+    is_remote = bool(ssh_host)
 
+    if is_remote:
+        # Resolve ~ to absolute path (node doesn't expand ~ in args)
+        # Query remote home dir via SSH (cached per host to avoid repeated calls)
+        ssh_host = agent_cfg.get('ssh_host', '')
+        if ssh_host not in _home_cache:
+            import subprocess
+            result = subprocess.run(
+                ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'IdentitiesOnly=yes',
+                 '-o', 'ConnectTimeout=5', ssh_host, 'echo ~'],
+                capture_output=True, text=True, timeout=10
+            )
+            _home_cache[ssh_host] = result.stdout.strip() or '/home/' + (ssh_host.split('@')[0] if '@' in ssh_host else ssh_host)
+        home_dir = _home_cache[ssh_host]
+        bridge_path = agent_cfg.get('remote_bridge_path', '~/mas-bridge/index.js').replace('~', home_dir)
+        working_dir = agent_cfg.get('remote_working_dir', '~/mas-workspace').replace('~', home_dir)
+        node_cmd = agent_cfg.get('remote_node_path', 'node').replace('~', home_dir)
+    else:
+        bridge_path = local_bridge_path
+        working_dir = agent_cfg.get('working_dir', project_dir)
+
+    cmd = node_cmd if is_remote else 'node'
     mcp_config = {
         'mcpServers': {
             server_name: {
-                'command': 'node',
+                'command': cmd,
                 'args': [bridge_path],
                 'env': {
                     'AGENT_ROLE': agent_name,
@@ -225,18 +250,39 @@ for agent_name, agent_cfg in agents.items():
     config_path = os.path.join(mcp_dir, f'{agent_name}.json')
     with open(config_path, 'w') as f:
         json.dump(mcp_config, f, indent=2)
+
+    # Print remote agents for shell to scp configs
+    if is_remote:
+        print(f'{agent_name}|{ssh_host}|{config_path}')
 "
 }
 
-_AGENTS_JSON="$AGENTS_JSON" \
-_MCP_DIR="$MCP_DIR" \
-_PROJECT_DIR="$PROJECT_DIR" \
-_NATS_URL="$NATS_URL" \
-_ROOT_DIR="$ROOT_DIR" \
-_MCP_BRIDGE_REL_PATH="$MCP_BRIDGE_REL_PATH" \
-_MCP_SERVER_NAME="$MCP_SERVER_NAME" \
-_RUNTIME_CLAUDE_CODE="$RUNTIME_CLAUDE_CODE" \
-generate_mcp_configs
+REMOTE_AGENTS=$( \
+    _AGENTS_JSON="$AGENTS_JSON" \
+    _MCP_DIR="$MCP_DIR" \
+    _PROJECT_DIR="$PROJECT_DIR" \
+    _NATS_URL="$NATS_URL" \
+    _ROOT_DIR="$ROOT_DIR" \
+    _MCP_BRIDGE_REL_PATH="$MCP_BRIDGE_REL_PATH" \
+    _MCP_SERVER_NAME="$MCP_SERVER_NAME" \
+    _RUNTIME_CLAUDE_CODE="$RUNTIME_CLAUDE_CODE" \
+    generate_mcp_configs \
+)
+
+# Copy MCP configs to remote hosts
+if [ -n "$REMOTE_AGENTS" ]; then
+    while IFS='|' read -r agent_name ssh_host config_path; do
+        [ -z "$agent_name" ] && continue
+        remote_config_dir="~/.mas-mcp-configs"
+        if [ "${_TEST_DRY_RUN:-false}" = "true" ]; then
+            echo "[DRY-RUN] scp ${config_path} ${ssh_host}:${remote_config_dir}/${agent_name}.json"
+        else
+            ssh -n -o StrictHostKeyChecking=no -o IdentitiesOnly=yes "$ssh_host" "mkdir -p ${remote_config_dir}" 2>/dev/null
+            scp -o StrictHostKeyChecking=no -o IdentitiesOnly=yes "$config_path" "${ssh_host}:${remote_config_dir}/${agent_name}.json" 2>/dev/null
+            echo "Copied MCP config for ${agent_name} to ${ssh_host}:${remote_config_dir}/${agent_name}.json"
+        fi
+    done <<< "$REMOTE_AGENTS"
+fi
 
 # -----------------------------------------------------------------------
 # NATS auto-start
@@ -307,7 +353,11 @@ ensure_clean_session() {
 
     echo "Creating new tmux session '$SESSION_NAME'..."
     tmux_cmd new-session -d -s "$SESSION_NAME" -n "$CONTROL_WINDOW" -x 200 -y 50
-    tmux_cmd set-option -t "$SESSION_NAME" pane-border-status top
+    tmux_cmd set-option -g pane-border-status top
+    tmux_cmd set-option -g pane-border-format ' #{@label} '
+    tmux_cmd set-option -g pane-border-lines heavy
+    tmux_cmd set-option -g allow-set-title off
+    tmux_cmd set-option -t "$SESSION_NAME" mouse on
     # Remove CLAUDECODE env var so claude_code agents can launch in tmux panes
     tmux_cmd set-environment -g -u CLAUDECODE 2>/dev/null || true
     tmux_cmd set-environment -t "$SESSION_NAME" -u CLAUDECODE 2>/dev/null || true
@@ -366,35 +416,54 @@ for name, cfg in agents.items():
         'working_dir': wd,
         'ssh_host': cfg.get('ssh_host', ''),
         'system_prompt': cfg.get('system_prompt', ''),
+        'remote_working_dir': cfg.get('remote_working_dir', ''),
+        'remote_node_path': cfg.get('remote_node_path', ''),
     }))
 " <<< "$AGENTS_JSON")
 
 build_launch_command() {
     # Build the tmux send-keys command for a given agent based on its
     # runtime type (claude_code or script) and optional SSH host.
+    # Remote claude_code agents use ~/.mas-mcp-configs/<name>.json and
+    # remote_working_dir from config.
     local agent_name="$1"
     local runtime="$2"
     local command="$3"
     local ssh_host="$4"
     local working_dir="$5"
     local system_prompt="$6"
+    local remote_working_dir="$7"
+    local remote_node_path="$8"
     local launch_cmd=""
 
     if [ "$runtime" = "$RUNTIME_CLAUDE_CODE" ]; then
-        local mcp_config_path="${MCP_DIR}/${agent_name}.json"
         local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message"
 
-        # Build Claude Code command with MCP config and tool permissions
-        launch_cmd="unset CLAUDECODE; claude --mcp-config ${mcp_config_path} --allowedTools ${allowed_tools}"
+        if [ -n "$ssh_host" ]; then
+            # Remote agent: use remote paths, pass settings inline to skip onboarding prompts
+            local mcp_config_path="~/.mas-mcp-configs/${agent_name}.json"
+            local wd="${remote_working_dir:-~/mas-workspace}"
+            # Prepend custom node path's directory to PATH if specified
+            local path_prefix=""
+            if [ -n "$remote_node_path" ]; then
+                local node_dir
+                node_dir=$(dirname "$remote_node_path")
+                path_prefix="export PATH=${node_dir}:\$PATH && "
+            fi
+            launch_cmd="${path_prefix}cd ${wd} && unset CLAUDECODE; claude --dangerously-skip-permissions --strict-mcp-config --settings '{\"skipDangerousModePermissionPrompt\":true}' --mcp-config ${mcp_config_path} --allowedTools ${allowed_tools}"
+        else
+            # Local agent: use local paths
+            local mcp_config_path="${MCP_DIR}/${agent_name}.json"
+            launch_cmd="unset CLAUDECODE; claude --dangerously-skip-permissions --strict-mcp-config --mcp-config ${mcp_config_path} --allowedTools ${allowed_tools}"
+            # Prepend cd to working directory if specified
+            if [ -n "$working_dir" ] && [ -d "$working_dir" ]; then
+                launch_cmd="cd ${working_dir} && ${launch_cmd}"
+            fi
+        fi
 
         # Append system prompt if configured
         if [ -n "$system_prompt" ]; then
             launch_cmd="${launch_cmd} --append-system-prompt '${system_prompt}'"
-        fi
-
-        # Prepend cd to working directory if specified
-        if [ -n "$working_dir" ] && [ -d "$working_dir" ]; then
-            launch_cmd="cd ${working_dir} && ${launch_cmd}"
         fi
     elif [ "$runtime" = "$RUNTIME_SCRIPT" ]; then
         launch_cmd="$command"
@@ -402,7 +471,11 @@ build_launch_command() {
 
     # Prepend SSH wrapper if remote host is specified
     if [ -n "$ssh_host" ]; then
-        launch_cmd="ssh ${ssh_host} '${launch_cmd}'"
+        # Use double quotes for SSH to avoid nested single-quote conflicts
+        # (e.g., --append-system-prompt uses single quotes internally)
+        # Use -t to force TTY allocation (required for Claude Code's interactive TUI)
+        local escaped_cmd="${launch_cmd//\"/\\\"}"
+        launch_cmd="ssh -t -o StrictHostKeyChecking=no -o IdentitiesOnly=yes ${ssh_host} \"${escaped_cmd}\""
     fi
 
     echo "$launch_cmd"
@@ -416,13 +489,15 @@ setup_agent_panes() {
     while IFS= read -r agent_line; do
         [ -z "$agent_line" ] && continue
 
-        local name runtime command working_dir ssh_host
+        local name runtime command working_dir ssh_host remote_working_dir
         name=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['name'])")
         runtime=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['runtime'])")
         command=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['command'])")
         ssh_host=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['ssh_host'])")
         working_dir=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['working_dir'])")
         system_prompt=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['system_prompt'])")
+        remote_working_dir=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['remote_working_dir'])")
+        remote_node_path=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['remote_node_path'])")
 
         # Create additional panes (first pane already exists with new-window)
         if [ "$pane_idx" -gt 0 ]; then
@@ -431,9 +506,17 @@ setup_agent_panes() {
         fi
 
         local launch_cmd
-        launch_cmd=$(build_launch_command "$name" "$runtime" "$command" "$ssh_host" "$working_dir" "$system_prompt")
+        launch_cmd=$(build_launch_command "$name" "$runtime" "$command" "$ssh_host" "$working_dir" "$system_prompt" "$remote_working_dir" "$remote_node_path")
 
-        tmux_cmd select-pane -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" -T "$name"
+        # Build pane title: "agent_name (host)" for remote, "agent_name (local)" for local
+        local pane_title="$name"
+        if [ -n "$ssh_host" ]; then
+            local host_label="${ssh_host#*@}"  # strip user@ prefix, keep IP/hostname
+            pane_title="$name ($host_label)"
+        else
+            pane_title="$name (local)"
+        fi
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" @label "$pane_title"
         tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" "$launch_cmd" Enter
 
         pane_idx=$((pane_idx + 1))

@@ -1,0 +1,18 @@
+{
+  "tasks": [
+    {
+      "id": "collab-1",
+      "title": "Summarize this project",
+      "description": "Read the README.md and prd.md files and write a one-paragraph summary of what this project does.",
+      "status": "completed",
+      "attempts": 0
+    },
+    {
+      "id": "collab-2",
+      "title": "List all Python modules",
+      "description": "List every .py file under orchestrator/ and describe what each one does in one sentence.",
+      "status": "completed",
+      "attempts": 0
+    }
+  ]
+}
