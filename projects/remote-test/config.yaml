@@ -6,102 +6,81 @@ nats:
   url: nats://192.168.1.25:4222
 
 agents:
-  local1:
+  hub:
     runtime: claude_code
     working_dir: ./workspace
-    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
-  remote1:
+    system_prompt: "You are a collaborator agent on the Mac hub. Complete the assigned task and report results via send_message."
+  dgx:
     runtime: claude_code
     ssh_host: dgx@192.168.1.51
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
-    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
-  remote2:
+    system_prompt: "You are a collaborator agent on the DGX server. Complete the assigned task and report results via send_message."
+  macmini:
     runtime: claude_code
     ssh_host: angelserrano@192.168.1.31
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
     remote_node_path: ~/local/bin/node
-    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
-  local2:
-    runtime: claude_code
-    working_dir: ./workspace
-    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+    system_prompt: "You are a collaborator agent on the Mac Mini. Complete the assigned task and report results via send_message."
 
 state_machine:
   initial: idle
   states:
     idle: { description: "No active task" }
-    waiting_local1: { agent: local1 }
-    waiting_remote1: { agent: remote1 }
-    waiting_remote2: { agent: remote2 }
-    waiting_local2: { agent: local2 }
+    waiting_hub: { agent: hub }
+    waiting_dgx: { agent: dgx }
+    waiting_macmini: { agent: macmini }
   transitions:
     - from: idle
-      to: waiting_local1
+      to: waiting_hub
       trigger: task_assigned
       action: assign_to_agent
-      action_args: { target_agent: local1 }
+      action_args: { target_agent: hub }
 
-    - from: waiting_local1
-      to: waiting_remote1
+    - from: waiting_hub
+      to: waiting_dgx
       trigger: agent_complete
-      source_agent: local1
+      source_agent: hub
       status: pass
       action: assign_to_agent
-      action_args: { target_agent: remote1 }
+      action_args: { target_agent: dgx }
 
-    - from: waiting_remote1
-      to: waiting_remote2
+    - from: waiting_dgx
+      to: waiting_macmini
       trigger: agent_complete
-      source_agent: remote1
+      source_agent: dgx
       status: pass
       action: assign_to_agent
-      action_args: { target_agent: remote2 }
+      action_args: { target_agent: macmini }
 
-    - from: waiting_remote2
-      to: waiting_local2
-      trigger: agent_complete
-      source_agent: remote2
-      status: pass
-      action: assign_to_agent
-      action_args: { target_agent: local2 }
-
-    - from: waiting_local2
+    - from: waiting_macmini
       to: idle
       trigger: agent_complete
-      source_agent: local2
+      source_agent: macmini
       status: pass
 
     # Failures
-    - from: waiting_local1
+    - from: waiting_hub
       to: idle
       trigger: agent_complete
-      source_agent: local1
+      source_agent: hub
       status: fail
       action: flag_human
-      action_args: { reason: "local1 failed" }
+      action_args: { reason: "hub failed" }
 
-    - from: waiting_remote1
+    - from: waiting_dgx
       to: idle
       trigger: agent_complete
-      source_agent: remote1
+      source_agent: dgx
       status: fail
       action: flag_human
-      action_args: { reason: "remote1 failed" }
+      action_args: { reason: "dgx failed" }
 
-    - from: waiting_remote2
+    - from: waiting_macmini
       to: idle
       trigger: agent_complete
-      source_agent: remote2
+      source_agent: macmini
       status: fail
       action: flag_human
-      action_args: { reason: "remote2 failed" }
-
-    - from: waiting_local2
-      to: idle
-      trigger: agent_complete
-      source_agent: local2
-      status: fail
-      action: flag_human
-      action_args: { reason: "local2 failed" }
+      action_args: { reason: "macmini failed" }

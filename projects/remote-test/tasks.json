@@ -4,7 +4,7 @@
       "id": "rt-1",
       "title": "Cross-machine test",
       "description": "Test that tasks flow through local and remote agents correctly.",
-      "status": "in_progress",
+      "status": "pending",
       "attempts": 0
     }
   ]

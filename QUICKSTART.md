@@ -114,6 +114,20 @@ mkdir -p projects/my-project
 | `scripts/stop.sh <project>` | Graceful shutdown |
 | `scripts/reset-tasks.sh <project>` | Reset all task statuses to pending |
 | `scripts/nats-monitor.sh` | Live stream of all NATS messages |
+| `scripts/reset-demo.sh [project]` | Full reset: kill tmux + NATS stream + tasks + logs |
+
+## Clean Start (Recommended)
+
+If things are in a weird state, do a full reset before starting:
+
+```bash
+cd ~/Repositories/multi-agent-system-shell
+bash scripts/reset-demo.sh demo
+bash scripts/start.sh demo
+tmux attach -t demo
+```
+
+The writer agent will be at the Claude Code trust prompt. Switch to the agents window (`Ctrl-b 1`), select the writer pane, and press Enter to accept.
 
 ## Troubleshooting
 
@@ -122,3 +136,9 @@ mkdir -p projects/my-project
 **Ollama not responding**: Run `ollama serve` in another terminal.
 
 **Agent not picking up messages**: Try `nudge <agent>` in the orchestrator pane.
+
+**Orchestrator exits immediately**: Stale NATS consumers. Run `bash scripts/reset-demo.sh demo` for a clean slate.
+
+**CLAUDECODE env var leak**: If agents behave oddly, tmux may have inherited CLAUDECODE from a parent Claude Code session. `reset-demo.sh` clears this, or manually: `tmux set-environment -g -u CLAUDECODE`
+
+**Stale NATS consumers**: If you see "consumer is already bound" errors, run `bash scripts/reset-demo.sh demo` which deletes the AGENTS stream entirely.
