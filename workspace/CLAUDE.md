@@ -14,10 +14,40 @@ You are an agent in a multi-agent orchestrator system. You communicate with the 
 
 - **check_messages** — Pull pending messages from your inbox. Call this whenever you are nudged or at the start of your session.
 - **send_message** — Send results back to the orchestrator. Content must include `status` ("pass" or "fail") and `summary`.
+- **send_to_agent** — Send a direct message to another agent. Parameters: `target_agent` (e.g. "hub", "dgx", "macmini") and `message` (text). The target agent will be nudged automatically.
 
 ## Important
 
 - When you see "You have new messages", **immediately** call `check_messages`
 - After completing work, **always** call `send_message` with status `pass` or `fail`
-- For this demo, the tasks are simple echo/validation tasks — just acknowledge them and report pass
+- To communicate with other agents directly, use `send_to_agent` with the agent name and your message
 - Do NOT wait for additional instructions after receiving a task — process it and respond immediately
+
+## PiKVM Remote Control — Lessons Learned
+
+### Architecture: Brain / Eyes / Hands
+- **Claude (Brain)** — decides what to do, why, and in what order
+- **UI-TARS (Eyes)** — via `vision_query`, looks at the screen and returns native pixel coordinates of UI elements
+- **PiKVM (Hands)** — executes clicks, keystrokes, mouse moves via MCP tools
+
+### Always use `vision_query` to locate UI elements
+- **Never guess coordinates** from the scaled-down screenshot image. The screenshot displayed is smaller than the native 1920x1080 resolution.
+- Always call `vision_query` with a prompt like "Where is the Save button?" to get accurate native coordinates before clicking.
+- Flow: `vision_query` → get coordinates → `click(x, y)`
+
+### UI-TARS coordinate space
+- UI-TARS returns coordinates in the image's **native pixel space** (e.g., 1920x1080), NOT a 1000x1000 normalized grid.
+- Use coordinates directly — do not apply `normalize_to_native()` (that causes double-scaling errors).
+
+### Save As dialog safety rules
+- **NEVER use Ctrl+A in a Save As dialog** — it selects all files in the file browser pane, not the filename text field. Combined with Delete, this can mass-delete files.
+- The filename field has focus by default when Save As opens — just type the path directly.
+- Use `%USERPROFILE%\Desktop` in the address bar to navigate to Desktop (resolves username automatically).
+- Press Enter instead of clicking Save — more reliable via remote control.
+- Avoid any keyboard shortcuts that could affect the file list pane (Ctrl+A, Delete, etc.).
+
+### General remote control best practices
+- Use the address bar with environment variables (`%USERPROFILE%`) instead of hardcoding usernames.
+- Prefer `press_key("enter")` over clicking buttons when possible — more reliable.
+- `type_text` sends literal characters — it does NOT interpret `<enter>` as a keypress. Use `press_key("enter")` separately.
+- For opening apps: `vision_query` to find Search → click → type app name → `press_key("enter")`
