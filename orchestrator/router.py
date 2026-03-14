@@ -62,10 +62,15 @@ class MessageRouter:
     messages, validates required fields, dispatches to the state machine,
     and hands off transition results to the lifecycle manager.
 
+    Also watches agent inboxes for ``agent_message`` types (sent via the
+    ``send_to_agent`` MCP tool) and nudges the target agent's tmux pane
+    so it knows to call ``check_messages``.
+
     Args:
         nats_client: NatsClient instance for subscribing to outbox subjects.
         state_machine: StateMachine instance for handling triggers/transitions.
         lifecycle_manager: TaskLifecycleManager for executing actions.
+        tmux_comm: TmuxComm instance for nudging agent panes.
         agents: Dict of agent definitions (name -> agent config).
     """
 
@@ -75,10 +80,12 @@ class MessageRouter:
         state_machine: Any,
         lifecycle_manager: Any,
         agents: dict[str, Any],
+        tmux_comm: Any = None,
     ) -> None:
         self._nats_client = nats_client
         self._state_machine = state_machine
         self._lifecycle_manager = lifecycle_manager
+        self._tmux_comm = tmux_comm
         self._agents = agents
         self._paused = False
 
@@ -111,8 +118,10 @@ class MessageRouter:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Subscribe to all agent outbox subjects."""
+        """Subscribe to all agent outbox and inbox subjects."""
         await self._nats_client.subscribe_all_outboxes(self.handle_message)
+        if self._tmux_comm is not None:
+            await self._nats_client.subscribe_all_inboxes(self._handle_inbox_relay)
 
     # ------------------------------------------------------------------
     # Message handling
@@ -213,3 +222,36 @@ class MessageRouter:
         if len(parts) >= _MIN_SUBJECT_PARTS:
             return parts[_SUBJECT_ROLE_INDEX]
         return _FALLBACK_ROLE
+
+    # ------------------------------------------------------------------
+    # Inbox relay: nudge agents on agent-to-agent messages
+    # ------------------------------------------------------------------
+
+    async def _handle_inbox_relay(self, msg: Any) -> None:
+        """Watch inbox messages for ``agent_message`` type and nudge the target.
+
+        This enables agent-to-agent communication: when agent A uses
+        ``send_to_agent`` to message agent B, the orchestrator sees the
+        message land in B's inbox and nudges B's tmux pane so it calls
+        ``check_messages``.
+
+        Non-``agent_message`` types (e.g. ``task_assignment``) are ignored
+        since the orchestrator already handles those via its own nudge path.
+        """
+        try:
+            payload = json.loads(msg.data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            await msg.ack()
+            return
+
+        if payload.get(_MSG_KEY_TYPE) != "agent_message":
+            await msg.ack()
+            return
+
+        target_role = self._extract_role(msg.subject)
+        sender = payload.get("from", "unknown")
+        logger.info(
+            "Relaying nudge to %s (agent_message from %s)", target_role, sender,
+        )
+        self._tmux_comm.nudge(target_role, force=True)
+        await msg.ack()

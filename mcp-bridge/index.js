@@ -32,6 +32,7 @@ const OUTBOX_MESSAGE_TYPE = 'agent_complete';
 
 const TOOL_CHECK_MESSAGES = 'check_messages';
 const TOOL_SEND_MESSAGE = 'send_message';
+const TOOL_SEND_TO_AGENT = 'send_to_agent';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -161,6 +162,46 @@ async function handleSendMessage(params) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool: send_to_agent
+// ---------------------------------------------------------------------------
+
+async function handleSendToAgent(params) {
+  const targetAgent = params.target_agent;
+  const message = params.message || '';
+
+  if (!targetAgent) {
+    return {
+      content: [{ type: 'text', text: 'Error: target_agent is required' }],
+      isError: true,
+    };
+  }
+
+  const targetInbox = buildSubject(targetAgent, CHANNEL_INBOX);
+  const envelope = {
+    type: 'agent_message',
+    from: agentRole,
+    message,
+    timestamp: new Date().toISOString(),
+  };
+
+  try {
+    const payload = sc.encode(JSON.stringify(envelope));
+    const ack = await js.publish(targetInbox, payload);
+    return {
+      content: [{
+        type: 'text',
+        text: `Message sent to ${targetAgent} via ${targetInbox} (seq: ${ack.seq})`,
+      }],
+    };
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `Error sending to ${targetAgent}: ${err.message}` }],
+      isError: true,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
@@ -177,6 +218,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {},
+      },
+    },
+    {
+      name: TOOL_SEND_TO_AGENT,
+      description: 'Send a direct message to another agent by name. The message lands in their inbox immediately.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          target_agent: {
+            type: 'string',
+            description: 'Name of the target agent (e.g. "hub", "dgx", "macmini")',
+          },
+          message: {
+            type: 'string',
+            description: 'The message to send',
+          },
+        },
+        required: ['target_agent', 'message'],
       },
     },
     {
@@ -209,6 +268,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return handleCheckMessages();
     case TOOL_SEND_MESSAGE:
       return handleSendMessage(params || {});
+    case TOOL_SEND_TO_AGENT:
+      return handleSendToAgent(params || {});
     default:
       return {
         content: [{ type: 'text', text: `Unknown tool: ${name}` }],

@@ -9,20 +9,20 @@ agents:
   hub:
     runtime: claude_code
     working_dir: ./workspace
-    system_prompt: "You are a collaborator agent on the Mac hub. Complete the assigned task and report results via send_message."
+    system_prompt: "You are a collaborator agent on the Mac hub. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, or macmini) and message. When nudged, always call check_messages first."
   dgx:
     runtime: claude_code
     ssh_host: dgx@192.168.1.51
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
-    system_prompt: "You are a collaborator agent on the DGX server. Complete the assigned task and report results via send_message."
+    system_prompt: "You are a collaborator agent on the DGX server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, or macmini) and message. When nudged, always call check_messages first."
   macmini:
     runtime: claude_code
     ssh_host: angelserrano@192.168.1.31
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
     remote_node_path: ~/local/bin/node
-    system_prompt: "You are a collaborator agent on the Mac Mini. Complete the assigned task and report results via send_message."
+    system_prompt: "You are a collaborator agent on the Mac Mini. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, or macmini) and message. When nudged, always call check_messages first."
 
 state_machine:
   initial: idle
@@ -32,12 +32,14 @@ state_machine:
     waiting_dgx: { agent: dgx }
     waiting_macmini: { agent: macmini }
   transitions:
+    # Task starts at hub
     - from: idle
       to: waiting_hub
       trigger: task_assigned
       action: assign_to_agent
       action_args: { target_agent: hub }
 
+    # Hub completes → DGX picks up (with hub's output)
     - from: waiting_hub
       to: waiting_dgx
       trigger: agent_complete
@@ -46,6 +48,7 @@ state_machine:
       action: assign_to_agent
       action_args: { target_agent: dgx }
 
+    # DGX completes → Mac Mini picks up (with all prior output)
     - from: waiting_dgx
       to: waiting_macmini
       trigger: agent_complete
@@ -54,33 +57,17 @@ state_machine:
       action: assign_to_agent
       action_args: { target_agent: macmini }
 
+    # Mac Mini completes → done
     - from: waiting_macmini
       to: idle
       trigger: agent_complete
       source_agent: macmini
       status: pass
 
-    # Failures
-    - from: waiting_hub
+    # Any agent fails → flag human
+    - from: "*"
       to: idle
       trigger: agent_complete
-      source_agent: hub
       status: fail
       action: flag_human
-      action_args: { reason: "hub failed" }
-
-    - from: waiting_dgx
-      to: idle
-      trigger: agent_complete
-      source_agent: dgx
-      status: fail
-      action: flag_human
-      action_args: { reason: "dgx failed" }
-
-    - from: waiting_macmini
-      to: idle
-      trigger: agent_complete
-      source_agent: macmini
-      status: fail
-      action: flag_human
-      action_args: { reason: "macmini failed" }
+      action_args: { reason: "agent failed task" }

@@ -160,6 +160,16 @@ cd /path/to/multi-agent-system-shell
 python3 -m pytest tests/ -v
 ```
 
+## Vision Inference (DGX)
+
+Fara-7B runs on the DGX Spark via vLLM, with Magentic-UI for browser automation.
+
+- **vLLM API:** `http://192.168.1.51:5000/v1/chat/completions`
+- **Models:** `http://192.168.1.51:5000/v1/models`
+- **Magentic-UI:** port 8080 on DGX
+- **Quickstart:** [docs/QUICKSTART-DGX.md](docs/QUICKSTART-DGX.md)
+- **Ops status:** `bash scripts/ops-status.sh dgx`
+
 ## License
 
 MIT

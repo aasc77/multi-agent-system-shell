@@ -437,7 +437,7 @@ build_launch_command() {
     local launch_cmd=""
 
     if [ "$runtime" = "$RUNTIME_CLAUDE_CODE" ]; then
-        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message"
+        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent"
 
         if [ -n "$ssh_host" ]; then
             # Remote agent: use remote paths, pass settings inline to skip onboarding prompts
