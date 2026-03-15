@@ -1,17 +1,10 @@
 {
   "tasks": [
     {
-      "id": "fara-1",
-      "title": "Deploy Fara-7B + Magentic-UI on DGX",
-      "description": "Run the full deployment: 1) HF token is already at ~/.config/huggingface/token. 2) Run 'bash ~/mas-workspace/scripts/dgx/setup-vllm.sh' to pull the vLLM image and start Fara-7B on port 5000. 3) Wait for vLLM healthcheck: curl http://localhost:5000/v1/models (may take several minutes for model to load). 4) Run 'bash ~/mas-workspace/scripts/dgx/setup-magentic-ui.sh' to install Magentic-UI. 5) Run 'bash ~/mas-workspace/scripts/dgx/manage-magentic-ui.sh start'. 6) Run 'bash ~/mas-workspace/scripts/dgx/smoke-test.sh' and report results.",
-      "status": "completed",
-      "attempts": 0
-    },
-    {
-      "id": "chain-1",
-      "title": "3-node system health check",
-      "description": "Collaborative health check across all 3 nodes. Hub: collect your local system info (hostname, OS, uptime, node/python versions) and report it. DGX: collect your system info (hostname, GPU name, Docker containers running, vLLM status via 'curl -s http://localhost:5000/v1/models | head -c 100') and report it along with what hub reported. Mac Mini: collect your system info (hostname, OS, uptime) and compile a final summary of ALL 3 nodes into your report.",
-      "status": "completed",
+      "id": "test-1",
+      "title": "4-node ping test",
+      "description": "Simple connectivity test across all 4 nodes. Each agent should report its hostname, OS, and uptime, then pass the chain along. Hub starts, DGX adds its info, Mac Mini adds its info, Hassio compiles the final report of all 4 nodes.",
+      "status": "in_progress",
       "attempts": 0
     }
   ]
