@@ -9,26 +9,26 @@ agents:
   hub:
     runtime: claude_code
     working_dir: ./workspace
-    system_prompt: "You are a collaborator agent on the Mac hub. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, macmini, or hassio) and message. When nudged, always call check_messages first."
+    system_prompt: "You are a collaborator agent on the Mac hub. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, macmini, or hassio) and message. When nudged, always call check_messages first. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them."
   dgx:
     runtime: claude_code
     ssh_host: dgx@192.168.1.51
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
-    system_prompt: "You are a collaborator agent on the DGX server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, macmini, or hassio) and message. When nudged, always call check_messages first."
+    system_prompt: "You are a collaborator agent on the DGX server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, macmini, or hassio) and message. When nudged, always call check_messages first. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them."
   macmini:
     runtime: claude_code
     ssh_host: angelserrano@192.168.1.44
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
     remote_node_path: ~/local/bin/node
-    system_prompt: "You are a collaborator agent on the Mac Mini. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, macmini, or hassio) and message. When nudged, always call check_messages first."
+    system_prompt: "You are a collaborator agent on the Mac Mini. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, macmini, or hassio) and message. When nudged, always call check_messages first. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them."
   hassio:
     runtime: claude_code
     ssh_host: hassio@192.168.1.50
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
-    system_prompt: "You are a collaborator agent on the Hassio server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, macmini, or hassio) and message. When nudged, always call check_messages first."
+    system_prompt: "You are a collaborator agent on the Hassio server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, macmini, or hassio) and message. When nudged, always call check_messages first. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them."
 
 state_machine:
   initial: idle

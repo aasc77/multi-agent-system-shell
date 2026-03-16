@@ -62,6 +62,7 @@ Type these in the orchestrator pane:
 | `tasks` | List all tasks with status |
 | `nudge <agent>` | Manually nudge an agent |
 | `msg <agent> TEXT` | Send text to an agent's pane |
+| `img <file> [agent]` | Share file to workspaces and notify agent |
 | `skip` | Skip current stuck task |
 | `pause` / `resume` | Pause/resume polling |
 | `log` | Show last 10 log entries |
@@ -105,6 +106,29 @@ mkdir -p projects/my-project
 
 4. Launch: `./scripts/start.sh my-project`
 
+## Sharing Images/Files with Agents
+
+From the orchestrator pane, use the `img` command to distribute a file to all agent workspaces and notify a specific agent:
+
+```
+img ~/Screenshots/bug.png hub
+```
+
+Without an agent name, it targets the currently active agent:
+
+```
+img ~/diagram.png
+```
+
+From the shell (outside the orchestrator):
+
+```bash
+cd ~/Repositories/multi-agent-system-shell
+./scripts/share-file.sh remote-test ~/Screenshots/bug.png
+```
+
+Files land in `shared/<filename>` in each agent's workspace. Agents can view them with their Read tool.
+
 ## Utility Scripts
 
 | Script | Purpose |
@@ -113,6 +137,7 @@ mkdir -p projects/my-project
 | `scripts/start.sh <project>` | Launch tmux session with all agents |
 | `scripts/stop.sh <project>` | Graceful shutdown |
 | `scripts/reset-tasks.sh <project>` | Reset all task statuses to pending |
+| `scripts/share-file.sh <project> <file>` | Distribute file to all agent workspaces |
 | `scripts/nats-monitor.sh` | Live stream of all NATS messages |
 | `scripts/reset-demo.sh [project]` | Full reset: kill tmux + NATS stream + tasks + logs |
 

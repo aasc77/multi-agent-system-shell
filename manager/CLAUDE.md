@@ -146,6 +146,7 @@ The orchestrator accepts these interactive commands (type in the ORCH tmux pane)
 | `skip` | Mark current task stuck, advance to next |
 | `nudge <agent>` | Send nudge prompt to agent's tmux pane |
 | `msg <agent> <text>` | Send custom text to agent's tmux pane |
+| `img <file> [agent]` | Share file to all workspaces and notify agent |
 | `pause` | Stop processing agent responses |
 | `resume` | Resume processing |
 | `log` | Show recent log entries |
