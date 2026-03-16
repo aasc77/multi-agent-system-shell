@@ -386,9 +386,10 @@ ensure_clean_session
 # Control window: orchestrator + nats-monitor (side-by-side)
 # -----------------------------------------------------------------------
 setup_control_window() {
-    # Configure the control window with two panes:
+    # Configure the control window with panes:
     #   Pane 0: orchestrator process
     #   Pane 1: nats-monitor (horizontal split for side-by-side layout)
+    #   Pane 2: manager agent (bottom, if configured -- autonomous monitor)
     local nats_subjects="${NATS_URL##*://}"
     nats_subjects="${nats_subjects%%/*}"
 
@@ -404,6 +405,38 @@ setup_control_window() {
     else
         tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" \
             "nats sub 'agents.>'" Enter
+    fi
+
+    # Launch manager agent in the control window if configured
+    local has_manager
+    has_manager=$(python3 -c "
+import json, sys
+agents = json.loads(sys.stdin.read())
+mgr = agents.get('manager', {})
+if mgr.get('role') == 'monitor' and mgr.get('runtime') == 'claude_code':
+    print('yes')
+else:
+    print('no')
+" <<< "$AGENTS_JSON")
+
+    if [ "$has_manager" = "yes" ]; then
+        tmux_cmd split-window -v -t "${SESSION_NAME}:${CONTROL_WINDOW}.0"
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "manager (monitor)"
+
+        local mcp_config_path="${MCP_DIR}/manager.json"
+        local manager_prompt
+        manager_prompt=$(python3 -c "
+import json, sys
+agents = json.loads(sys.stdin.read())
+print(agents.get('manager', {}).get('system_prompt', ''))
+" <<< "$AGENTS_JSON")
+
+        local manager_cmd="cd ${ROOT_DIR} && unset CLAUDECODE; claude --dangerously-skip-permissions --strict-mcp-config --mcp-config ${mcp_config_path} --allowedTools mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent"
+        if [ -n "$manager_prompt" ]; then
+            manager_cmd="${manager_cmd} --append-system-prompt '${manager_prompt}'"
+        fi
+
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" "$manager_cmd" Enter
     fi
 }
 
@@ -508,6 +541,12 @@ setup_agent_panes() {
 
         local name runtime command working_dir ssh_host remote_working_dir
         name=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['name'])")
+
+        # Skip manager agent -- it's launched in the control window, not agents window
+        if [ "$name" = "manager" ]; then
+            continue
+        fi
+
         runtime=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['runtime'])")
         command=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['command'])")
         ssh_host=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['ssh_host'])")

@@ -6,6 +6,11 @@ nats:
   url: nats://192.168.1.38:4222
 
 agents:
+  manager:
+    runtime: claude_code
+    working_dir: .
+    role: monitor
+    system_prompt: "You are the manager agent. Follow the instructions in manager/CLAUDE.md exactly. Start your monitoring loop immediately. Be silent when things work."
   hub:
     runtime: claude_code
     working_dir: ./workspace
