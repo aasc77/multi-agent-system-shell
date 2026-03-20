@@ -51,6 +51,7 @@ This creates a tmux session with:
 | `Ctrl-b o` | Cycle to next pane |
 | `Ctrl-b q` | Show pane numbers |
 | `Ctrl-b d` | Detach (session keeps running) |
+| `Ctrl-b V` | Paste clipboard image to current agent pane |
 
 ## 5. Interactive Commands
 
@@ -139,6 +140,7 @@ Files land in `shared/<filename>` in each agent's workspace. Agents can view the
 | `scripts/reset-tasks.sh <project>` | Reset all task statuses to pending |
 | `scripts/share-file.sh <project> <file>` | Distribute file to all agent workspaces |
 | `scripts/nats-monitor.sh` | Live stream of all NATS messages |
+| `scripts/tmux-paste-image.sh` | Paste clipboard image into any agent pane |
 | `scripts/reset-demo.sh [project]` | Full reset: kill tmux + NATS stream + tasks + logs |
 
 ## Clean Start (Recommended)
