@@ -1,6 +1,6 @@
 # Multi-Agent System Shell (MAS)
 
-This project aims to reduce communication friction between ai cli agents operating across multiple boxes/environment with a humman in realtime 
+This project aims to reduce communication friction between ai cli agents operating across multiple boxes/environment with a human in realtime 
 
 A config-driven multi-agent orchestrator. Define agents, their communication flow, and the state machine in YAML -- then run one command and get a consolidated terminal with all agents visible, communicating over NATS, driven by a config-driven state machine.
 
