@@ -183,6 +183,9 @@ class TmuxComm:
             )
             return False
 
+        # Prefix with /btw for Claude Code agents to avoid interrupting work
+        if agent in self._claude_code_agents:
+            text = f"/btw {text}"
         self.send_keys(agent, text)
         return True
 
