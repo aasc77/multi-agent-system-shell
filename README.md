@@ -1,6 +1,6 @@
 # Multi-Agent System Shell (MAS)
 
-The aim of this preject is  reduce the friction with comumunictions between agents running in diffrent hardware and enviroments
+This project aims to reduce communication friction between ai cli agents operating across multiple boxes/environments as i have experienced 
 
 A config-driven multi-agent orchestrator. Define agents, their communication flow, and the state machine in YAML -- then run one command and get a consolidated terminal with all agents visible, communicating over NATS, driven by a config-driven state machine.
 
