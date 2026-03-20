@@ -62,7 +62,9 @@ multi-agent-system-shell/
 │   ├── stop.sh            # Graceful shutdown
 │   ├── setup-nats.sh      # Install and start NATS server
 │   ├── reset-tasks.sh     # Reset task statuses to pending
-│   └── nats-monitor.sh    # Live NATS message monitor
+│   ├── nats-monitor.sh    # Live NATS message monitor
+│   ├── share-file.sh      # Distribute files to all agent workspaces
+│   └── tmux-paste-image.sh # Paste clipboard image into any agent pane
 ├── projects/
 │   └── demo/              # Example project (writer + executor)
 │       ├── config.yaml    # Project config with agents + state machine
@@ -158,6 +160,29 @@ state_machine:
 ```bash
 cd /path/to/multi-agent-system-shell
 python3 -m pytest tests/ -v
+```
+
+## Clipboard Image Paste
+
+Paste a screenshot from your clipboard into any agent pane — local or remote. The image is delivered to the agent's `shared/` directory and the agent is told to read it.
+
+**Setup:** `brew install pngpaste` (macOS only, run on the hub machine)
+
+**Usage:**
+1. Copy a screenshot to your clipboard (`Cmd+Shift+4`, etc.)
+2. Switch to any agent pane in the `agents` tmux window
+3. Press `prefix + V` (`Ctrl-B` then `Shift-V`)
+
+The script auto-detects which agent you're in, SCPs the image to that agent's `shared/` directory (or copies locally for the hub), and tells the agent to look at it.
+
+**How it works:**
+- Local agents: image copied to `<working_dir>/shared/`
+- Remote agents: image SCP'd to `<remote_working_dir>/shared/` on the remote host
+- No setup needed on remote machines — everything runs from the hub
+
+**Manual alternative:** Use the orchestrator console `img` command:
+```bash
+img /path/to/screenshot.png macmini
 ```
 
 ## Vision Inference (DGX)

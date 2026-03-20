@@ -525,7 +525,7 @@ build_launch_command() {
         # (e.g., --append-system-prompt uses single quotes internally)
         # Use -t to force TTY allocation (required for Claude Code's interactive TUI)
         local escaped_cmd="${launch_cmd//\"/\\\"}"
-        launch_cmd="ssh -t -o StrictHostKeyChecking=no -o IdentitiesOnly=yes ${ssh_host} \"${escaped_cmd}\""
+        launch_cmd="ssh -t -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 ${ssh_host} \"${escaped_cmd}\""
     fi
 
     echo "$launch_cmd"

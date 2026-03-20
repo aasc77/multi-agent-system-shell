@@ -86,9 +86,15 @@ class TmuxComm:
         self._cooldown_seconds: int = tmux_cfg[_CFG_COOLDOWN_SECONDS]
         self._max_nudge_retries: int = tmux_cfg[_CFG_MAX_NUDGE_RETRIES]
 
-        # Build pane mapping: agent_name -> 0-based pane index (config order)
+        # Build pane mapping: agent_name -> 0-based pane index (config order).
+        # Skip agents with role=monitor -- they launch in the control window,
+        # not the agents window (mirrors start.sh behaviour).
+        pane_agents = [
+            name for name, cfg in config[_CFG_AGENTS].items()
+            if not (isinstance(cfg, dict) and cfg.get("role") == "monitor")
+        ]
         self._pane_mapping: dict[str, int] = {
-            name: idx for idx, name in enumerate(config[_CFG_AGENTS])
+            name: idx for idx, name in enumerate(pane_agents)
         }
 
         # Track which agents are claude_code (skip busy-check for them)
