@@ -19,6 +19,8 @@ venv/
 # Runtime artifacts
 projects/*/.mcp-configs/
 projects/*/orchestrator.log
+workspace/shared/
+**/shared/
 
 # OS
 .DS_Store

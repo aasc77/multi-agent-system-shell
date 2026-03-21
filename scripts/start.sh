@@ -218,12 +218,22 @@ for agent_name, agent_cfg in agents.items():
         ssh_host = agent_cfg.get('ssh_host', '')
         if ssh_host not in _home_cache:
             import subprocess
-            result = subprocess.run(
-                ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'IdentitiesOnly=yes',
-                 '-o', 'ConnectTimeout=5', ssh_host, 'echo ~'],
-                capture_output=True, text=True, timeout=10
-            )
-            _home_cache[ssh_host] = result.stdout.strip() or '/home/' + (ssh_host.split('@')[0] if '@' in ssh_host else ssh_host)
+            try:
+                result = subprocess.run(
+                    ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'IdentitiesOnly=yes',
+                     '-o', 'ConnectTimeout=5', ssh_host, 'echo ~'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    print(f'WARNING: Could not reach {ssh_host} for agent \"{agent_name}\" (connection timed out or refused). Using fallback home path.', file=sys.stderr)
+                    user_part = ssh_host.split('@')[0] if '@' in ssh_host else ssh_host
+                    _home_cache[ssh_host] = '/home/' + user_part
+                else:
+                    _home_cache[ssh_host] = result.stdout.strip()
+            except (subprocess.TimeoutExpired, OSError) as e:
+                print(f'WARNING: Could not reach {ssh_host} for agent \"{agent_name}\" ({e}). Using fallback home path.', file=sys.stderr)
+                user_part = ssh_host.split('@')[0] if '@' in ssh_host else ssh_host
+                _home_cache[ssh_host] = '/home/' + user_part
         home_dir = _home_cache[ssh_host]
         bridge_path = agent_cfg.get('remote_bridge_path', '~/mas-bridge/index.js').replace('~', home_dir)
         working_dir = agent_cfg.get('remote_working_dir', '~/mas-workspace').replace('~', home_dir)
@@ -277,9 +287,16 @@ if [ -n "$REMOTE_AGENTS" ]; then
         if [ "${_TEST_DRY_RUN:-false}" = "true" ]; then
             echo "[DRY-RUN] scp ${config_path} ${ssh_host}:${remote_config_dir}/${agent_name}.json"
         else
-            ssh -n -o StrictHostKeyChecking=no -o IdentitiesOnly=yes "$ssh_host" "mkdir -p ${remote_config_dir}" 2>/dev/null
-            scp -o StrictHostKeyChecking=no -o IdentitiesOnly=yes "$config_path" "${ssh_host}:${remote_config_dir}/${agent_name}.json" 2>/dev/null
-            echo "Copied MCP config for ${agent_name} to ${ssh_host}:${remote_config_dir}/${agent_name}.json"
+            if ! ssh -n -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o ConnectTimeout=5 "$ssh_host" "mkdir -p ${remote_config_dir}" 2>/dev/null; then
+                echo "WARNING: Could not reach ${ssh_host} for agent '${agent_name}' (connection timed out or refused). Skipping remote config copy." >&2
+                continue
+            fi
+            if scp -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o ConnectTimeout=5 "$config_path" "${ssh_host}:${remote_config_dir}/${agent_name}.json" 2>/dev/null \
+               || scp -O -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o ConnectTimeout=5 "$config_path" "${ssh_host}:${remote_config_dir}/${agent_name}.json" 2>/dev/null; then
+                echo "Copied MCP config for ${agent_name} to ${ssh_host}:${remote_config_dir}/${agent_name}.json"
+            else
+                echo "WARNING: Failed to copy MCP config to ${ssh_host} for agent '${agent_name}'." >&2
+            fi
         fi
     done <<< "$REMOTE_AGENTS"
 fi
@@ -369,9 +386,10 @@ ensure_clean_session
 # Control window: orchestrator + nats-monitor (side-by-side)
 # -----------------------------------------------------------------------
 setup_control_window() {
-    # Configure the control window with two panes:
+    # Configure the control window with panes:
     #   Pane 0: orchestrator process
     #   Pane 1: nats-monitor (horizontal split for side-by-side layout)
+    #   Pane 2: manager agent (bottom, if configured -- autonomous monitor)
     local nats_subjects="${NATS_URL##*://}"
     nats_subjects="${nats_subjects%%/*}"
 
@@ -387,6 +405,38 @@ setup_control_window() {
     else
         tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" \
             "nats sub 'agents.>'" Enter
+    fi
+
+    # Launch manager agent in the control window if configured
+    local has_manager
+    has_manager=$(python3 -c "
+import json, sys
+agents = json.loads(sys.stdin.read())
+mgr = agents.get('manager', {})
+if mgr.get('role') == 'monitor' and mgr.get('runtime') == 'claude_code':
+    print('yes')
+else:
+    print('no')
+" <<< "$AGENTS_JSON")
+
+    if [ "$has_manager" = "yes" ]; then
+        tmux_cmd split-window -v -t "${SESSION_NAME}:${CONTROL_WINDOW}.0"
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "manager (monitor)"
+
+        local mcp_config_path="${MCP_DIR}/manager.json"
+        local manager_prompt
+        manager_prompt=$(python3 -c "
+import json, sys
+agents = json.loads(sys.stdin.read())
+print(agents.get('manager', {}).get('system_prompt', ''))
+" <<< "$AGENTS_JSON")
+
+        local manager_cmd="cd ${ROOT_DIR} && unset CLAUDECODE; claude --dangerously-skip-permissions --strict-mcp-config --mcp-config ${mcp_config_path} --allowedTools mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent"
+        if [ -n "$manager_prompt" ]; then
+            manager_cmd="${manager_cmd} --append-system-prompt '${manager_prompt}'"
+        fi
+
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" "$manager_cmd" Enter
     fi
 }
 
@@ -437,7 +487,7 @@ build_launch_command() {
     local launch_cmd=""
 
     if [ "$runtime" = "$RUNTIME_CLAUDE_CODE" ]; then
-        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message"
+        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent"
 
         if [ -n "$ssh_host" ]; then
             # Remote agent: use remote paths, pass settings inline to skip onboarding prompts
@@ -475,7 +525,7 @@ build_launch_command() {
         # (e.g., --append-system-prompt uses single quotes internally)
         # Use -t to force TTY allocation (required for Claude Code's interactive TUI)
         local escaped_cmd="${launch_cmd//\"/\\\"}"
-        launch_cmd="ssh -t -o StrictHostKeyChecking=no -o IdentitiesOnly=yes ${ssh_host} \"${escaped_cmd}\""
+        launch_cmd="ssh -t -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 ${ssh_host} \"${escaped_cmd}\""
     fi
 
     echo "$launch_cmd"
@@ -491,6 +541,12 @@ setup_agent_panes() {
 
         local name runtime command working_dir ssh_host remote_working_dir
         name=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['name'])")
+
+        # Skip manager agent -- it's launched in the control window, not agents window
+        if [ "$name" = "manager" ]; then
+            continue
+        fi
+
         runtime=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['runtime'])")
         command=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['command'])")
         ssh_host=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['ssh_host'])")
@@ -517,6 +573,18 @@ setup_agent_panes() {
             pane_title="$name (local)"
         fi
         tmux_cmd set-option -p -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" @label "$pane_title"
+
+        # Pre-check connectivity for remote agents
+        if [ -n "$ssh_host" ] && [ "$DRY_RUN" != "true" ]; then
+            if ! ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -n "$ssh_host" "echo ok" &>/dev/null; then
+                echo "WARNING: Agent '${name}' -- cannot reach ${ssh_host} (connection timed out or refused)" >&2
+                tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" \
+                    "echo 'ERROR: Cannot reach ${ssh_host} -- check IP address and network connectivity'" Enter
+                pane_idx=$((pane_idx + 1))
+                continue
+            fi
+        fi
+
         tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" "$launch_cmd" Enter
 
         pane_idx=$((pane_idx + 1))

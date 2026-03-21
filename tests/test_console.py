@@ -688,3 +688,130 @@ class TestEdgeCases:
             outputs.append(console.handle_command(cmd))
         assert all(isinstance(o, str) for o in outputs)
         assert len(outputs) == 4
+
+
+# ===========================================================================
+# 12. IMG COMMAND -- share file to agent workspaces and notify
+# ===========================================================================
+
+
+class TestImgCommand:
+    """img command must share a file to agent workspaces and notify an agent."""
+
+    def test_img_no_args_returns_usage(self, console):
+        """img without arguments must return usage hint."""
+        output = console.handle_command("img")
+        assert "usage" in output.lower()
+
+    def test_img_file_not_found(self, console):
+        """img with nonexistent file must return error."""
+        output = console.handle_command("img /nonexistent/file.png qa")
+        assert "not found" in output.lower()
+
+    def test_img_invalid_agent(self, console, tmp_path):
+        """img with invalid agent name must return usage hint."""
+        test_file = tmp_path / "test.png"
+        test_file.write_text("fake")
+        output = console.handle_command(f"img {test_file} badagent")
+        assert "usage" in output.lower()
+
+    def test_img_calls_share_script_and_notifies(self, console, deps, tmp_path):
+        """img with valid file and agent calls share-file.sh and sends tmux msg."""
+        test_file = tmp_path / "screenshot.png"
+        test_file.write_text("fake")
+
+        with patch("orchestrator.console.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="OK", stderr="")
+            output = console.handle_command(f"img {test_file} qa")
+
+            # Verify share-file.sh was called
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args[0][0]
+            assert "share-file.sh" in call_args[0]
+
+            # Verify agent was notified via tmux
+            deps["tmux_comm"].send_msg.assert_called_once()
+            agent_arg = deps["tmux_comm"].send_msg.call_args[0][0]
+            msg_arg = deps["tmux_comm"].send_msg.call_args[0][1]
+            assert agent_arg == "qa"
+            assert "shared/screenshot.png" in msg_arg
+            assert "Read tool" in msg_arg
+
+        assert "Shared screenshot.png" in output
+        assert "qa" in output
+
+    def test_img_no_agent_uses_active_state(self, tmp_path):
+        """img without agent arg uses the currently active agent from state machine."""
+        config = {
+            **SAMPLE_CONFIG,
+            "project": "demo",
+            "state_machine": {
+                "states": {
+                    "idle": {"description": "No active task"},
+                    "waiting_qa": {"agent": "qa"},
+                },
+            },
+        }
+        d = _make_mock_deps(config=config)
+        d["state_machine"].current_state = "waiting_qa"
+        c = Console(**d)
+
+        test_file = tmp_path / "diagram.png"
+        test_file.write_text("fake")
+
+        with patch("orchestrator.console.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="OK", stderr="")
+            c.handle_command(f"img {test_file}")
+
+            # Should have targeted the qa agent
+            d["tmux_comm"].send_msg.assert_called_once()
+            agent_arg = d["tmux_comm"].send_msg.call_args[0][0]
+            assert agent_arg == "qa"
+
+    def test_img_share_script_failure(self, console, deps, tmp_path):
+        """img must return error when share-file.sh fails."""
+        test_file = tmp_path / "test.png"
+        test_file.write_text("fake")
+
+        with patch("orchestrator.console.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=1, stdout="", stderr="Project not found"
+            )
+            output = console.handle_command(f"img {test_file} qa")
+
+            # Should NOT have notified the agent
+            deps["tmux_comm"].send_msg.assert_not_called()
+
+        assert "error" in output.lower()
+
+    def test_img_expands_tilde(self, console):
+        """img must expand ~ in file paths."""
+        output = console.handle_command("img ~/nonexistent_test_xyz.png qa")
+        # Should show expanded path in error
+        assert "not found" in output.lower()
+        assert "~" not in output
+
+    def test_img_in_help(self, console):
+        """help command must include img."""
+        output = console.handle_command("help")
+        assert "img" in output
+
+    def test_img_in_dispatch(self, console):
+        """img must be registered in the dispatch table."""
+        assert "img" in console._dispatch
+
+    def test_img_returns_string(self, console):
+        """img must always return a string."""
+        output = console.handle_command("img")
+        assert isinstance(output, str)
+
+    def test_project_name_extracted(self):
+        """Console must extract project name from config."""
+        config = {**SAMPLE_CONFIG, "project": "my-project"}
+        d = _make_mock_deps(config=config)
+        c = Console(**d)
+        assert c._project_name == "my-project"
+
+    def test_project_name_default_empty(self, console):
+        """Console must default project_name to empty string."""
+        assert console._project_name == ""

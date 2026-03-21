@@ -1,9 +1,9 @@
 {
   "tasks": [
     {
-      "id": "rt-1",
-      "title": "Cross-machine test",
-      "description": "Test that tasks flow through local and remote agents correctly.",
+      "id": "test-1",
+      "title": "4-node ping test",
+      "description": "Simple connectivity test across all 4 nodes. Each agent should report its hostname, OS, and uptime, then pass the chain along. Hub starts, DGX adds its info, Mac Mini adds its info, Hassio compiles the final report of all 4 nodes.",
       "status": "in_progress",
       "attempts": 0
     }

@@ -116,6 +116,7 @@ router = MessageRouter(
     state_machine=state_machine,
     lifecycle_manager=lifecycle,
     agents=agents_dict,
+    tmux_comm=tmux_comm,
 )
 
 # --- Interactive command reader ---

@@ -51,6 +51,7 @@ This creates a tmux session with:
 | `Ctrl-b o` | Cycle to next pane |
 | `Ctrl-b q` | Show pane numbers |
 | `Ctrl-b d` | Detach (session keeps running) |
+| `Ctrl-b V` | Paste clipboard image to current agent pane |
 
 ## 5. Interactive Commands
 
@@ -62,6 +63,7 @@ Type these in the orchestrator pane:
 | `tasks` | List all tasks with status |
 | `nudge <agent>` | Manually nudge an agent |
 | `msg <agent> TEXT` | Send text to an agent's pane |
+| `img <file> [agent]` | Share file to workspaces and notify agent |
 | `skip` | Skip current stuck task |
 | `pause` / `resume` | Pause/resume polling |
 | `log` | Show last 10 log entries |
@@ -105,6 +107,29 @@ mkdir -p projects/my-project
 
 4. Launch: `./scripts/start.sh my-project`
 
+## Sharing Images/Files with Agents
+
+From the orchestrator pane, use the `img` command to distribute a file to all agent workspaces and notify a specific agent:
+
+```
+img ~/Screenshots/bug.png hub
+```
+
+Without an agent name, it targets the currently active agent:
+
+```
+img ~/diagram.png
+```
+
+From the shell (outside the orchestrator):
+
+```bash
+cd ~/Repositories/multi-agent-system-shell
+./scripts/share-file.sh remote-test ~/Screenshots/bug.png
+```
+
+Files land in `shared/<filename>` in each agent's workspace. Agents can view them with their Read tool.
+
 ## Utility Scripts
 
 | Script | Purpose |
@@ -113,7 +138,23 @@ mkdir -p projects/my-project
 | `scripts/start.sh <project>` | Launch tmux session with all agents |
 | `scripts/stop.sh <project>` | Graceful shutdown |
 | `scripts/reset-tasks.sh <project>` | Reset all task statuses to pending |
+| `scripts/share-file.sh <project> <file>` | Distribute file to all agent workspaces |
 | `scripts/nats-monitor.sh` | Live stream of all NATS messages |
+| `scripts/tmux-paste-image.sh` | Paste clipboard image into any agent pane |
+| `scripts/reset-demo.sh [project]` | Full reset: kill tmux + NATS stream + tasks + logs |
+
+## Clean Start (Recommended)
+
+If things are in a weird state, do a full reset before starting:
+
+```bash
+cd ~/Repositories/multi-agent-system-shell
+bash scripts/reset-demo.sh demo
+bash scripts/start.sh demo
+tmux attach -t demo
+```
+
+The writer agent will be at the Claude Code trust prompt. Switch to the agents window (`Ctrl-b 1`), select the writer pane, and press Enter to accept.
 
 ## Troubleshooting
 
@@ -122,3 +163,9 @@ mkdir -p projects/my-project
 **Ollama not responding**: Run `ollama serve` in another terminal.
 
 **Agent not picking up messages**: Try `nudge <agent>` in the orchestrator pane.
+
+**Orchestrator exits immediately**: Stale NATS consumers. Run `bash scripts/reset-demo.sh demo` for a clean slate.
+
+**CLAUDECODE env var leak**: If agents behave oddly, tmux may have inherited CLAUDECODE from a parent Claude Code session. `reset-demo.sh` clears this, or manually: `tmux set-environment -g -u CLAUDECODE`
+
+**Stale NATS consumers**: If you see "consumer is already bound" errors, run `bash scripts/reset-demo.sh demo` which deletes the AGENTS stream entirely.

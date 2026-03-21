@@ -10,6 +10,8 @@ Requirements traced to PRD:
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,7 @@ _CMD_MSG = "msg"
 _CMD_PAUSE = "pause"
 _CMD_RESUME = "resume"
 _CMD_LOG = "log"
+_CMD_IMG = "img"
 _CMD_HELP = "help"
 
 _ALL_COMMANDS = [
@@ -37,6 +40,7 @@ _ALL_COMMANDS = [
     _CMD_SKIP,
     _CMD_NUDGE,
     _CMD_MSG,
+    _CMD_IMG,
     _CMD_PAUSE,
     _CMD_RESUME,
     _CMD_LOG,
@@ -58,6 +62,10 @@ _MSG_MSG_NO_TEXT = "Usage: msg <agent> <text>. No text provided for {}."
 _MSG_MSG_OK = "Message sent to {}."
 _MSG_MSG_BUSY = "Agent {} is busy -- message not sent. Warning: try again later."
 _MSG_TMUX_ERROR = "Error: agent not found or {} failed - {}"
+_MSG_IMG_USAGE = "Usage: img <file-path> [agent]. Available agents: {}"
+_MSG_IMG_NOT_FOUND = "Error: File not found: {}"
+_MSG_IMG_OK = "Shared {} and notified {}."
+_MSG_IMG_DIST_FAIL = "Error distributing file: {}"
 _MSG_PAUSE_OK = "Outbox processing paused."
 _MSG_RESUME_OK = "Outbox processing resumed."
 _MSG_NO_LOGS = "No log entries."
@@ -110,12 +118,15 @@ class Console:
         self._agent_names = list(config.get("agents", {}).keys())
 
         # Build dispatch table once (all handlers are stable bound methods)
+        self._project_name: str = config.get("project", "")
+
         self._dispatch: dict[str, Any] = {
             _CMD_STATUS: self._cmd_status,
             _CMD_TASKS: self._cmd_tasks,
             _CMD_SKIP: self._cmd_skip,
             _CMD_NUDGE: self._cmd_nudge,
             _CMD_MSG: self._cmd_msg,
+            _CMD_IMG: self._cmd_img,
             _CMD_PAUSE: self._cmd_pause,
             _CMD_RESUME: self._cmd_resume,
             _CMD_LOG: self._cmd_log,
@@ -226,6 +237,51 @@ class Console:
             skipped_msg=_MSG_MSG_BUSY.format(agent_name),
         )
 
+    def _cmd_img(self, args: list[str]) -> str:
+        """Share an image/file to agent workspaces and notify an agent."""
+        if not args:
+            return _MSG_IMG_USAGE.format(", ".join(self._agent_names))
+
+        file_path = os.path.expanduser(args[0])
+        if not os.path.isfile(file_path):
+            return _MSG_IMG_NOT_FOUND.format(file_path)
+
+        # Determine target agent
+        if len(args) >= 2:
+            agent = args[1]
+            if agent not in self._agent_names:
+                return _MSG_IMG_USAGE.format(", ".join(self._agent_names))
+        else:
+            # Use the currently active agent from the state machine
+            current_state = self._state_machine.current_state
+            states_cfg = self._config.get("state_machine", {}).get("states", {})
+            state_info = states_cfg.get(current_state, {})
+            agent = state_info.get("agent", self._agent_names[0] if self._agent_names else "")
+            if not agent:
+                return _MSG_IMG_USAGE.format(", ".join(self._agent_names))
+
+        # Run share-file.sh
+        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        share_script = os.path.join(script_dir, "scripts", "share-file.sh")
+        result = subprocess.run(
+            [share_script, self._project_name, file_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return _MSG_IMG_DIST_FAIL.format(result.stderr.strip())
+
+        # Notify the agent
+        filename = os.path.basename(file_path)
+        msg = f"Look at the image at shared/{filename} using your Read tool"
+        self._safe_tmux_call(
+            operation="message",
+            call=lambda: self._tmux_comm.send_msg(agent, msg),
+            success_msg=_MSG_MSG_OK.format(agent),
+            skipped_msg=_MSG_MSG_BUSY.format(agent),
+        )
+        return _MSG_IMG_OK.format(filename, agent)
+
     def _cmd_pause(self, args: list[str]) -> str:
         """Pause outbox processing."""
         self._paused = True
@@ -258,6 +314,7 @@ class Console:
             "  skip            - Skip current task (mark as stuck)\n"
             f"  nudge <agent>   - Nudge an agent. Agents: {agent_list}\n"
             f"  msg <agent> <text> - Send text to agent pane. Agents: {agent_list}\n"
+            f"  img <file> [agent] - Share file to workspaces and notify agent. Agents: {agent_list}\n"
             "  pause           - Pause outbox processing\n"
             "  resume          - Resume outbox processing\n"
             "  log             - Show last 10 log entries\n"
