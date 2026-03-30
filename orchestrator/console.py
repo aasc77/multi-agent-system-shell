@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 from typing import Any
 
@@ -32,6 +33,8 @@ _CMD_PAUSE = "pause"
 _CMD_RESUME = "resume"
 _CMD_LOG = "log"
 _CMD_IMG = "img"
+_CMD_BROADCAST = "broadcast"
+_CMD_CONVERSATION = "conversation"
 _CMD_HELP = "help"
 
 _ALL_COMMANDS = [
@@ -40,6 +43,7 @@ _ALL_COMMANDS = [
     _CMD_SKIP,
     _CMD_NUDGE,
     _CMD_MSG,
+    _CMD_BROADCAST,
     _CMD_IMG,
     _CMD_PAUSE,
     _CMD_RESUME,
@@ -62,6 +66,8 @@ _MSG_MSG_NO_TEXT = "Usage: msg <agent> <text>. No text provided for {}."
 _MSG_MSG_OK = "Message sent to {}."
 _MSG_MSG_BUSY = "Agent {} is busy -- message not sent. Warning: try again later."
 _MSG_TMUX_ERROR = "Error: agent not found or {} failed - {}"
+_MSG_BROADCAST_USAGE = "Usage: broadcast <text>"
+_MSG_BROADCAST_OK = "Broadcast sent to: {}"
 _MSG_IMG_USAGE = "Usage: img <file-path> [agent]. Available agents: {}"
 _MSG_IMG_NOT_FOUND = "Error: File not found: {}"
 _MSG_IMG_OK = "Shared {} and notified {}."
@@ -126,12 +132,17 @@ class Console:
             _CMD_SKIP: self._cmd_skip,
             _CMD_NUDGE: self._cmd_nudge,
             _CMD_MSG: self._cmd_msg,
+            _CMD_BROADCAST: self._cmd_broadcast,
             _CMD_IMG: self._cmd_img,
             _CMD_PAUSE: self._cmd_pause,
             _CMD_RESUME: self._cmd_resume,
             _CMD_LOG: self._cmd_log,
+            _CMD_CONVERSATION: self._cmd_conversation,
             _CMD_HELP: self._cmd_help,
         }
+
+        # Conversation mode subprocess
+        self._conversation_proc: subprocess.Popen | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -237,6 +248,21 @@ class Console:
             skipped_msg=_MSG_MSG_BUSY.format(agent_name),
         )
 
+    def _cmd_broadcast(self, args: list[str]) -> str:
+        """Send a message to all agent panes."""
+        if not args:
+            return _MSG_BROADCAST_USAGE
+
+        text = " ".join(args)
+        sent = []
+        for agent in self._agent_names:
+            try:
+                if self._tmux_comm.send_msg(agent, text):
+                    sent.append(agent)
+            except Exception:
+                pass  # skip agents not in pane mapping (e.g. monitor)
+        return _MSG_BROADCAST_OK.format(", ".join(sent)) if sent else "No agents received the broadcast."
+
     def _cmd_img(self, args: list[str]) -> str:
         """Share an image/file to agent workspaces and notify an agent."""
         if not args:
@@ -304,6 +330,41 @@ class Console:
 
         return "\n".join(logs[-_MAX_LOG_ENTRIES:])
 
+    def _cmd_conversation(self, args: list[str]) -> str:
+        """Toggle conversation mode on/off."""
+        if not args:
+            is_on = self._conversation_proc is not None and self._conversation_proc.poll() is None
+            return f"Conversation mode is {'ON' if is_on else 'OFF'}. Usage: conversation on|off"
+
+        action = args[0].lower()
+        if action == "on":
+            if self._conversation_proc and self._conversation_proc.poll() is None:
+                return "Conversation mode is already ON."
+            script = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "scripts", "conversation-mode.py",
+            )
+            nats_url = self._config.get("nats", {}).get("url", "nats://192.168.1.38:4222")
+            self._conversation_proc = subprocess.Popen(
+                ["python3", script, "--nats-url", nats_url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            logger.info("Conversation mode started (PID %d)", self._conversation_proc.pid)
+            return f"Conversation mode ON (PID {self._conversation_proc.pid})"
+
+        elif action == "off":
+            if not self._conversation_proc or self._conversation_proc.poll() is not None:
+                return "Conversation mode is already OFF."
+            self._conversation_proc.send_signal(signal.SIGTERM)
+            self._conversation_proc.wait(timeout=5)
+            pid = self._conversation_proc.pid
+            self._conversation_proc = None
+            logger.info("Conversation mode stopped (PID %d)", pid)
+            return f"Conversation mode OFF (stopped PID {pid})"
+
+        return "Usage: conversation on|off"
+
     def _cmd_help(self, args: list[str]) -> str:
         """List all commands with available agent names."""
         agent_list = ", ".join(self._agent_names) if self._agent_names else "none"
@@ -314,7 +375,9 @@ class Console:
             "  skip            - Skip current task (mark as stuck)\n"
             f"  nudge <agent>   - Nudge an agent. Agents: {agent_list}\n"
             f"  msg <agent> <text> - Send text to agent pane. Agents: {agent_list}\n"
+            f"  broadcast <text>  - Send text to all agent panes\n"
             f"  img <file> [agent] - Share file to workspaces and notify agent. Agents: {agent_list}\n"
+            "  conversation on|off - Toggle conversation mode (hear agents on speakers)\n"
             "  pause           - Pause outbox processing\n"
             "  resume          - Resume outbox processing\n"
             "  log             - Show last 10 log entries\n"
