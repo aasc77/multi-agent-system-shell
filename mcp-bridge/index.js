@@ -42,6 +42,17 @@ function buildSubject(role, channel) {
   return `${SUBJECT_PREFIX}.${role}.${channel}`;
 }
 
+let messageCounter = 0;
+
+function buildEnvelopeMetadata(priority) {
+  return {
+    message_id: `${agentRole}-${Date.now()}-${++messageCounter}`,
+    timestamp: new Date().toISOString(),
+    from: agentRole,
+    priority: priority || 'normal', // low, normal, high, urgent
+  };
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -224,6 +235,7 @@ async function handleSendMessage(params) {
 
   const envelope = {
     type: OUTBOX_MESSAGE_TYPE,
+    ...buildEnvelopeMetadata(content.priority),
     ...content,
   };
 
@@ -251,6 +263,7 @@ async function handleSendMessage(params) {
 async function handleSendToAgent(params) {
   const targetAgent = params.target_agent;
   const message = params.message || '';
+  const priority = params.priority || 'normal';
 
   if (!targetAgent) {
     return {
@@ -262,9 +275,8 @@ async function handleSendToAgent(params) {
   const targetInbox = buildSubject(targetAgent, CHANNEL_INBOX);
   const envelope = {
     type: 'agent_message',
-    from: agentRole,
+    ...buildEnvelopeMetadata(priority),
     message,
-    timestamp: new Date().toISOString(),
   };
 
   try {
@@ -305,7 +317,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: TOOL_SEND_TO_AGENT,
-      description: 'Send a direct message to another agent by name. The message lands in their inbox immediately.',
+      description: 'Send a direct message to another agent by name. The message lands in their inbox immediately. Messages include timestamp, message_id, and priority.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -316,6 +328,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           message: {
             type: 'string',
             description: 'The message to send',
+          },
+          priority: {
+            type: 'string',
+            enum: ['low', 'normal', 'high', 'urgent'],
+            description: 'Message priority. Default: normal. Use "urgent" for time-sensitive tasks, "high" for important but not immediate.',
           },
         },
         required: ['target_agent', 'message'],
