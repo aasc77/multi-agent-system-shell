@@ -181,6 +181,15 @@ class NatsClient:
         payload = json.dumps(message).encode()
         await self._js.publish(subject, payload)
 
+    async def publish_raw(self, subject: str, payload: bytes) -> None:
+        """Publish raw bytes to an arbitrary NATS subject.
+
+        Raises:
+            NatsClientError: If not connected.
+        """
+        self._require_connected()
+        await self._js.publish(subject, payload)
+
     async def publish_all_done(self, summary: str) -> None:
         """Publish an ``all_done`` message to every agent's inbox.
 

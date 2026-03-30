@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -81,13 +82,16 @@ class MessageRouter:
         lifecycle_manager: Any,
         agents: dict[str, Any],
         tmux_comm: Any = None,
+        watchdog: Any = None,
     ) -> None:
         self._nats_client = nats_client
         self._state_machine = state_machine
         self._lifecycle_manager = lifecycle_manager
         self._tmux_comm = tmux_comm
+        self._watchdog = watchdog
         self._agents = agents
         self._paused = False
+        self._last_activity_time: float = time.time()
 
         # Build set of known trigger types from transitions
         self._known_triggers: set[str] = {
@@ -104,6 +108,15 @@ class MessageRouter:
     def is_paused(self) -> bool:
         """Return whether the router is currently paused."""
         return self._paused
+
+    @property
+    def last_activity_time(self) -> float:
+        """Return the timestamp of the last message activity."""
+        return self._last_activity_time
+
+    def _touch_activity(self) -> None:
+        """Update the last activity timestamp."""
+        self._last_activity_time = time.time()
 
     def pause(self) -> None:
         """Pause message processing."""
@@ -138,6 +151,8 @@ class MessageRouter:
           5. Hand off transition result to lifecycle manager
           6. ACK the message in all cases
         """
+        self._touch_activity()
+
         if self._paused:
             return
 
@@ -157,6 +172,12 @@ class MessageRouter:
             # --- Validate required fields (missing, empty, or None) ---
             if not msg_type or not status:
                 await self._discard_unrecognized(msg, role, payload)
+                return
+
+            # --- Manager idle response → route to watchdog ---
+            if msg_type == "manager_idle_response" and self._watchdog is not None:
+                await self._watchdog.handle_manager_response(payload)
+                await msg.ack()
                 return
 
             # --- Check if type is a known trigger ---
@@ -238,6 +259,7 @@ class MessageRouter:
         Non-``agent_message`` types (e.g. ``task_assignment``) are ignored
         since the orchestrator already handles those via its own nudge path.
         """
+        self._touch_activity()
         try:
             payload = json.loads(msg.data.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -253,5 +275,9 @@ class MessageRouter:
         logger.info(
             "Relaying nudge to %s (agent_message from %s)", target_role, sender,
         )
-        self._tmux_comm.nudge(target_role, force=True)
+        try:
+            self._tmux_comm.nudge(target_role, force=True)
+        except Exception:
+            # Monitor agents (e.g. manager) have no pane in the agents window
+            logger.debug("Skipping tmux nudge for %s (no pane)", target_role)
         await msg.ack()

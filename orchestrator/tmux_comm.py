@@ -134,6 +134,37 @@ class TmuxComm:
         target = self.get_target(agent)
         self._tmux_send_keys(target, text)
 
+    def capture_pane(self, agent: str, lines: int = 20) -> str | None:
+        """Capture the last *lines* of an agent's tmux pane.
+
+        Returns:
+            The captured text, or ``None`` on failure.
+        """
+        target = self.get_target(agent)
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def is_agent_idle(self, agent: str) -> bool:
+        """Return ``True`` if the agent's pane appears idle (at prompt).
+
+        Claude Code agents show a ``❯`` prompt when idle.
+        """
+        pane_text = self.capture_pane(agent, lines=5)
+        if pane_text is None:
+            return False
+        # Check if the last non-empty line ends with the Claude Code prompt
+        lines = [l for l in pane_text.strip().splitlines() if l.strip()]
+        if not lines:
+            return False
+        last = lines[-1].strip()
+        return last == "❯" or last.endswith("❯")
+
     def nudge(self, agent: str, force: bool = False) -> bool:
         """Nudge an agent pane with the configured nudge prompt.
 
@@ -183,9 +214,6 @@ class TmuxComm:
             )
             return False
 
-        # Prefix with /btw for Claude Code agents to avoid interrupting work
-        if agent in self._claude_code_agents:
-            text = f"/btw {text}"
         self.send_keys(agent, text)
         return True
 

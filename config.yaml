@@ -4,7 +4,7 @@ nats:
   subjects_prefix: agents
 
 tmux:
-  nudge_prompt: "/btw You have new messages. Use check_messages with your role."
+  nudge_prompt: "check_messages"
   nudge_cooldown_seconds: 30
   max_nudge_retries: 20
 
