@@ -393,10 +393,12 @@ setup_control_window() {
     local nats_subjects="${NATS_URL##*://}"
     nats_subjects="${nats_subjects%%/*}"
 
+    tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" @label "orchestrator"
     tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" \
         "cd ${ROOT_DIR} && python3 -m orchestrator ${PROJECT}" Enter
 
     tmux_cmd split-window -h -t "${SESSION_NAME}:${CONTROL_WINDOW}"
+    tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "nats-monitor"
 
     local monitor_script="${SCRIPT_DIR}/nats-monitor.sh"
     if [ -f "$monitor_script" ]; then
@@ -421,7 +423,14 @@ else:
 
     if [ "$has_manager" = "yes" ]; then
         tmux_cmd split-window -v -t "${SESSION_NAME}:${CONTROL_WINDOW}.0"
-        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "manager (monitor)"
+
+        local manager_label
+        manager_label=$(python3 -c "
+import json, sys
+agents = json.loads(sys.stdin.read())
+print(agents.get('manager', {}).get('label', 'manager'))
+" <<< "$AGENTS_JSON")
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "$manager_label"
 
         local mcp_config_path="${MCP_DIR}/manager.json"
         local manager_prompt
@@ -468,6 +477,7 @@ for name, cfg in agents.items():
         'system_prompt': cfg.get('system_prompt', ''),
         'remote_working_dir': cfg.get('remote_working_dir', ''),
         'remote_node_path': cfg.get('remote_node_path', ''),
+        'label': cfg.get('label', ''),
     }))
 " <<< "$AGENTS_JSON")
 
@@ -512,6 +522,8 @@ build_launch_command() {
         fi
 
         # Append system prompt if configured
+        # NOTE: system_prompt must NOT contain single quotes -- they break
+        # shell quoting, especially through SSH double-quote wrapping.
         if [ -n "$system_prompt" ]; then
             launch_cmd="${launch_cmd} --append-system-prompt '${system_prompt}'"
         fi
@@ -554,6 +566,7 @@ setup_agent_panes() {
         system_prompt=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['system_prompt'])")
         remote_working_dir=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['remote_working_dir'])")
         remote_node_path=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['remote_node_path'])")
+        label=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['label'])")
 
         # Create additional panes (first pane already exists with new-window)
         if [ "$pane_idx" -gt 0 ]; then
@@ -564,9 +577,11 @@ setup_agent_panes() {
         local launch_cmd
         launch_cmd=$(build_launch_command "$name" "$runtime" "$command" "$ssh_host" "$working_dir" "$system_prompt" "$remote_working_dir" "$remote_node_path")
 
-        # Build pane title: "agent_name (host)" for remote, "agent_name (local)" for local
+        # Build pane title: use config label if set, else "name (host)" / "name (local)"
         local pane_title="$name"
-        if [ -n "$ssh_host" ]; then
+        if [ -n "$label" ]; then
+            pane_title="$label"
+        elif [ -n "$ssh_host" ]; then
             local host_label="${ssh_host#*@}"  # strip user@ prefix, keep IP/hostname
             pane_title="$name ($host_label)"
         else

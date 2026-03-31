@@ -11,7 +11,7 @@ watchdog:
   idle_cooldown: 300
   announce_on_speaker: false
   inactivity_announcer:
-    enabled: true
+    enabled: false
     threshold_seconds: 300
     escalate_after: 3
     announce_on_speaker: false
@@ -21,36 +21,42 @@ agents:
     runtime: claude_code
     working_dir: .
     role: monitor
+    label: manager
     system_prompt: "You are the manager agent. Follow the instructions in manager/CLAUDE.md exactly. Start your monitoring loop immediately. Be silent when things work."
   hub:
     runtime: claude_code
     working_dir: ./workspace
-    system_prompt: "You are the dev agent on the Mac hub. Your role is to write code, build features, deploy services, and fix bugs. You are the primary builder — the orchestrator codebase is local at /Users/angelserrano/Repositories/multi-agent-system-shell/. When you finish work, notify macmini (the QA agent) to verify it. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the 'from' field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user's attention, use /speak to announce it on the home speakers."
+    label: hub (dev)
+    system_prompt: "You are the dev agent on the Mac hub. Your role is to write code, build features, deploy services, and fix bugs. You are the primary builder — the orchestrator codebase is local at /Users/angelserrano/Repositories/multi-agent-system-shell/. When you finish work, notify macmini (the QA agent) to verify it. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
   dgx:
     runtime: claude_code
     ssh_host: dgx@192.168.1.51
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
-    system_prompt: "You are a collaborator agent on the DGX server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the 'from' field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user's attention, use /speak to announce it on the home speakers."
+    label: dgx1
+    system_prompt: "You are a collaborator agent on the DGX server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
   macmini:
     runtime: claude_code
     ssh_host: angelserrano@192.168.1.44
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
     remote_node_path: ~/local/bin/node
-    system_prompt: "You are the QA agent on the Mac Mini. Your role is to verify, test, and validate work done by other agents — especially hub (the dev agent). Review code, run tests, verify deployments, and confirm things actually work before reporting pass/fail. Do not write production code — that's hub's job. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the 'from' field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user's attention, use /speak to announce it on the home speakers."
+    label: macmini (qa)
+    system_prompt: "You are the QA agent on the Mac Mini. Your role is to verify, test, and validate work done by other agents — especially hub (the dev agent). Review code, run tests, verify deployments, and confirm things actually work before reporting pass/fail. Do not write production code — that is hub job. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
   hassio:
     runtime: claude_code
     ssh_host: hassio@192.168.1.50
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
-    system_prompt: "You are a collaborator agent on the Hassio server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the 'from' field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user's attention, use /speak to announce it on the home speakers."
+    label: hassio
+    system_prompt: "You are a collaborator agent on the Hassio server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
   dgx2:
     runtime: claude_code
     ssh_host: dgx2@192.168.1.49
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
-    system_prompt: "You are a collaborator agent on DGX2 (second DGX Spark). Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the 'from' field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user's attention, use /speak to announce it on the home speakers."
+    label: dgx2
+    system_prompt: "You are a collaborator agent on DGX2 (second DGX Spark). Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
 
 state_machine:
   initial: idle
