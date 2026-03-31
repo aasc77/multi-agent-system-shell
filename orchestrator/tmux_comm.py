@@ -41,6 +41,7 @@ _CFG_AGENTS = "agents"
 # tmux config keys
 _CFG_SESSION_NAME = "session_name"
 _CFG_NUDGE_PROMPT = "nudge_prompt"
+_CFG_MONITOR_NUDGE_PROMPT = "monitor_nudge_prompt"
 _CFG_COOLDOWN_SECONDS = "nudge_cooldown_seconds"
 _CFG_MAX_NUDGE_RETRIES = "max_nudge_retries"
 
@@ -83,6 +84,10 @@ class TmuxComm:
         tmux_cfg = config[_CFG_TMUX]
         self._session_name: str = tmux_cfg[_CFG_SESSION_NAME]
         self._nudge_prompt: str = tmux_cfg[_CFG_NUDGE_PROMPT]
+        self._monitor_nudge_prompt: str = tmux_cfg.get(
+            _CFG_MONITOR_NUDGE_PROMPT,
+            "You have new messages. Use check_messages with your role.",
+        )
         self._cooldown_seconds: int = tmux_cfg[_CFG_COOLDOWN_SECONDS]
         self._max_nudge_retries: int = tmux_cfg[_CFG_MAX_NUDGE_RETRIES]
 
@@ -207,8 +212,14 @@ class TmuxComm:
                 self._record_skip(agent)
                 return False
 
-        # Safe to nudge
-        self.send_keys(agent, self._nudge_prompt)
+        # Monitor agents (e.g. manager) are mid-conversation in Claude Code,
+        # so they need a conversational nudge, not a bare command.
+        prompt = (
+            self._monitor_nudge_prompt
+            if agent in self._control_pane_mapping
+            else self._nudge_prompt
+        )
+        self.send_keys(agent, prompt)
         self._last_nudge_time[agent] = time.time()
         self._reset_skip_tracking(agent)
         return True
