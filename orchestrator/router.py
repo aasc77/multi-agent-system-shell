@@ -258,8 +258,11 @@ class MessageRouter:
 
         Non-``agent_message`` types (e.g. ``task_assignment``) are ignored
         since the orchestrator already handles those via its own nudge path.
+
+        Note: activity is only touched for real agent messages, not
+        orchestrator-generated messages (which would create a loopback
+        resetting the inactivity counter).
         """
-        self._touch_activity()
         try:
             payload = json.loads(msg.data.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -272,12 +275,16 @@ class MessageRouter:
 
         target_role = self._extract_role(msg.subject)
         sender = payload.get("from", "unknown")
+
+        # Only count real agent activity — ignore orchestrator's own messages
+        # (e.g. inactivity alerts) to prevent loopback resetting the counter.
+        if sender != "orchestrator":
+            self._touch_activity()
         logger.info(
             "Relaying nudge to %s (agent_message from %s)", target_role, sender,
         )
         try:
             self._tmux_comm.nudge(target_role, force=True)
         except Exception:
-            # Monitor agents (e.g. manager) have no pane in the agents window
             logger.debug("Skipping tmux nudge for %s (no pane)", target_role)
         await msg.ack()

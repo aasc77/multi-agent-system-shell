@@ -97,6 +97,18 @@ class TmuxComm:
             name: idx for idx, name in enumerate(pane_agents)
         }
 
+        # Monitor agents live in the control window (start.sh splits pane 0
+        # vertically and places the manager in pane 1).  Build a separate
+        # mapping so nudge/send_keys can reach them.
+        self._control_pane_mapping: dict[str, str] = {}
+        control_idx = 1  # pane 0 = orchestrator, pane 1 = first monitor agent
+        for name, cfg in config[_CFG_AGENTS].items():
+            if isinstance(cfg, dict) and cfg.get("role") == "monitor":
+                self._control_pane_mapping[name] = (
+                    f"{self._session_name}:control.{control_idx}"
+                )
+                control_idx += 1
+
         # Track which agents are claude_code (skip busy-check for them)
         self._claude_code_agents: set[str] = {
             name for name, cfg in config[_CFG_AGENTS].items()
@@ -120,14 +132,19 @@ class TmuxComm:
         return dict(self._pane_mapping)
 
     def get_target(self, agent: str) -> str:
-        """Return canonical tmux target ``<session>:agents.<index>``.
+        """Return canonical tmux target for an agent.
+
+        Regular agents return ``<session>:agents.<index>``.
+        Monitor agents (e.g. manager) return their control window target.
 
         Raises:
-            TmuxCommError: If *agent* is not in the pane mapping.
+            TmuxCommError: If *agent* is not in any pane mapping.
         """
-        if agent not in self._pane_mapping:
-            raise TmuxCommError(f"Unknown agent: {agent}")
-        return f"{self._session_name}:{_AGENTS_WINDOW}.{self._pane_mapping[agent]}"
+        if agent in self._pane_mapping:
+            return f"{self._session_name}:{_AGENTS_WINDOW}.{self._pane_mapping[agent]}"
+        if agent in self._control_pane_mapping:
+            return self._control_pane_mapping[agent]
+        raise TmuxCommError(f"Unknown agent: {agent}")
 
     def send_keys(self, agent: str, text: str) -> None:
         """Send *text* to an agent's tmux pane via ``tmux send-keys`` with Enter."""

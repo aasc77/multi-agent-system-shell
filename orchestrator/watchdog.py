@@ -176,12 +176,7 @@ class IdleWatchdog:
         await self._nats_client.publish_to_inbox("manager", alert)
 
         # Nudge manager's tmux pane so it checks messages
-        try:
-            self._tmux_comm.nudge("manager", force=True)
-        except Exception:
-            # Manager may not have a pane in the agents window (role=monitor)
-            # Fall back to sending via the control window
-            logger.debug("Manager not in agents window, skipping tmux nudge")
+        self._tmux_comm.nudge("manager", force=True)
 
         self._last_alert[agent] = time.time()
         self._awaiting_response[agent] = True
