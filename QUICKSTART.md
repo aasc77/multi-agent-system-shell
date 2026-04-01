@@ -38,16 +38,17 @@ cd /path/to/multi-agent-system-shell
 ./scripts/start.sh demo
 ```
 
-This creates a tmux session with:
-- **Window 1 (control)**: orchestrator + NATS monitor side-by-side
-- **Window 2 (agents)**: one pane per agent (writer + executor for the demo)
+On macOS, this opens **two iTerm windows**:
+- **iTerm window 1 (control)**: orchestrator + NATS monitor + manager agent
+- **iTerm window 2 (agents)**: one pane per agent (dev, QA, etc.) in a tiled grid
+
+Each window is a grouped tmux session, so they can independently show different
+tmux windows while sharing the same session.
 
 ### tmux Navigation
 
 | Key | Action |
 |-----|--------|
-| `Ctrl-b 1` | Switch to control window |
-| `Ctrl-b 2` | Switch to agents window |
 | `Ctrl-b o` | Cycle to next pane |
 | `Ctrl-b q` | Show pane numbers |
 | `Ctrl-b d` | Detach (session keeps running) |
@@ -63,9 +64,11 @@ Type these in the orchestrator pane:
 | `tasks` | List all tasks with status |
 | `nudge <agent>` | Manually nudge an agent |
 | `msg <agent> TEXT` | Send text to an agent's pane |
+| `broadcast TEXT` | Send text to ALL agent panes |
 | `img <file> [agent]` | Share file to workspaces and notify agent |
+| `conversation on\|off` | Toggle conversation mode (hear agents on speakers) |
 | `skip` | Skip current stuck task |
-| `pause` / `resume` | Pause/resume polling |
+| `pause` / `resume` | Pause/resume outbox processing |
 | `log` | Show last 10 log entries |
 | `help` | Show all commands |
 
@@ -135,12 +138,16 @@ Files land in `shared/<filename>` in each agent's workspace. Agents can view the
 | Script | Purpose |
 |--------|---------|
 | `scripts/setup-nats.sh` | Install and start NATS server with JetStream |
-| `scripts/start.sh <project>` | Launch tmux session with all agents |
+| `scripts/start.sh <project>` | Launch two iTerm windows with all agents |
 | `scripts/stop.sh <project>` | Graceful shutdown |
 | `scripts/reset-tasks.sh <project>` | Reset all task statuses to pending |
 | `scripts/share-file.sh <project> <file>` | Distribute file to all agent workspaces |
 | `scripts/nats-monitor.sh` | Live stream of all NATS messages |
 | `scripts/tmux-paste-image.sh` | Paste clipboard image into any agent pane |
+| `scripts/notify.sh "message"` | macOS text-to-speech announcement |
+| `scripts/push-notify.py "message"` | Pushover push notification |
+| `scripts/sms-notify.py "message"` | Twilio SMS notification |
+| `scripts/conversation-mode.py` | Standalone conversation mode listener |
 | `scripts/reset-demo.sh [project]` | Full reset: kill tmux + NATS stream + tasks + logs |
 
 ## Clean Start (Recommended)
@@ -151,10 +158,10 @@ If things are in a weird state, do a full reset before starting:
 cd ~/Repositories/multi-agent-system-shell
 bash scripts/reset-demo.sh demo
 bash scripts/start.sh demo
-tmux attach -t demo
 ```
 
-The writer agent will be at the Claude Code trust prompt. Switch to the agents window (`Ctrl-b 1`), select the writer pane, and press Enter to accept.
+On macOS, `start.sh` automatically opens two iTerm windows (control + agents).
+On other systems, attach manually: `tmux attach -t demo`.
 
 ## Troubleshooting
 

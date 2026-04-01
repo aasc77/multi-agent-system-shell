@@ -6,35 +6,43 @@ A config-driven multi-agent orchestrator. Define agents, their communication flo
 
 ## Architecture
 
+On macOS with iTerm2, `start.sh` opens **two separate iTerm windows** so you can
+arrange control and agents side-by-side on your screen:
+
 ```
-┌─────────────────────────────────────────────────┐
-│                    tmux session                  │
-│                                                  │
-│  Window 1: control                               │
-│  ┌──────────────────┬──────────────────┐         │
-│  │   orchestrator   │   nats-monitor   │         │
-│  │  (state machine) │  (live messages) │         │
-│  └──────────────────┴──────────────────┘         │
-│                                                  │
-│  Window 2: agents (tiled grid, N panes)          │
-│  ┌──────────────────┬──────────────────┐         │
-│  │    agent-1       │    agent-2       │         │
-│  │  (claude_code)   │  (script)        │         │
-│  └──────────────────┴──────────────────┘         │
-└─────────────────────────────────────────────────┘
+ iTerm Window 1 — control               iTerm Window 2 — agents
+┌──────────────────┬───────────────┐    ┌──────────────┬──────────────┐
+│   orchestrator   │  nats-monitor │    │  dev (hub)   │  qa (macmini)│
+│  (state machine  │ (live msgs)   │    │ (claude_code)│ (claude_code)│
+│   + console)     │               │    ├──────────────┼──────────────┤
+├──────────────────┘               │    │  dgx1        │  hassio      │
+│   manager (monitor)              │    │ (claude_code)│ (claude_code)│
+│  (autonomous oversight)          │    └──────────────┴──────────────┘
+└──────────────────────────────────┘
             │                    │
             └────── NATS ────────┘
               JetStream pub/sub
 ```
 
+Both windows share the same tmux session via grouped sessions, so each can
+independently view a different tmux window. On non-macOS systems, falls back to
+a single `tmux attach`.
+
 ### Key Concepts
 
 - **N agents** defined in config (not hardcoded). Any runtime: `claude_code` or `script`
+- **Local & remote agents**: SSH support for agents on other machines (DGX, Mac Mini, Hassio)
 - **NATS JetStream** for messaging. Subject convention: `agents.<role>.inbox`
 - **Config-driven state machine**: states + transitions in YAML, supports wildcards (`from: "*"`)
 - **Built-in actions**: `assign_to_agent`, `merge_and_assign`, `merge_to_default`, `flag_human`
-- **MCP bridge**: 2 generic tools (`send_message`, `check_messages`) for Claude Code agents
-- **tmux layout**: dynamic pane arrangement based on agent count
+- **MCP bridge**: tools for Claude Code agents (`send_message`, `check_messages`, `send_to_agent`)
+- **Manager agent**: autonomous monitor that watches task progress, agent health, and logs
+- **Idle watchdog**: detects idle agents with pending tasks and alerts the manager
+- **Inactivity announcer**: alerts when no agent has any NATS activity for a configurable threshold
+- **Conversation mode**: streams agent-to-agent messages to home speakers via Piper TTS
+- **Push notifications**: Pushover and Twilio SMS integration for external alerts
+- **Pane labels**: configurable labels per agent for clear pane identification
+- **Two-window iTerm layout**: control and agents in separate windows (macOS)
 
 ## Project Structure
 
@@ -58,13 +66,17 @@ multi-agent-system-shell/
 │   ├── index.js           # MCP server (send_message, check_messages)
 │   └── package.json
 ├── scripts/
-│   ├── start.sh           # Launch tmux session with all agents
+│   ├── start.sh           # Launch two iTerm windows with all agents
 │   ├── stop.sh            # Graceful shutdown
 │   ├── setup-nats.sh      # Install and start NATS server
 │   ├── reset-tasks.sh     # Reset task statuses to pending
 │   ├── nats-monitor.sh    # Live NATS message monitor
 │   ├── share-file.sh      # Distribute files to all agent workspaces
-│   └── tmux-paste-image.sh # Paste clipboard image into any agent pane
+│   ├── tmux-paste-image.sh # Paste clipboard image into any agent pane
+│   ├── notify.sh          # macOS text-to-speech notification helper
+│   ├── push-notify.py     # Pushover push notification script
+│   ├── sms-notify.py      # Twilio SMS notification script
+│   └── conversation-mode.py # Standalone conversation mode listener
 ├── projects/
 │   └── demo/              # Example project (writer + executor)
 │       ├── config.yaml    # Project config with agents + state machine
@@ -94,11 +106,13 @@ nats:
   subjects_prefix: agents
 
 tmux:
-  nudge_prompt: "You have new messages. Use check_messages with your role."
-  nudge_cooldown_seconds: 30
+  nudge_prompt: "check_messages"       # text sent to agent pane on nudge
+  nudge_cooldown_seconds: 30           # min seconds between nudges to same agent
+  max_nudge_retries: 20                # consecutive skips before agent marked stuck
+  monitor_nudge_prompt: "You have..."  # nudge text for monitor agents (e.g. manager)
 
 tasks:
-  max_attempts_per_task: 5
+  max_attempts_per_task: 5             # retries before task marked stuck
 ```
 
 ### Project Config (`projects/<name>/config.yaml`)
@@ -108,43 +122,67 @@ project: demo
 tmux:
   session_name: demo
 
+# Idle watchdog and inactivity announcer (optional)
+watchdog:
+  enabled: true
+  check_interval: 60          # seconds between idle checks
+  idle_cooldown: 300           # seconds before re-alerting same agent
+  announce_on_speaker: false
+  inactivity_announcer:
+    enabled: true
+    threshold_seconds: 300     # no-activity duration before first alert
+    escalate_after: 3          # alerts before escalation
+    announce_on_speaker: false
+
 agents:
-  writer:
+  manager:
+    runtime: claude_code
+    working_dir: .
+    role: monitor              # places agent in the control window
+    label: manager             # custom pane label
+    system_prompt: "You are the manager agent."
+  dev:
     runtime: claude_code
     working_dir: ./workspace
-    system_prompt: "You are a writer agent."
-  executor:
-    runtime: script
-    command: "python3 agents/echo_agent.py --role executor"
+    label: dev
+    system_prompt: "You are the dev agent."
+  qa:
+    runtime: claude_code
+    ssh_host: user@192.168.1.44          # remote agent via SSH
+    remote_working_dir: ~/mas-workspace
+    remote_bridge_path: ~/mas-bridge/index.js
+    remote_node_path: ~/local/bin/node   # custom Node.js path on remote
+    label: qa
+    system_prompt: "You are the QA agent."
 
 state_machine:
   initial: idle
   states:
     idle:
       description: "No active task"
-    waiting_writer:
-      agent: writer
-    waiting_executor:
-      agent: executor
+    waiting_dev:
+      agent: dev
+    waiting_qa:
+      agent: qa
   transitions:
     - from: idle
-      to: waiting_writer
+      to: waiting_dev
       trigger: task_assigned
       action: assign_to_agent
       action_args:
-        target_agent: writer
-    - from: waiting_writer
-      to: waiting_executor
+        target_agent: dev
+    - from: waiting_dev
+      to: waiting_qa
       trigger: agent_complete
-      source_agent: writer
+      source_agent: dev
       status: pass
       action: assign_to_agent
       action_args:
-        target_agent: executor
-    - from: waiting_executor
+        target_agent: qa
+    - from: waiting_qa
       to: idle
       trigger: agent_complete
-      source_agent: executor
+      source_agent: qa
       status: pass
 ```
 
