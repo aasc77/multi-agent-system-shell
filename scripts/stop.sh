@@ -74,6 +74,16 @@ session_exists() {
 }
 
 # -----------------------------------------------------------------------
+# Signal SSH reconnect loops to stop before killing the session
+# -----------------------------------------------------------------------
+echo "Signaling SSH agents to stop reconnecting..."
+for sentinel in /tmp/mas-launch-*; do
+    [ -f "$sentinel" ] || continue
+    agent_name=$(basename "$sentinel" | sed 's/^mas-launch-//; s/\.sh$//')
+    touch "/tmp/mas-stop-${agent_name}"
+done
+
+# -----------------------------------------------------------------------
 # Kill tmux session
 # -----------------------------------------------------------------------
 if session_exists; then

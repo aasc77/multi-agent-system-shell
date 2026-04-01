@@ -31,7 +31,7 @@ a single `tmux attach`.
 ### Key Concepts
 
 - **N agents** defined in config (not hardcoded). Any runtime: `claude_code` or `script`
-- **Local & remote agents**: SSH support for agents on other machines (DGX, Mac Mini, Hassio)
+- **Local & remote agents**: SSH support for agents on other machines with auto-reconnect on connection loss
 - **NATS JetStream** for messaging. Subject convention: `agents.<role>.inbox`
 - **Config-driven state machine**: states + transitions in YAML, supports wildcards (`from: "*"`)
 - **Built-in actions**: `assign_to_agent`, `merge_and_assign`, `merge_to_default`, `flag_human`
@@ -77,6 +77,7 @@ multi-agent-system-shell/
 │   ├── nats-monitor.sh    # Live NATS message monitor
 │   ├── share-file.sh      # Distribute files to all agent workspaces
 │   ├── tmux-paste-image.sh # Paste clipboard image into any agent pane
+│   ├── ssh-reconnect.sh   # Auto-reconnect wrapper for remote SSH agents
 │   ├── notify.sh          # macOS text-to-speech notification helper
 │   ├── push-notify.py     # Pushover push notification script
 │   ├── sms-notify.py      # Twilio SMS notification script

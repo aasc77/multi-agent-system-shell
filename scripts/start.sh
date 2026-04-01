@@ -600,7 +600,15 @@ setup_agent_panes() {
             fi
         fi
 
-        tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" "$launch_cmd" Enter
+        # For SSH agents, wrap in auto-reconnect loop
+        if [ -n "$ssh_host" ]; then
+            local launch_script="/tmp/mas-launch-${name}.sh"
+            echo "$launch_cmd" > "$launch_script"
+            tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" \
+                "bash ${SCRIPT_DIR}/ssh-reconnect.sh ${name}" Enter
+        else
+            tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" "$launch_cmd" Enter
+        fi
 
         pane_idx=$((pane_idx + 1))
     done <<< "$AGENT_DETAILS"
