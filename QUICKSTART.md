@@ -144,6 +144,7 @@ Files land in `shared/<filename>` in each agent's workspace. Agents can view the
 | `scripts/share-file.sh <project> <file>` | Distribute file to all agent workspaces |
 | `scripts/nats-monitor.sh` | Live stream of all NATS messages |
 | `scripts/tmux-paste-image.sh` | Paste clipboard image into any agent pane |
+| `scripts/ssh-reconnect.sh` | Auto-reconnect wrapper for remote SSH agents |
 | `scripts/notify.sh "message"` | macOS text-to-speech announcement |
 | `scripts/push-notify.py "message"` | Pushover push notification |
 | `scripts/sms-notify.py "message"` | Twilio SMS notification |
