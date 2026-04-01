@@ -49,17 +49,21 @@ a single `tmux attach`.
 ```
 multi-agent-system-shell/
 ├── orchestrator/          # Core orchestrator modules
-│   ├── config.py          # YAML config loader
+│   ├── __main__.py        # Entry point (python3 -m orchestrator <project>)
+│   ├── config.py          # YAML config loader (global + project merge)
 │   ├── state_machine.py   # Config-driven state engine
 │   ├── task_queue.py      # Task queue manager
 │   ├── nats_client.py     # NATS JetStream wrapper
-│   ├── router.py          # Message router
+│   ├── router.py          # Message router + inbox relay
 │   ├── tmux_comm.py       # tmux communication (nudge, clear, send)
 │   ├── lifecycle.py       # Task lifecycle manager
-│   ├── console.py         # Interactive console + LLM client
+│   ├── watchdog.py        # Idle agent detection + inactivity announcer
+│   ├── console.py         # Interactive console commands
 │   ├── llm_client.py      # Ollama LLM client
 │   ├── logging_setup.py   # Logging configuration
 │   └── session_report.py  # Session report generator
+├── manager/
+│   └── CLAUDE.md          # Manager agent instructions and monitoring workflow
 ├── agents/
 │   └── echo_agent.py      # Example script agent (speaks NATS directly)
 ├── mcp-bridge/
