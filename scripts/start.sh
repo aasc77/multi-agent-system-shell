@@ -629,28 +629,57 @@ if [ "$DRY_RUN" = "true" ]; then
     exit 0
 fi
 
-# Open two iTerm windows so control and agents are side-by-side on screen.
-# Uses grouped sessions so each window can view a different tmux window independently.
-# Note: iTerm's "command" option runs without loading shell profile, so we must
-# use the full path to tmux and launch via login shell for proper PATH.
-if command -v osascript &>/dev/null; then
-    TMUX_BIN="$(command -v tmux)"
+# -----------------------------------------------------------------------
+# Open two terminal windows (control + agents) using grouped sessions.
+# Each platform gets its own launcher; all share the same tmux commands:
+#   Window 1: tmux new-session -t <session> \; select-window -t control
+#   Window 2: tmux new-session -t <session> \; select-window -t agents
+# -----------------------------------------------------------------------
+TMUX_BIN="$(command -v tmux)"
+TMUX_CMD_CONTROL="${TMUX_BIN} new-session -t ${SESSION_NAME} \; select-window -t ${CONTROL_WINDOW}"
+TMUX_CMD_AGENTS="${TMUX_BIN} new-session -t ${SESSION_NAME} \; select-window -t ${AGENTS_WINDOW}"
 
-    # iTerm window 1: control (orch + NATS + manager)
-    osascript -e 'tell application "iTerm2"
-        activate
-        create window with default profile command "'"${TMUX_BIN}"' new-session -t '"${SESSION_NAME}"' \\; select-window -t '"${CONTROL_WINDOW}"'"
-    end tell' 2>/dev/null
+open_two_windows() {
+    if command -v osascript &>/dev/null; then
+        # macOS + iTerm2
+        osascript -e 'tell application "iTerm2"
+            activate
+            create window with default profile command "'"${TMUX_CMD_CONTROL}"'"
+        end tell' 2>/dev/null
+        sleep 1
+        osascript -e 'tell application "iTerm2"
+            create window with default profile command "'"${TMUX_CMD_AGENTS}"'"
+        end tell' 2>/dev/null
+        echo "Opened iTerm windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
 
-    sleep 1
+    elif command -v wt.exe &>/dev/null; then
+        # Windows Terminal (WSL)
+        wt.exe new-tab --title "${CONTROL_WINDOW}" -- bash -c "${TMUX_CMD_CONTROL}" 2>/dev/null
+        sleep 1
+        wt.exe new-tab --title "${AGENTS_WINDOW}" -- bash -c "${TMUX_CMD_AGENTS}" 2>/dev/null
+        echo "Opened Windows Terminal tabs: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
 
-    # iTerm window 2: agents (dev, QA, etc.)
-    osascript -e 'tell application "iTerm2"
-        create window with default profile command "'"${TMUX_BIN}"' new-session -t '"${SESSION_NAME}"' \\; select-window -t '"${AGENTS_WINDOW}"'"
-    end tell' 2>/dev/null
+    elif command -v gnome-terminal &>/dev/null; then
+        # Linux (GNOME)
+        gnome-terminal --title="${CONTROL_WINDOW}" -- bash -c "${TMUX_CMD_CONTROL}" 2>/dev/null &
+        sleep 1
+        gnome-terminal --title="${AGENTS_WINDOW}" -- bash -c "${TMUX_CMD_AGENTS}" 2>/dev/null &
+        echo "Opened GNOME terminals: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
 
-    echo "Opened iTerm windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
-else
-    # Fallback: plain tmux attach
-    exec tmux attach -t "$SESSION_NAME"
-fi
+    elif command -v xterm &>/dev/null; then
+        # Linux (xterm fallback)
+        xterm -title "${CONTROL_WINDOW}" -e "${TMUX_CMD_CONTROL}" 2>/dev/null &
+        sleep 1
+        xterm -title "${AGENTS_WINDOW}" -e "${TMUX_CMD_AGENTS}" 2>/dev/null &
+        echo "Opened xterm windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
+
+    else
+        # Last resort: attach in current terminal, print instructions for second
+        echo "Open a second terminal and run:"
+        echo "  ${TMUX_CMD_AGENTS}"
+        echo ""
+        exec ${TMUX_CMD_CONTROL}
+    fi
+}
+
+open_two_windows
