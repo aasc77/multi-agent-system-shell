@@ -631,24 +631,23 @@ fi
 
 # Open two iTerm windows so control and agents are side-by-side on screen.
 # Uses grouped sessions so each window can view a different tmux window independently.
+# Note: iTerm's "command" option runs without loading shell profile, so we must
+# use the full path to tmux and launch via login shell for proper PATH.
 if command -v osascript &>/dev/null; then
-    # iTerm window 1: control (orch + NATS + manager)
-    osascript -e "
-        tell application \"iTerm2\"
-            activate
-            set controlWindow to (create window with default profile command \"tmux new-session -t ${SESSION_NAME} \\\\; select-window -t ${CONTROL_WINDOW}\")
-        end tell
-    " 2>/dev/null
+    TMUX_BIN="$(command -v tmux)"
 
-    # Small delay so the grouped session is ready
+    # iTerm window 1: control (orch + NATS + manager)
+    osascript -e 'tell application "iTerm2"
+        activate
+        create window with default profile command "'"${TMUX_BIN}"' new-session -t '"${SESSION_NAME}"' \\; select-window -t '"${CONTROL_WINDOW}"'"
+    end tell' 2>/dev/null
+
     sleep 1
 
     # iTerm window 2: agents (dev, QA, etc.)
-    osascript -e "
-        tell application \"iTerm2\"
-            set agentsWindow to (create window with default profile command \"tmux new-session -t ${SESSION_NAME} \\\\; select-window -t ${AGENTS_WINDOW}\")
-        end tell
-    " 2>/dev/null
+    osascript -e 'tell application "iTerm2"
+        create window with default profile command "'"${TMUX_BIN}"' new-session -t '"${SESSION_NAME}"' \\; select-window -t '"${AGENTS_WINDOW}"'"
+    end tell' 2>/dev/null
 
     echo "Opened iTerm windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
 else
