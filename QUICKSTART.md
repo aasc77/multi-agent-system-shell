@@ -38,12 +38,14 @@ cd /path/to/multi-agent-system-shell
 ./scripts/start.sh demo
 ```
 
-On macOS, this opens **two iTerm windows**:
-- **iTerm window 1 (control)**: orchestrator + NATS monitor + manager agent
-- **iTerm window 2 (agents)**: one pane per agent (dev, QA, etc.) in a tiled grid
+This automatically opens **two terminal windows**:
+- **Window 1 (control)**: orchestrator + NATS monitor + manager agent
+- **Window 2 (agents)**: one pane per agent (dev, QA, etc.) in a tiled grid
 
+Supported terminals: iTerm2 (macOS), Windows Terminal (WSL), GNOME Terminal, xterm.
 Each window is a grouped tmux session, so they can independently show different
-tmux windows while sharing the same session.
+tmux windows while sharing the same session. If your terminal isn't auto-detected,
+it attaches the control window and prints a command to open the second window manually.
 
 ### tmux Navigation
 
@@ -161,8 +163,8 @@ bash scripts/reset-demo.sh demo
 bash scripts/start.sh demo
 ```
 
-On macOS, `start.sh` automatically opens two iTerm windows (control + agents).
-On other systems, attach manually: `tmux attach -t demo`.
+`start.sh` automatically opens two terminal windows (control + agents) on
+macOS (iTerm2), Linux (GNOME Terminal/xterm), and Windows (WSL + Windows Terminal).
 
 ## Troubleshooting
 

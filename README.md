@@ -6,11 +6,11 @@ A config-driven multi-agent orchestrator. Define agents, their communication flo
 
 ## Architecture
 
-On macOS with iTerm2, `start.sh` opens **two separate iTerm windows** so you can
-arrange control and agents side-by-side on your screen:
+`start.sh` automatically opens **two terminal windows** so you can arrange
+control and agents side-by-side on your screen:
 
 ```
- iTerm Window 1 — control               iTerm Window 2 — agents
+ Window 1 — control                     Window 2 — agents
 ┌──────────────────┬───────────────┐    ┌──────────────┬──────────────┐
 │   orchestrator   │  nats-monitor │    │  dev (hub)   │  qa (macmini)│
 │  (state machine  │ (live msgs)   │    │ (claude_code)│ (claude_code)│
@@ -25,8 +25,17 @@ arrange control and agents side-by-side on your screen:
 ```
 
 Both windows share the same tmux session via grouped sessions, so each can
-independently view a different tmux window. On non-macOS systems, falls back to
-a single `tmux attach`.
+independently view a different tmux window.
+
+**Supported terminals:**
+
+| Platform | Terminal | Method |
+|----------|----------|--------|
+| macOS | iTerm2 | Two windows via osascript |
+| Windows | Windows Terminal (WSL) | Two tabs via `wt.exe` |
+| Linux | GNOME Terminal | Two windows via `gnome-terminal` |
+| Linux | xterm (fallback) | Two windows via `xterm` |
+| Any | Current terminal | Attaches control window, prints command for second |
 
 ### Key Concepts
 
