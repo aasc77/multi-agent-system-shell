@@ -1,5 +1,5 @@
 nats:
-  url: nats://localhost:4222
+  url: nats://192.168.1.37:4222
   stream: AGENTS
   subjects_prefix: agents
 
@@ -7,6 +7,7 @@ tmux:
   nudge_prompt: "check_messages"
   nudge_cooldown_seconds: 30
   max_nudge_retries: 20
+  nudge_send_retries: 3
 
 tasks:
   max_attempts_per_task: 5

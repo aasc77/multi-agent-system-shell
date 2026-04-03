@@ -44,6 +44,13 @@ _CFG_NUDGE_PROMPT = "nudge_prompt"
 _CFG_MONITOR_NUDGE_PROMPT = "monitor_nudge_prompt"
 _CFG_COOLDOWN_SECONDS = "nudge_cooldown_seconds"
 _CFG_MAX_NUDGE_RETRIES = "max_nudge_retries"
+_CFG_NUDGE_SEND_RETRIES = "nudge_send_retries"
+
+# Default retry settings for send-keys delivery verification
+_DEFAULT_SEND_RETRIES = 3
+_SEND_KEYS_DELAY = 0.3       # seconds between text and Enter
+_VERIFY_DELAY = 0.5           # seconds before verifying delivery
+_RETRY_DELAY = 1.0            # seconds between retry attempts
 
 # tmux window name for agent panes (matches start.sh convention)
 _AGENTS_WINDOW = "agents"
@@ -90,6 +97,9 @@ class TmuxComm:
         )
         self._cooldown_seconds: int = tmux_cfg[_CFG_COOLDOWN_SECONDS]
         self._max_nudge_retries: int = tmux_cfg[_CFG_MAX_NUDGE_RETRIES]
+        self._send_retries: int = tmux_cfg.get(
+            _CFG_NUDGE_SEND_RETRIES, _DEFAULT_SEND_RETRIES,
+        )
 
         # Build pane mapping: agent_name -> 0-based pane index (config order).
         # Skip agents with role=monitor -- they launch in the control window,
@@ -318,24 +328,90 @@ class TmuxComm:
         return result.stdout.strip()
 
     @staticmethod
-    def _tmux_send_keys(target: str, text: str) -> None:
-        """Low-level wrapper: execute ``tmux send-keys`` with Enter.
-
-        Sends text and Enter separately to work with Claude Code's TUI
-        input handler, which may not process them correctly when sent
-        atomically in a single send-keys invocation.
-        """
-        # Send text first
-        subprocess.run(
+    def _tmux_send_keys_once(target: str, text: str) -> bool:
+        """Send text + Enter to a tmux pane. Returns True if tmux commands succeeded."""
+        result = subprocess.run(
             ["tmux", "send-keys", "-t", target, text],
             capture_output=True,
             text=True,
         )
-        # Brief delay for the TUI to register the text
-        time.sleep(0.3)
-        # Send Enter separately
-        subprocess.run(
+        if result.returncode != 0:
+            logger.warning("tmux send-keys text failed for %s: %s", target, result.stderr.strip())
+            return False
+        time.sleep(_SEND_KEYS_DELAY)
+        result = subprocess.run(
             ["tmux", "send-keys", "-t", target, "Enter"],
             capture_output=True,
             text=True,
+        )
+        if result.returncode != 0:
+            logger.warning("tmux send-keys Enter failed for %s: %s", target, result.stderr.strip())
+            return False
+        return True
+
+    @staticmethod
+    def _tmux_clear_input(target: str) -> None:
+        """Send Escape to clear any partial TUI input state."""
+        subprocess.run(
+            ["tmux", "send-keys", "-t", target, "Escape"],
+            capture_output=True,
+            text=True,
+        )
+        time.sleep(0.2)
+
+    @staticmethod
+    def _capture_pane_text(target: str, lines: int = 5) -> str:
+        """Capture recent pane text for delivery verification."""
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout if result.returncode == 0 else ""
+
+    def _tmux_send_keys(self, target: str, text: str) -> None:
+        """Send text + Enter to a tmux pane with retry on delivery failure.
+
+        After sending, captures the pane to verify the text appeared or
+        that the agent started processing (prompt disappeared). On failure,
+        sends Escape to clear TUI state and retries.
+        """
+        for attempt in range(1, self._send_retries + 1):
+            # On retry, clear TUI state first
+            if attempt > 1:
+                logger.info(
+                    "Nudge retry %d/%d for %s — clearing TUI state",
+                    attempt, self._send_retries, target,
+                )
+                self._tmux_clear_input(target)
+                time.sleep(_RETRY_DELAY)
+
+            if not self._tmux_send_keys_once(target, text):
+                continue
+
+            # Verify delivery: check if text appeared or agent started working
+            time.sleep(_VERIFY_DELAY)
+            pane_content = self._capture_pane_text(target, lines=8)
+            if not pane_content:
+                logger.warning("Could not capture pane %s for verification", target)
+                continue
+
+            # Success indicators: the sent text is visible, or the agent is
+            # now processing (no idle prompt visible in the last few lines)
+            last_lines = pane_content.strip().splitlines()[-3:] if pane_content.strip() else []
+            last_text = " ".join(last_lines)
+
+            # Check if our text landed or agent is actively working
+            if text.lower() in last_text.lower() or "❯" not in last_text:
+                logger.debug("Nudge delivered to %s on attempt %d", target, attempt)
+                return
+
+            logger.warning(
+                "Nudge text not detected in pane %s after attempt %d",
+                target, attempt,
+            )
+
+        logger.error(
+            "Failed to deliver nudge to %s after %d attempts",
+            target, self._send_retries,
         )
