@@ -38,19 +38,23 @@ cd /path/to/multi-agent-system-shell
 ./scripts/start.sh demo
 ```
 
-This creates a tmux session with:
-- **Window 1 (control)**: orchestrator + NATS monitor side-by-side
-- **Window 2 (agents)**: one pane per agent (writer + executor for the demo)
+This automatically opens **two terminal windows**:
+- **Window 1 (control)**: orchestrator + NATS monitor + manager agent
+- **Window 2 (agents)**: one pane per agent (dev, QA, etc.) in a tiled grid
+
+Supported terminals: iTerm2 (macOS), Windows Terminal (WSL), GNOME Terminal, xterm.
+Each window is a grouped tmux session, so they can independently show different
+tmux windows while sharing the same session. If your terminal isn't auto-detected,
+it attaches the control window and prints a command to open the second window manually.
 
 ### tmux Navigation
 
 | Key | Action |
 |-----|--------|
-| `Ctrl-b 1` | Switch to control window |
-| `Ctrl-b 2` | Switch to agents window |
 | `Ctrl-b o` | Cycle to next pane |
 | `Ctrl-b q` | Show pane numbers |
 | `Ctrl-b d` | Detach (session keeps running) |
+| `Ctrl-b V` | Paste clipboard image to current agent pane |
 
 ## 5. Interactive Commands
 
@@ -62,8 +66,11 @@ Type these in the orchestrator pane:
 | `tasks` | List all tasks with status |
 | `nudge <agent>` | Manually nudge an agent |
 | `msg <agent> TEXT` | Send text to an agent's pane |
+| `broadcast TEXT` | Send text to ALL agent panes |
+| `img <file> [agent]` | Share file to workspaces and notify agent |
+| `conversation on\|off` | Toggle conversation mode (hear agents on speakers) |
 | `skip` | Skip current stuck task |
-| `pause` / `resume` | Pause/resume polling |
+| `pause` / `resume` | Pause/resume outbox processing |
 | `log` | Show last 10 log entries |
 | `help` | Show all commands |
 
@@ -105,15 +112,59 @@ mkdir -p projects/my-project
 
 4. Launch: `./scripts/start.sh my-project`
 
+## Sharing Images/Files with Agents
+
+From the orchestrator pane, use the `img` command to distribute a file to all agent workspaces and notify a specific agent:
+
+```
+img ~/Screenshots/bug.png hub
+```
+
+Without an agent name, it targets the currently active agent:
+
+```
+img ~/diagram.png
+```
+
+From the shell (outside the orchestrator):
+
+```bash
+cd ~/Repositories/multi-agent-system-shell
+./scripts/share-file.sh remote-test ~/Screenshots/bug.png
+```
+
+Files land in `shared/<filename>` in each agent's workspace. Agents can view them with their Read tool.
+
 ## Utility Scripts
 
 | Script | Purpose |
 |--------|---------|
 | `scripts/setup-nats.sh` | Install and start NATS server with JetStream |
-| `scripts/start.sh <project>` | Launch tmux session with all agents |
+| `scripts/start.sh <project>` | Launch two iTerm windows with all agents |
 | `scripts/stop.sh <project>` | Graceful shutdown |
 | `scripts/reset-tasks.sh <project>` | Reset all task statuses to pending |
+| `scripts/share-file.sh <project> <file>` | Distribute file to all agent workspaces |
 | `scripts/nats-monitor.sh` | Live stream of all NATS messages |
+| `scripts/tmux-paste-image.sh` | Paste clipboard image into any agent pane |
+| `scripts/ssh-reconnect.sh` | Auto-reconnect wrapper for remote SSH agents |
+| `scripts/notify.sh "message"` | macOS text-to-speech announcement |
+| `scripts/push-notify.py "message"` | Pushover push notification |
+| `scripts/sms-notify.py "message"` | Twilio SMS notification |
+| `scripts/conversation-mode.py` | Standalone conversation mode listener |
+| `scripts/reset-demo.sh [project]` | Full reset: kill tmux + NATS stream + tasks + logs |
+
+## Clean Start (Recommended)
+
+If things are in a weird state, do a full reset before starting:
+
+```bash
+cd ~/Repositories/multi-agent-system-shell
+bash scripts/reset-demo.sh demo
+bash scripts/start.sh demo
+```
+
+`start.sh` automatically opens two terminal windows (control + agents) on
+macOS (iTerm2), Linux (GNOME Terminal/xterm), and Windows (WSL + Windows Terminal).
 
 ## Troubleshooting
 
@@ -122,3 +173,9 @@ mkdir -p projects/my-project
 **Ollama not responding**: Run `ollama serve` in another terminal.
 
 **Agent not picking up messages**: Try `nudge <agent>` in the orchestrator pane.
+
+**Orchestrator exits immediately**: Stale NATS consumers. Run `bash scripts/reset-demo.sh demo` for a clean slate.
+
+**CLAUDECODE env var leak**: If agents behave oddly, tmux may have inherited CLAUDECODE from a parent Claude Code session. `reset-demo.sh` clears this, or manually: `tmux set-environment -g -u CLAUDECODE`
+
+**Stale NATS consumers**: If you see "consumer is already bound" errors, run `bash scripts/reset-demo.sh demo` which deletes the AGENTS stream entirely.

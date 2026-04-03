@@ -74,6 +74,26 @@ session_exists() {
 }
 
 # -----------------------------------------------------------------------
+# Signal SSH reconnect loops to stop before killing the session
+# -----------------------------------------------------------------------
+echo "Signaling SSH agents to stop reconnecting..."
+for sentinel in /tmp/mas-launch-*; do
+    [ -f "$sentinel" ] || continue
+    agent_name=$(basename "$sentinel" | sed 's/^mas-launch-//; s/\.sh$//')
+    touch "/tmp/mas-stop-${agent_name}"
+done
+
+# -----------------------------------------------------------------------
+# Kill knowledge-store indexer
+# -----------------------------------------------------------------------
+echo "Stopping knowledge indexer..."
+if [ "$DRY_RUN" = "true" ]; then
+    echo "[DRY-RUN] pkill -f knowledge-store/indexer.py"
+else
+    pkill -f "knowledge-store/indexer.py" 2>/dev/null || true
+fi
+
+# -----------------------------------------------------------------------
 # Kill tmux session
 # -----------------------------------------------------------------------
 if session_exists; then

@@ -7,8 +7,10 @@ logging, and session report. Runs the async event loop.
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
+import time
 import threading
 import queue
 from pathlib import Path
@@ -23,6 +25,7 @@ from orchestrator.lifecycle import TaskLifecycleManager
 from orchestrator.console import Console
 from orchestrator.logging_setup import setup_logging
 from orchestrator.session_report import SessionReport
+from orchestrator.watchdog import IdleWatchdog
 
 # --- CLI ---
 parser = argparse.ArgumentParser(description="Multi-Agent System Shell Orchestrator")
@@ -70,6 +73,7 @@ component_config = {
     "tmux": tmux_config,
     "tasks": to_dict(config.tasks) if hasattr(config, "tasks") else {},
     "nats": nats_config,
+    "watchdog": to_dict(config.watchdog) if hasattr(config, "watchdog") else {},
 }
 
 # Task queue
@@ -110,12 +114,23 @@ console = Console(
     lifecycle_manager=lifecycle,
 )
 
+# Idle watchdog
+watchdog = IdleWatchdog(
+    lifecycle=lifecycle,
+    state_machine=state_machine,
+    nats_client=nats_client,
+    tmux_comm=tmux_comm,
+    config=component_config,
+)
+
 # Message router
 router = MessageRouter(
     nats_client=nats_client,
     state_machine=state_machine,
     lifecycle_manager=lifecycle,
     agents=agents_dict,
+    tmux_comm=tmux_comm,
+    watchdog=watchdog,
 )
 
 # --- Interactive command reader ---
@@ -165,6 +180,89 @@ async def main():
 
     logger.info("Type 'help' for commands")
     logger.info("")
+
+    # Start idle watchdog
+    watchdog_cfg = component_config.get("watchdog", {})
+    if watchdog_cfg.get("enabled", False):
+        asyncio.create_task(watchdog.run())
+        logger.info("Idle watchdog enabled")
+    else:
+        logger.info("Idle watchdog disabled (set watchdog.enabled: true to enable)")
+
+    # Inactivity announcer — speaks when no NATS activity for X seconds
+    announcer_cfg = watchdog_cfg.get("inactivity_announcer", {})
+    inactivity_threshold = announcer_cfg.get("threshold_seconds", 300)
+    escalate_after = announcer_cfg.get("escalate_after", 3)
+    _inactivity_count = 0
+    _inactivity_escalated = False
+
+    announce_on_speaker = announcer_cfg.get("announce_on_speaker", False)
+
+    async def inactivity_announcer():
+        nonlocal _inactivity_count, _inactivity_escalated
+        speaker_subject = "agents.hassio.speaker"
+        while True:
+            await asyncio.sleep(30)  # check every 30s
+            idle_seconds = time.time() - router.last_activity_time
+
+            # Check if we've crossed another inactivity threshold
+            if idle_seconds >= inactivity_threshold:
+                expected_count = int(idle_seconds // inactivity_threshold)
+                if expected_count > _inactivity_count:
+                    _inactivity_count = expected_count
+                    minutes = int(idle_seconds // 60)
+                    logger.info("Inactivity alert #%d — no activity for %d minutes", _inactivity_count, minutes)
+
+                    # Always notify manager via NATS
+                    notify = {
+                        "type": "agent_message",
+                        "from": "orchestrator",
+                        "message": f"Inactivity alert #{_inactivity_count}: no agent activity for {minutes} minutes. All agents appear idle.",
+                        "priority": "normal",
+                    }
+                    try:
+                        await nats_client.publish_to_inbox("manager", notify)
+                        logger.info("Inactivity alert #%d sent to manager", _inactivity_count)
+                    except Exception as e:
+                        logger.warning("Failed to notify manager: %s", e)
+
+                    # Optionally announce on speaker
+                    if announce_on_speaker:
+                        msg = json.dumps({
+                            "text": f"Orchestrator here. No agent activity for {minutes} minutes. Alert number {_inactivity_count}.",
+                            "from": "orchestrator",
+                        })
+                        try:
+                            await nats_client.publish_raw(speaker_subject, msg.encode())
+                        except Exception:
+                            pass
+
+                    # Escalate after N consecutive alerts
+                    if _inactivity_count >= escalate_after and not _inactivity_escalated:
+                        _inactivity_escalated = True
+                        logger.warning("Inactivity escalation — %d alerts, notifying manager to investigate", escalate_after)
+                        escalation = {
+                            "type": "agent_message",
+                            "from": "orchestrator",
+                            "message": f"ESCALATION: No agent activity for {_inactivity_count} consecutive checks. Investigate why agents are idle. Ask hub (QA) to run health tests.",
+                            "priority": "urgent",
+                        }
+                        try:
+                            await nats_client.publish_to_inbox("manager", escalation)
+                        except Exception as e:
+                            logger.warning("Failed to escalate: %s", e)
+
+            elif idle_seconds < inactivity_threshold:
+                if _inactivity_count > 0:
+                    logger.info("Activity resumed after %d inactivity alerts — flags cleared", _inactivity_count)
+                _inactivity_count = 0
+                _inactivity_escalated = False
+
+    if announcer_cfg.get("enabled", False):
+        asyncio.create_task(inactivity_announcer())
+        logger.info("Inactivity announcer enabled (threshold=%ds, escalate after %d)", inactivity_threshold, escalate_after)
+    else:
+        logger.info("Inactivity announcer disabled (set watchdog.inactivity_announcer.enabled: true to enable)")
 
     # Poll loop
     try:

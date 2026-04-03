@@ -41,8 +41,16 @@ _CFG_AGENTS = "agents"
 # tmux config keys
 _CFG_SESSION_NAME = "session_name"
 _CFG_NUDGE_PROMPT = "nudge_prompt"
+_CFG_MONITOR_NUDGE_PROMPT = "monitor_nudge_prompt"
 _CFG_COOLDOWN_SECONDS = "nudge_cooldown_seconds"
 _CFG_MAX_NUDGE_RETRIES = "max_nudge_retries"
+_CFG_NUDGE_SEND_RETRIES = "nudge_send_retries"
+
+# Default retry settings for send-keys delivery verification
+_DEFAULT_SEND_RETRIES = 3
+_SEND_KEYS_DELAY = 0.3       # seconds between text and Enter
+_VERIFY_DELAY = 0.5           # seconds before verifying delivery
+_RETRY_DELAY = 1.0            # seconds between retry attempts
 
 # tmux window name for agent panes (matches start.sh convention)
 _AGENTS_WINDOW = "agents"
@@ -83,13 +91,38 @@ class TmuxComm:
         tmux_cfg = config[_CFG_TMUX]
         self._session_name: str = tmux_cfg[_CFG_SESSION_NAME]
         self._nudge_prompt: str = tmux_cfg[_CFG_NUDGE_PROMPT]
+        self._monitor_nudge_prompt: str = tmux_cfg.get(
+            _CFG_MONITOR_NUDGE_PROMPT,
+            "You have new messages. Use check_messages with your role.",
+        )
         self._cooldown_seconds: int = tmux_cfg[_CFG_COOLDOWN_SECONDS]
         self._max_nudge_retries: int = tmux_cfg[_CFG_MAX_NUDGE_RETRIES]
+        self._send_retries: int = tmux_cfg.get(
+            _CFG_NUDGE_SEND_RETRIES, _DEFAULT_SEND_RETRIES,
+        )
 
-        # Build pane mapping: agent_name -> 0-based pane index (config order)
+        # Build pane mapping: agent_name -> 0-based pane index (config order).
+        # Skip agents with role=monitor -- they launch in the control window,
+        # not the agents window (mirrors start.sh behaviour).
+        pane_agents = [
+            name for name, cfg in config[_CFG_AGENTS].items()
+            if not (isinstance(cfg, dict) and cfg.get("role") == "monitor")
+        ]
         self._pane_mapping: dict[str, int] = {
-            name: idx for idx, name in enumerate(config[_CFG_AGENTS])
+            name: idx for idx, name in enumerate(pane_agents)
         }
+
+        # Monitor agents live in the control window (start.sh splits pane 0
+        # vertically and places the manager in pane 1).  Build a separate
+        # mapping so nudge/send_keys can reach them.
+        self._control_pane_mapping: dict[str, str] = {}
+        control_idx = 1  # pane 0 = orchestrator, pane 1 = first monitor agent
+        for name, cfg in config[_CFG_AGENTS].items():
+            if isinstance(cfg, dict) and cfg.get("role") == "monitor":
+                self._control_pane_mapping[name] = (
+                    f"{self._session_name}:control.{control_idx}"
+                )
+                control_idx += 1
 
         # Track which agents are claude_code (skip busy-check for them)
         self._claude_code_agents: set[str] = {
@@ -114,19 +147,55 @@ class TmuxComm:
         return dict(self._pane_mapping)
 
     def get_target(self, agent: str) -> str:
-        """Return canonical tmux target ``<session>:agents.<index>``.
+        """Return canonical tmux target for an agent.
+
+        Regular agents return ``<session>:agents.<index>``.
+        Monitor agents (e.g. manager) return their control window target.
 
         Raises:
-            TmuxCommError: If *agent* is not in the pane mapping.
+            TmuxCommError: If *agent* is not in any pane mapping.
         """
-        if agent not in self._pane_mapping:
-            raise TmuxCommError(f"Unknown agent: {agent}")
-        return f"{self._session_name}:{_AGENTS_WINDOW}.{self._pane_mapping[agent]}"
+        if agent in self._pane_mapping:
+            return f"{self._session_name}:{_AGENTS_WINDOW}.{self._pane_mapping[agent]}"
+        if agent in self._control_pane_mapping:
+            return self._control_pane_mapping[agent]
+        raise TmuxCommError(f"Unknown agent: {agent}")
 
     def send_keys(self, agent: str, text: str) -> None:
         """Send *text* to an agent's tmux pane via ``tmux send-keys`` with Enter."""
         target = self.get_target(agent)
         self._tmux_send_keys(target, text)
+
+    def capture_pane(self, agent: str, lines: int = 20) -> str | None:
+        """Capture the last *lines* of an agent's tmux pane.
+
+        Returns:
+            The captured text, or ``None`` on failure.
+        """
+        target = self.get_target(agent)
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def is_agent_idle(self, agent: str) -> bool:
+        """Return ``True`` if the agent's pane appears idle (at prompt).
+
+        Claude Code agents show a ``❯`` prompt when idle.
+        """
+        pane_text = self.capture_pane(agent, lines=5)
+        if pane_text is None:
+            return False
+        # Check if the last non-empty line ends with the Claude Code prompt
+        lines = [l for l in pane_text.strip().splitlines() if l.strip()]
+        if not lines:
+            return False
+        last = lines[-1].strip()
+        return last == "❯" or last.endswith("❯")
 
     def nudge(self, agent: str, force: bool = False) -> bool:
         """Nudge an agent pane with the configured nudge prompt.
@@ -153,8 +222,14 @@ class TmuxComm:
                 self._record_skip(agent)
                 return False
 
-        # Safe to nudge
-        self.send_keys(agent, self._nudge_prompt)
+        # Monitor agents (e.g. manager) are mid-conversation in Claude Code,
+        # so they need a conversational nudge, not a bare command.
+        prompt = (
+            self._monitor_nudge_prompt
+            if agent in self._control_pane_mapping
+            else self._nudge_prompt
+        )
+        self.send_keys(agent, prompt)
         self._last_nudge_time[agent] = time.time()
         self._reset_skip_tracking(agent)
         return True
@@ -253,24 +328,90 @@ class TmuxComm:
         return result.stdout.strip()
 
     @staticmethod
-    def _tmux_send_keys(target: str, text: str) -> None:
-        """Low-level wrapper: execute ``tmux send-keys`` with Enter.
-
-        Sends text and Enter separately to work with Claude Code's TUI
-        input handler, which may not process them correctly when sent
-        atomically in a single send-keys invocation.
-        """
-        # Send text first
-        subprocess.run(
+    def _tmux_send_keys_once(target: str, text: str) -> bool:
+        """Send text + Enter to a tmux pane. Returns True if tmux commands succeeded."""
+        result = subprocess.run(
             ["tmux", "send-keys", "-t", target, text],
             capture_output=True,
             text=True,
         )
-        # Brief delay for the TUI to register the text
-        time.sleep(0.3)
-        # Send Enter separately
-        subprocess.run(
+        if result.returncode != 0:
+            logger.warning("tmux send-keys text failed for %s: %s", target, result.stderr.strip())
+            return False
+        time.sleep(_SEND_KEYS_DELAY)
+        result = subprocess.run(
             ["tmux", "send-keys", "-t", target, "Enter"],
             capture_output=True,
             text=True,
+        )
+        if result.returncode != 0:
+            logger.warning("tmux send-keys Enter failed for %s: %s", target, result.stderr.strip())
+            return False
+        return True
+
+    @staticmethod
+    def _tmux_clear_input(target: str) -> None:
+        """Send Escape to clear any partial TUI input state."""
+        subprocess.run(
+            ["tmux", "send-keys", "-t", target, "Escape"],
+            capture_output=True,
+            text=True,
+        )
+        time.sleep(0.2)
+
+    @staticmethod
+    def _capture_pane_text(target: str, lines: int = 5) -> str:
+        """Capture recent pane text for delivery verification."""
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout if result.returncode == 0 else ""
+
+    def _tmux_send_keys(self, target: str, text: str) -> None:
+        """Send text + Enter to a tmux pane with retry on delivery failure.
+
+        After sending, captures the pane to verify the text appeared or
+        that the agent started processing (prompt disappeared). On failure,
+        sends Escape to clear TUI state and retries.
+        """
+        for attempt in range(1, self._send_retries + 1):
+            # On retry, clear TUI state first
+            if attempt > 1:
+                logger.info(
+                    "Nudge retry %d/%d for %s — clearing TUI state",
+                    attempt, self._send_retries, target,
+                )
+                self._tmux_clear_input(target)
+                time.sleep(_RETRY_DELAY)
+
+            if not self._tmux_send_keys_once(target, text):
+                continue
+
+            # Verify delivery: check if text appeared or agent started working
+            time.sleep(_VERIFY_DELAY)
+            pane_content = self._capture_pane_text(target, lines=8)
+            if not pane_content:
+                logger.warning("Could not capture pane %s for verification", target)
+                continue
+
+            # Success indicators: the sent text is visible, or the agent is
+            # now processing (no idle prompt visible in the last few lines)
+            last_lines = pane_content.strip().splitlines()[-3:] if pane_content.strip() else []
+            last_text = " ".join(last_lines)
+
+            # Check if our text landed or agent is actively working
+            if text.lower() in last_text.lower() or "❯" not in last_text:
+                logger.debug("Nudge delivered to %s on attempt %d", target, attempt)
+                return
+
+            logger.warning(
+                "Nudge text not detected in pane %s after attempt %d",
+                target, attempt,
+            )
+
+        logger.error(
+            "Failed to deliver nudge to %s after %d attempts",
+            target, self._send_retries,
         )

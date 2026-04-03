@@ -32,6 +32,7 @@ const OUTBOX_MESSAGE_TYPE = 'agent_complete';
 
 const TOOL_CHECK_MESSAGES = 'check_messages';
 const TOOL_SEND_MESSAGE = 'send_message';
+const TOOL_SEND_TO_AGENT = 'send_to_agent';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -39,6 +40,17 @@ const TOOL_SEND_MESSAGE = 'send_message';
 
 function buildSubject(role, channel) {
   return `${SUBJECT_PREFIX}.${role}.${channel}`;
+}
+
+let messageCounter = 0;
+
+function buildEnvelopeMetadata(priority) {
+  return {
+    message_id: `${agentRole}-${Date.now()}-${++messageCounter}`,
+    timestamp: new Date().toISOString(),
+    from: agentRole,
+    priority: priority || 'normal', // low, normal, high, urgent
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -65,13 +77,96 @@ let nc = null;
 let js = null;
 
 // ---------------------------------------------------------------------------
-// NATS connection
+// Reconnection settings
+// ---------------------------------------------------------------------------
+
+const RECONNECT_MAX_ATTEMPTS = -1; // unlimited
+const RECONNECT_INITIAL_DELAY_MS = 500;
+const RECONNECT_MAX_DELAY_MS = 30000;
+const PING_INTERVAL_MS = 10000; // detect dead connections faster
+
+// ---------------------------------------------------------------------------
+// NATS connection (with automatic reconnection)
 // ---------------------------------------------------------------------------
 
 async function connectNats() {
-  nc = await nats.connect({ servers: natsUrl });
+  nc = await nats.connect({
+    servers: natsUrl,
+    maxReconnectAttempts: RECONNECT_MAX_ATTEMPTS,
+    reconnect: true,
+    reconnectTimeWait: RECONNECT_INITIAL_DELAY_MS,
+    reconnectJitter: 500,
+    reconnectJitterTLS: 1000,
+    reconnectDelayHandler: () => {
+      // Exponential backoff capped at max delay
+      const attempt = nc ? (nc.stats().reconnects || 0) : 0;
+      const delay = Math.min(
+        RECONNECT_INITIAL_DELAY_MS * Math.pow(2, attempt),
+        RECONNECT_MAX_DELAY_MS,
+      );
+      return delay;
+    },
+    pingInterval: PING_INTERVAL_MS,
+    maxPingOut: 3,
+  });
+
   js = nc.jetstream();
   process.stderr.write(`MCP bridge connected to NATS as "${agentRole}"\n`);
+
+  // Monitor connection status changes
+  (async () => {
+    for await (const status of nc.status()) {
+      switch (status.type) {
+        case 'disconnect':
+          process.stderr.write(
+            `[${new Date().toISOString()}] NATS disconnected: ${status.data || 'unknown reason'}\n`,
+          );
+          break;
+        case 'reconnect':
+          js = nc.jetstream(); // refresh JetStream context after reconnect
+          process.stderr.write(
+            `[${new Date().toISOString()}] NATS reconnected to ${status.data || natsUrl}\n`,
+          );
+          break;
+        case 'reconnecting':
+          process.stderr.write(
+            `[${new Date().toISOString()}] NATS reconnecting...\n`,
+          );
+          break;
+        case 'error':
+          process.stderr.write(
+            `[${new Date().toISOString()}] NATS error: ${status.data}\n`,
+          );
+          break;
+      }
+    }
+  })();
+}
+
+// ---------------------------------------------------------------------------
+// Retry helper -- retries on CONNECTION_CLOSED / transient NATS errors
+// ---------------------------------------------------------------------------
+
+async function withRetry(fn, label, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isTransient =
+        /CONNECTION_CLOSED|DISCONNECT|TIMEOUT|reconnect/i.test(err.message);
+      if (isTransient && attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
+        process.stderr.write(
+          `[${new Date().toISOString()}] ${label} failed (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message} -- retrying in ${delay}ms\n`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        // Refresh JetStream context in case we reconnected
+        if (nc) js = nc.jetstream();
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +235,7 @@ async function handleSendMessage(params) {
 
   const envelope = {
     type: OUTBOX_MESSAGE_TYPE,
+    ...buildEnvelopeMetadata(content.priority),
     ...content,
   };
 
@@ -155,6 +251,46 @@ async function handleSendMessage(params) {
   } catch (err) {
     return {
       content: [{ type: 'text', text: `Error publishing message: ${err.message}` }],
+      isError: true,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tool: send_to_agent
+// ---------------------------------------------------------------------------
+
+async function handleSendToAgent(params) {
+  const targetAgent = params.target_agent;
+  const message = params.message || '';
+  const priority = params.priority || 'normal';
+
+  if (!targetAgent) {
+    return {
+      content: [{ type: 'text', text: 'Error: target_agent is required' }],
+      isError: true,
+    };
+  }
+
+  const targetInbox = buildSubject(targetAgent, CHANNEL_INBOX);
+  const envelope = {
+    type: 'agent_message',
+    ...buildEnvelopeMetadata(priority),
+    message,
+  };
+
+  try {
+    const payload = sc.encode(JSON.stringify(envelope));
+    const ack = await js.publish(targetInbox, payload);
+    return {
+      content: [{
+        type: 'text',
+        text: `Message sent to ${targetAgent} via ${targetInbox} (seq: ${ack.seq})`,
+      }],
+    };
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `Error sending to ${targetAgent}: ${err.message}` }],
       isError: true,
     };
   }
@@ -177,6 +313,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {},
+      },
+    },
+    {
+      name: TOOL_SEND_TO_AGENT,
+      description: 'Send a direct message to another agent by name. The message lands in their inbox immediately. Messages include timestamp, message_id, and priority.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          target_agent: {
+            type: 'string',
+            description: 'Name of the target agent (e.g. "hub", "dgx", "macmini")',
+          },
+          message: {
+            type: 'string',
+            description: 'The message to send',
+          },
+          priority: {
+            type: 'string',
+            enum: ['low', 'normal', 'high', 'urgent'],
+            description: 'Message priority. Default: normal. Use "urgent" for time-sensitive tasks, "high" for important but not immediate.',
+          },
+        },
+        required: ['target_agent', 'message'],
       },
     },
     {
@@ -206,9 +365,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   switch (name) {
     case TOOL_CHECK_MESSAGES:
-      return handleCheckMessages();
+      return withRetry(() => handleCheckMessages(), 'check_messages');
     case TOOL_SEND_MESSAGE:
-      return handleSendMessage(params || {});
+      return withRetry(() => handleSendMessage(params || {}), 'send_message');
+    case TOOL_SEND_TO_AGENT:
+      return withRetry(() => handleSendToAgent(params || {}), 'send_to_agent');
     default:
       return {
         content: [{ type: 'text', text: `Unknown tool: ${name}` }],

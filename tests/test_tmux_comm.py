@@ -179,6 +179,36 @@ class TestPaneIndexMapping:
         assert mapping["gamma"] == 2
         assert mapping["delta"] == 3
 
+    def test_monitor_agent_excluded_from_pane_mapping(self):
+        """Manager agent with role=monitor must not get a pane index.
+
+        start.sh launches monitor agents in the control window, not the
+        agents window.  If TmuxComm includes them in the mapping the
+        indices for all subsequent agents are off by one.
+        """
+        config = {
+            "tmux": {
+                "session_name": "remote-test",
+                "nudge_prompt": "check",
+                "nudge_cooldown_seconds": 30,
+                "max_nudge_retries": 20,
+            },
+            "agents": {
+                "manager": {"runtime": "claude_code", "role": "monitor"},
+                "hub": {"runtime": "claude_code"},
+                "dgx": {"runtime": "claude_code", "ssh_host": "dgx@10.0.0.1"},
+                "macmini": {"runtime": "claude_code", "ssh_host": "user@10.0.0.2"},
+                "hassio": {"runtime": "claude_code", "ssh_host": "hassio@10.0.0.3"},
+            },
+        }
+        comm = TmuxComm(config)
+        mapping = comm.get_pane_mapping()
+        assert "manager" not in mapping
+        assert mapping["hub"] == 0
+        assert mapping["dgx"] == 1
+        assert mapping["macmini"] == 2
+        assert mapping["hassio"] == 3
+
 
 # ===========================================================================
 # 2. CANONICAL TARGET FORMAT

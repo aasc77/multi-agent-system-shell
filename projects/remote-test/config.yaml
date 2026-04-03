@@ -3,105 +3,125 @@ tmux:
   session_name: remote-test
 
 nats:
-  url: nats://192.168.1.25:4222
+  url: nats://192.168.1.38:4222
+
+watchdog:
+  enabled: true
+  check_interval: 60
+  idle_cooldown: 300
+  announce_on_speaker: false
+  inactivity_announcer:
+    enabled: false
+    threshold_seconds: 300
+    escalate_after: 3
+    announce_on_speaker: false
 
 agents:
-  local1:
+  manager:
+    runtime: claude_code
+    working_dir: .
+    role: monitor
+    label: manager
+    system_prompt: "You are the manager agent. Follow the instructions in manager/CLAUDE.md exactly. Start your monitoring loop immediately. Be silent when things work."
+  hub:
     runtime: claude_code
     working_dir: ./workspace
-    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
-  remote1:
+    label: hub (dev)
+    system_prompt: "You are the dev agent on the Mac hub. Your role is to write code, build features, deploy services, and fix bugs. You are the primary builder — the orchestrator codebase is local at /Users/angelserrano/Repositories/multi-agent-system-shell/. When you finish work, notify macmini (the QA agent) to verify it. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
+  dgx:
     runtime: claude_code
     ssh_host: dgx@192.168.1.51
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
-    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
-  remote2:
+    label: dgx1
+    system_prompt: "You are a collaborator agent on the DGX server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
+  macmini:
     runtime: claude_code
-    ssh_host: angelserrano@192.168.1.31
+    ssh_host: angelserrano@192.168.1.44
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
     remote_node_path: ~/local/bin/node
-    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
-  local2:
+    label: macmini (qa)
+    system_prompt: "You are the QA agent on the Mac Mini. Your role is to verify, test, and validate work done by other agents — especially hub (the dev agent). Review code, run tests, verify deployments, and confirm things actually work before reporting pass/fail. Do not write production code — that is hub job. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
+  hassio:
     runtime: claude_code
-    working_dir: ./workspace
-    system_prompt: "You are a collaborator agent. Complete the assigned task and report results."
+    ssh_host: hassio@192.168.1.50
+    remote_working_dir: ~/mas-workspace
+    remote_bridge_path: ~/mas-bridge/index.js
+    label: hassio
+    system_prompt: "You are a collaborator agent on the Hassio server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
+  dgx2:
+    runtime: claude_code
+    ssh_host: dgx2@192.168.1.49
+    remote_working_dir: ~/mas-workspace
+    remote_bridge_path: ~/mas-bridge/index.js
+    label: dgx2
+    system_prompt: "You are a collaborator agent on DGX2 (second DGX Spark). Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
 
 state_machine:
   initial: idle
   states:
     idle: { description: "No active task" }
-    waiting_local1: { agent: local1 }
-    waiting_remote1: { agent: remote1 }
-    waiting_remote2: { agent: remote2 }
-    waiting_local2: { agent: local2 }
+    waiting_hub: { agent: hub }
+    waiting_dgx: { agent: dgx }
+    waiting_dgx2: { agent: dgx2 }
+    waiting_macmini: { agent: macmini }
+    waiting_hassio: { agent: hassio }
   transitions:
+    # Task starts at hub
     - from: idle
-      to: waiting_local1
+      to: waiting_hub
       trigger: task_assigned
       action: assign_to_agent
-      action_args: { target_agent: local1 }
+      action_args: { target_agent: hub }
 
-    - from: waiting_local1
-      to: waiting_remote1
+    # Hub completes → DGX picks up (with hub's output)
+    - from: waiting_hub
+      to: waiting_dgx
       trigger: agent_complete
-      source_agent: local1
+      source_agent: hub
       status: pass
       action: assign_to_agent
-      action_args: { target_agent: remote1 }
+      action_args: { target_agent: dgx }
 
-    - from: waiting_remote1
-      to: waiting_remote2
+    # DGX completes → DGX2 picks up
+    - from: waiting_dgx
+      to: waiting_dgx2
       trigger: agent_complete
-      source_agent: remote1
+      source_agent: dgx
       status: pass
       action: assign_to_agent
-      action_args: { target_agent: remote2 }
+      action_args: { target_agent: dgx2 }
 
-    - from: waiting_remote2
-      to: waiting_local2
+    # DGX2 completes → Mac Mini picks up
+    - from: waiting_dgx2
+      to: waiting_macmini
       trigger: agent_complete
-      source_agent: remote2
+      source_agent: dgx2
       status: pass
       action: assign_to_agent
-      action_args: { target_agent: local2 }
+      action_args: { target_agent: macmini }
 
-    - from: waiting_local2
+    # Mac Mini completes → Hassio picks up
+    - from: waiting_macmini
+      to: waiting_hassio
+      trigger: agent_complete
+      source_agent: macmini
+      status: pass
+      action: assign_to_agent
+      action_args: { target_agent: hassio }
+
+    # Hassio completes → done
+    - from: waiting_hassio
       to: idle
       trigger: agent_complete
-      source_agent: local2
+      source_agent: hassio
       status: pass
 
-    # Failures
-    - from: waiting_local1
+    # Any agent fails → flag human
+    - from: "*"
       to: idle
       trigger: agent_complete
-      source_agent: local1
       status: fail
       action: flag_human
-      action_args: { reason: "local1 failed" }
-
-    - from: waiting_remote1
-      to: idle
-      trigger: agent_complete
-      source_agent: remote1
-      status: fail
-      action: flag_human
-      action_args: { reason: "remote1 failed" }
-
-    - from: waiting_remote2
-      to: idle
-      trigger: agent_complete
-      source_agent: remote2
-      status: fail
-      action: flag_human
-      action_args: { reason: "remote2 failed" }
-
-    - from: waiting_local2
-      to: idle
-      trigger: agent_complete
-      source_agent: local2
-      status: fail
-      action: flag_human
-      action_args: { reason: "local2 failed" }
+      action_args: { reason: "agent failed task" }
