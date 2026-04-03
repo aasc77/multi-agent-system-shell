@@ -5,7 +5,7 @@ Subscribes to all agent inbox messages on NATS and forwards agent-to-agent
 messages to the hassio speaker service so they're spoken aloud via Piper TTS.
 
 Usage:
-    python3 scripts/conversation-mode.py [--nats-url nats://192.168.1.38:4222]
+    python3 scripts/conversation-mode.py [--nats-url nats://192.168.1.37:4222]
 
 Each agent's message is spoken in their assigned voice (resolved by the
 speaker service from the 'from' field).
@@ -154,8 +154,8 @@ def main():
     parser = argparse.ArgumentParser(description="Conversation Mode — hear agents talk")
     parser.add_argument(
         "--nats-url",
-        default="nats://192.168.1.38:4222",
-        help="NATS server URL (default: nats://192.168.1.38:4222)",
+        default="nats://192.168.1.37:4222",
+        help="NATS server URL (default: nats://192.168.1.37:4222)",
     )
     args = parser.parse_args()
 
