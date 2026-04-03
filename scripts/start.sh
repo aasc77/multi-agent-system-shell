@@ -257,6 +257,21 @@ for agent_name, agent_cfg in agents.items():
         }
     }
 
+    # Add knowledge-store MCP server for local agents only
+    if not is_remote:
+        ks_path = os.path.join(root_dir, 'knowledge-store', 'server.py')
+        if os.path.isfile(ks_path):
+            mcp_config['mcpServers']['knowledge-store'] = {
+                'command': 'python3',
+                'args': [ks_path],
+                'env': {
+                    'AGENT_ROLE': agent_name,
+                    'NATS_URL': nats_url,
+                    'OLLAMA_URL': 'http://localhost:11434',
+                    'CHROMADB_PATH': os.path.join(root_dir, 'data', 'chromadb'),
+                }
+            }
+
     config_path = os.path.join(mcp_dir, f'{agent_name}.json')
     with open(config_path, 'w') as f:
         json.dump(mcp_config, f, indent=2)
@@ -397,6 +412,17 @@ setup_control_window() {
     tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" \
         "cd ${ROOT_DIR} && python3 -m orchestrator ${PROJECT}" Enter
 
+    # Start knowledge-store indexer as a background daemon (if available)
+    local indexer_script="${ROOT_DIR}/knowledge-store/indexer.py"
+    if [ -f "$indexer_script" ]; then
+        mkdir -p "${ROOT_DIR}/data"
+        NATS_URL="${NATS_URL}" \
+        CHROMADB_PATH="${ROOT_DIR}/data/chromadb" \
+        OLLAMA_URL="http://localhost:11434" \
+            python3 "$indexer_script" >> "${ROOT_DIR}/data/indexer.log" 2>&1 &
+        echo "Knowledge indexer started (PID: $!)"
+    fi
+
     tmux_cmd split-window -h -t "${SESSION_NAME}:${CONTROL_WINDOW}"
     tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "nats-monitor"
 
@@ -440,7 +466,7 @@ agents = json.loads(sys.stdin.read())
 print(agents.get('manager', {}).get('system_prompt', ''))
 " <<< "$AGENTS_JSON")
 
-        local manager_cmd="cd ${ROOT_DIR} && unset CLAUDECODE; claude --dangerously-skip-permissions --strict-mcp-config --mcp-config ${mcp_config_path} --allowedTools mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent"
+        local manager_cmd="cd ${ROOT_DIR} && unset CLAUDECODE; claude --dangerously-skip-permissions --strict-mcp-config --mcp-config ${mcp_config_path} --allowedTools mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent,mcp__knowledge-store__search_knowledge"
         if [ -n "$manager_prompt" ]; then
             manager_cmd="${manager_cmd} --append-system-prompt '${manager_prompt}'"
         fi
@@ -497,7 +523,7 @@ build_launch_command() {
     local launch_cmd=""
 
     if [ "$runtime" = "$RUNTIME_CLAUDE_CODE" ]; then
-        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent"
+        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent,mcp__knowledge-store__search_knowledge"
 
         if [ -n "$ssh_host" ]; then
             # Remote agent: use remote paths, pass settings inline to skip onboarding prompts

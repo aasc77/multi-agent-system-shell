@@ -26,6 +26,9 @@ workspace/shared/
 .env
 workspace/.env
 
+# Knowledge store data
+data/chromadb/
+
 # Logs
 *.log
 
