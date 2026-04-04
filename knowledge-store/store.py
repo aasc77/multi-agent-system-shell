@@ -25,27 +25,35 @@ CHROMADB_PATH = os.environ.get(
 )
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
-COLLECTION_NAME = "agent_messages"
+COLLECTION_MESSAGES = "agent_messages"
+COLLECTION_OPS_KNOWLEDGE = "operational_knowledge"
 
 # ---------------------------------------------------------------------------
 # ChromaDB client (lazy-initialized to avoid startup cost)
 # ---------------------------------------------------------------------------
 
 _client = None
-_collection = None
+_collections: dict[str, object] = {}
 
 
-def _get_collection():
-    global _client, _collection
-    if _collection is None:
+def _get_client():
+    global _client
+    if _client is None:
         os.makedirs(CHROMADB_PATH, exist_ok=True)
         _client = chromadb.PersistentClient(path=CHROMADB_PATH)
-        _collection = _client.get_or_create_collection(
-            name=COLLECTION_NAME,
+        logger.info("ChromaDB client ready at %s", CHROMADB_PATH)
+    return _client
+
+
+def _get_collection(name: str = COLLECTION_MESSAGES):
+    if name not in _collections:
+        client = _get_client()
+        _collections[name] = client.get_or_create_collection(
+            name=name,
             metadata={"hnsw:space": "cosine"},
         )
-        logger.info("ChromaDB collection '%s' ready at %s", COLLECTION_NAME, CHROMADB_PATH)
-    return _collection
+        logger.info("ChromaDB collection '%s' ready", name)
+    return _collections[name]
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +147,7 @@ async def index_message(message: dict, subject: str) -> bool:
         "priority": message.get("priority", "normal"),
     }
 
-    collection = _get_collection()
+    collection = _get_collection(COLLECTION_MESSAGES)
     collection.upsert(
         ids=[msg_id],
         embeddings=[embedding],
@@ -149,35 +157,114 @@ async def index_message(message: dict, subject: str) -> bool:
     return True
 
 
+async def index_document(
+    text: str,
+    title: str,
+    category: str = "general",
+    doc_id: str | None = None,
+) -> str:
+    """
+    Index an arbitrary document into the operational_knowledge collection.
+
+    Args:
+        text: The document content to index.
+        title: Human-readable title for the document.
+        category: Category tag (e.g. "architecture", "runbook", "config").
+        doc_id: Optional explicit ID. Auto-generated from title if not provided.
+
+    Returns:
+        The document ID used for the upsert.
+    """
+    from datetime import datetime, timezone
+
+    if not text.strip():
+        raise ValueError("Document text cannot be empty")
+
+    if doc_id is None:
+        # Deterministic ID from title for idempotent re-indexing
+        doc_id = "ops-" + title.lower().replace(" ", "-").replace("/", "-")[:80]
+
+    embedding = await get_embedding(text)
+
+    metadata = {
+        "title": title,
+        "category": category,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "collection_type": "operational_knowledge",
+    }
+
+    collection = _get_collection(COLLECTION_OPS_KNOWLEDGE)
+    collection.upsert(
+        ids=[doc_id],
+        embeddings=[embedding],
+        documents=[text],
+        metadatas=[metadata],
+    )
+    logger.info("Indexed ops document '%s' (category=%s)", title, category)
+    return doc_id
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
 
-async def search(query: str, n_results: int = 5, where: dict | None = None) -> list[dict]:
+async def search(
+    query: str,
+    n_results: int = 5,
+    where: dict | None = None,
+    collections: list[str] | None = None,
+) -> list[dict]:
     """
-    Semantic search over indexed messages.
+    Semantic search over indexed data.
 
-    Returns list of dicts with id, text, metadata, and distance (lower = more similar).
+    Args:
+        query: Natural language search query.
+        n_results: Max results to return.
+        where: Optional ChromaDB metadata filter.
+        collections: Which collections to search. Defaults to both.
+
+    Returns list of dicts with id, text, metadata, source, and distance.
     """
+    if collections is None:
+        collections = [COLLECTION_MESSAGES, COLLECTION_OPS_KNOWLEDGE]
+
     embedding = await get_embedding(query)
 
-    kwargs = {
-        "query_embeddings": [embedding],
-        "n_results": n_results,
-        "include": ["documents", "metadatas", "distances"],
-    }
-    if where:
-        kwargs["where"] = where
+    all_items = []
+    for coll_name in collections:
+        try:
+            collection = _get_collection(coll_name)
+        except Exception:
+            continue
 
-    collection = _get_collection()
-    results = collection.query(**kwargs)
+        # Check if collection has any documents before querying
+        count = collection.count()
+        if count == 0:
+            continue
 
-    items = []
-    for i in range(len(results["ids"][0])):
-        items.append({
-            "id": results["ids"][0][i],
-            "text": results["documents"][0][i],
-            "metadata": results["metadatas"][0][i],
-            "distance": round(results["distances"][0][i], 4),
-        })
-    return items
+        kwargs = {
+            "query_embeddings": [embedding],
+            "n_results": min(n_results, count),
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
+
+        try:
+            results = collection.query(**kwargs)
+        except Exception as e:
+            logger.warning("Search failed on collection '%s': %s", coll_name, e)
+            continue
+
+        for i in range(len(results["ids"][0])):
+            all_items.append({
+                "id": results["ids"][0][i],
+                "text": results["documents"][0][i],
+                "metadata": results["metadatas"][0][i],
+                "source": coll_name,
+                "distance": round(results["distances"][0][i], 4),
+            })
+
+    # Merge by relevance (lowest distance first) and trim
+    all_items.sort(key=lambda x: x["distance"])
+    return all_items[:n_results]

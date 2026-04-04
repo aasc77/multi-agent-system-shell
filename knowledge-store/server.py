@@ -34,10 +34,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_knowledge",
             description=(
-                "Search the shared knowledge base for past agent messages and conversations. "
-                "Uses semantic search — describe what you're looking for in natural language. "
-                "Returns matching messages with metadata (who sent it, when, relevance score). "
-                "Optionally filter by source or target agent."
+                "Search the shared knowledge base for past agent messages, conversations, "
+                "and operational documentation. Uses semantic search — describe what you're "
+                "looking for in natural language. Returns matching results from both agent "
+                "messages and operational knowledge, merged by relevance."
             ),
             inputSchema={
                 "type": "object",
@@ -53,14 +53,49 @@ async def list_tools() -> list[Tool]:
                     },
                     "from_agent": {
                         "type": "string",
-                        "description": "Filter by source agent name (e.g., 'hub', 'dgx', 'macmini')",
+                        "description": "Filter by source agent name (e.g., 'hub', 'dgx', 'macmini'). Only applies to agent_messages.",
                     },
                     "to_agent": {
                         "type": "string",
-                        "description": "Filter by target agent name",
+                        "description": "Filter by target agent name. Only applies to agent_messages.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["all", "messages", "ops"],
+                        "description": "Which collection to search: 'all' (default), 'messages' (agent messages only), 'ops' (operational knowledge only)",
+                        "default": "all",
                     },
                 },
                 "required": ["query"],
+            },
+        ),
+        Tool(
+            name="index_knowledge",
+            description=(
+                "Store operational knowledge (system docs, runbooks, architecture notes) "
+                "into the shared knowledge base. Use this to persist information that agents "
+                "need to recall later — e.g., how NATS messaging works, IP addresses, "
+                "startup procedures. Documents are deduplicated by title."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the document (e.g., 'Tmux Pane Layout', 'Network Map')",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The document content to index",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["architecture", "runbook", "config", "status", "general"],
+                        "description": "Category for the document (default: 'general')",
+                        "default": "general",
+                    },
+                },
+                "required": ["title", "content"],
             },
         ),
     ]
@@ -68,16 +103,30 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
-    if name != "search_knowledge":
+    if name == "search_knowledge":
+        return await _handle_search(arguments)
+    elif name == "index_knowledge":
+        return await _handle_index(arguments)
+    else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
+
+async def _handle_search(arguments: dict):
     query = arguments.get("query", "")
     if not query:
         return [TextContent(type="text", text="Error: query is required")]
 
     n_results = min(arguments.get("n_results", 5), 20)
 
-    # Build optional metadata filter
+    # Determine which collections to search
+    source = arguments.get("source", "all")
+    collections = None  # default: both
+    if source == "messages":
+        collections = [store.COLLECTION_MESSAGES]
+    elif source == "ops":
+        collections = [store.COLLECTION_OPS_KNOWLEDGE]
+
+    # Build optional metadata filter (only meaningful for agent_messages)
     where_clauses = []
     if arguments.get("from_agent"):
         where_clauses.append({"from": arguments["from_agent"]})
@@ -91,14 +140,46 @@ async def call_tool(name: str, arguments: dict):
         where = {"$and": where_clauses}
 
     try:
-        results = await store.search(query, n_results=n_results, where=where)
+        results = await store.search(
+            query,
+            n_results=n_results,
+            where=where if source != "ops" else None,
+            collections=collections,
+        )
         if not results:
-            return [TextContent(type="text", text="No matching messages found.")]
+            return [TextContent(type="text", text="No matching results found.")]
         return [TextContent(type="text", text=json.dumps(results, indent=2))]
     except Exception as e:
         return [TextContent(
             type="text",
             text=f"Knowledge search failed: {e}. Is Ollama running at {store.OLLAMA_URL}?",
+        )]
+
+
+async def _handle_index(arguments: dict):
+    title = arguments.get("title", "")
+    content = arguments.get("content", "")
+    category = arguments.get("category", "general")
+
+    if not title:
+        return [TextContent(type="text", text="Error: title is required")]
+    if not content:
+        return [TextContent(type="text", text="Error: content is required")]
+
+    try:
+        doc_id = await store.index_document(
+            text=content,
+            title=title,
+            category=category,
+        )
+        return [TextContent(
+            type="text",
+            text=f"Indexed operational knowledge: '{title}' (id={doc_id}, category={category})",
+        )]
+    except Exception as e:
+        return [TextContent(
+            type="text",
+            text=f"Failed to index knowledge: {e}. Is Ollama running at {store.OLLAMA_URL}?",
         )]
 
 

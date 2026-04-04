@@ -154,8 +154,8 @@ def main():
     parser = argparse.ArgumentParser(description="Conversation Mode — hear agents talk")
     parser.add_argument(
         "--nats-url",
-        default="nats://192.168.1.37:4222",
-        help="NATS server URL (default: nats://192.168.1.37:4222)",
+        default="nats://127.0.0.1:4222",
+        help="NATS server URL (default: nats://127.0.0.1:4222)",
     )
     args = parser.parse_args()
 

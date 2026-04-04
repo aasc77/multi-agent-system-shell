@@ -48,6 +48,10 @@ independently view a different tmux window.
 - **Manager agent**: autonomous monitor that watches task progress, agent health, and logs
 - **Idle watchdog**: detects idle agents with pending tasks and alerts the manager
 - **Inactivity announcer**: alerts when no agent has any NATS activity for a configurable threshold
+- **Knowledge store**: ChromaDB + Ollama embeddings for semantic search across agent messages and operational docs
+- **Speaker service**: any agent can announce on home speakers via `send_to_agent(target_agent="speaker", message="text")`
+- **Voice call service**: Twilio TTS outbound calls via `send_to_agent(target_agent="voicecall", message="text")`
+- **Daily status report**: automated daily health check (agents, NATS, disk) indexed into knowledge store
 - **Conversation mode**: streams agent-to-agent messages to home speakers via Piper TTS
 - **Push notifications**: Pushover and Twilio SMS integration for external alerts
 - **Pane labels**: configurable labels per agent for clear pane identification
@@ -75,6 +79,13 @@ multi-agent-system-shell/
 │   └── CLAUDE.md          # Manager agent instructions and monitoring workflow
 ├── agents/
 │   └── echo_agent.py      # Example script agent (speaks NATS directly)
+├── knowledge-store/
+│   ├── store.py           # ChromaDB + Ollama embedding wrapper
+│   ├── server.py           # MCP server (search_knowledge, index_knowledge)
+│   └── indexer.py          # NATS message indexer daemon
+├── services/
+│   ├── speaker-service.py  # NATS→hassio speaker routing with voice map
+│   └── voice-call-service.py # Twilio TTS voice call via NATS
 ├── mcp-bridge/
 │   ├── index.js           # MCP server (send_message, check_messages)
 │   └── package.json

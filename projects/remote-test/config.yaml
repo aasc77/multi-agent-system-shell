@@ -3,7 +3,7 @@ tmux:
   session_name: remote-test
 
 nats:
-  url: nats://192.168.1.37:4222
+  url: nats://127.0.0.1:4222
 
 watchdog:
   enabled: true

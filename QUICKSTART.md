@@ -16,7 +16,7 @@ ollama serve                                # leave running in background
 cd /path/to/multi-agent-system-shell
 
 # Python dependencies
-pip3 install nats-py pyyaml requests
+pip3 install nats-py pyyaml requests chromadb httpx
 
 # MCP bridge dependencies
 cd mcp-bridge && npm install && cd ..
@@ -151,6 +151,8 @@ Files land in `shared/<filename>` in each agent's workspace. Agents can view the
 | `scripts/push-notify.py "message"` | Pushover push notification |
 | `scripts/sms-notify.py "message"` | Twilio SMS notification |
 | `scripts/conversation-mode.py` | Standalone conversation mode listener |
+| `scripts/index-ops-knowledge.py` | Seed operational knowledge into ChromaDB |
+| `scripts/daily-status.sh` | Daily health check report (agents, NATS, disk) |
 | `scripts/reset-demo.sh [project]` | Full reset: kill tmux + NATS stream + tasks + logs |
 
 ## Clean Start (Recommended)

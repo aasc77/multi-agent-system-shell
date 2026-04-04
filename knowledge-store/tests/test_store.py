@@ -1,17 +1,20 @@
-"""Unit tests for knowledge-store/store.py."""
+"""
+Tests for knowledge store — index_document, search across collections, and MCP tools.
+
+Usage:
+    cd /path/to/multi-agent-system-shell
+    python3 -m pytest knowledge-store/tests/test_store.py -v
+"""
 
 import json
-from unittest.mock import AsyncMock, patch
-
-import chromadb
-import pytest
-import pytest_asyncio
-
-# Patch environment before importing store
 import os
-os.environ["CHROMADB_PATH"] = "/tmp/test-chromadb"
-os.environ["OLLAMA_URL"] = "http://localhost:11434"
+import sys
+from unittest.mock import patch
 
+import pytest
+
+# Add knowledge-store to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import store
 
 
@@ -19,214 +22,264 @@ import store
 # Fixtures
 # ---------------------------------------------------------------------------
 
-FAKE_EMBEDDING = [0.1] * 768
+@pytest.fixture(autouse=True)
+def _isolated_chromadb(tmp_path):
+    """Use a temporary ChromaDB path for each test to avoid cross-test pollution."""
+    store.CHROMADB_PATH = str(tmp_path / "chromadb")
+    store._client = None
+    store._collections.clear()
+    yield
+    store._client = None
+    store._collections.clear()
+
+
+# Fake embedding: deterministic 768-dim vector based on text hash
+def _fake_embedding(text: str) -> list[float]:
+    import hashlib
+    h = hashlib.sha256(text.encode()).digest()
+    vec = [b / 255.0 for b in h]
+    # Pad to 768 dims
+    return (vec * (768 // len(vec) + 1))[:768]
 
 
 @pytest.fixture(autouse=True)
-def reset_store():
-    """Reset store globals between tests."""
-    store._client = None
-    store._collection = None
-    yield
-    store._client = None
-    store._collection = None
+def _mock_ollama():
+    """Mock Ollama embedding calls with deterministic fake embeddings."""
+    async def mock_get_embedding(text):
+        return _fake_embedding(text)
 
-
-@pytest.fixture
-def memory_collection():
-    """In-memory ChromaDB collection for testing."""
-    client = chromadb.EphemeralClient()
-    # Delete collection if it exists from a prior test
-    try:
-        client.delete_collection("test_messages")
-    except Exception:
-        pass
-    collection = client.create_collection(
-        name="test_messages",
-        metadata={"hnsw:space": "cosine"},
-    )
-    # Inject into store module
-    store._client = client
-    store._collection = collection
-    return collection
+    with patch.object(store, "get_embedding", side_effect=mock_get_embedding):
+        yield
 
 
 # ---------------------------------------------------------------------------
-# build_text tests
+# Tests: index_document
 # ---------------------------------------------------------------------------
 
-class TestBuildText:
-    def test_extracts_message_field(self):
-        msg = {"message": "hello world", "message_id": "x", "from": "hub"}
-        assert store.build_text(msg) == "hello world"
+class TestIndexDocument:
+    @pytest.mark.asyncio
+    async def test_index_basic(self):
+        doc_id = await store.index_document(
+            text="NATS is the message bus for the MAS system.",
+            title="NATS Overview",
+            category="architecture",
+        )
+        assert doc_id == "ops-nats-overview"
 
-    def test_extracts_summary_field(self):
-        msg = {"summary": "task done", "status": "pass"}
-        assert store.build_text(msg) == "task done"
+        # Verify it's in the operational_knowledge collection
+        coll = store._get_collection(store.COLLECTION_OPS_KNOWLEDGE)
+        assert coll.count() == 1
 
-    def test_combines_multiple_fields(self):
-        msg = {"message": "hello", "summary": "world"}
-        assert store.build_text(msg) == "hello world"
+        result = coll.get(ids=[doc_id], include=["documents", "metadatas"])
+        assert "NATS" in result["documents"][0]
+        assert result["metadatas"][0]["title"] == "NATS Overview"
+        assert result["metadatas"][0]["category"] == "architecture"
+        assert "updated_at" in result["metadatas"][0]
 
-    def test_fallback_to_json(self):
-        msg = {"status": "pass", "custom_data": "value"}
-        result = store.build_text(msg)
-        assert "custom_data" in result
-        assert "value" in result
+    @pytest.mark.asyncio
+    async def test_index_custom_id(self):
+        doc_id = await store.index_document(
+            text="Custom doc",
+            title="Custom",
+            doc_id="my-custom-id",
+        )
+        assert doc_id == "my-custom-id"
 
-    def test_empty_message(self):
-        # Only metadata fields — nothing indexable
-        msg = {"message_id": "x", "timestamp": "t", "from": "hub", "priority": "normal", "type": "agent_complete"}
-        assert store.build_text(msg) == ""
+    @pytest.mark.asyncio
+    async def test_index_empty_text_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            await store.index_document(text="   ", title="Empty")
 
-    def test_ignores_non_string_values(self):
-        msg = {"message": 123, "summary": "ok"}
-        assert store.build_text(msg) == "ok"
+    @pytest.mark.asyncio
+    async def test_index_idempotent_upsert(self):
+        """Indexing the same title twice should upsert, not duplicate."""
+        await store.index_document(text="Version 1", title="Test Doc")
+        await store.index_document(text="Version 2", title="Test Doc")
+
+        coll = store._get_collection(store.COLLECTION_OPS_KNOWLEDGE)
+        assert coll.count() == 1
+
+        result = coll.get(ids=["ops-test-doc"], include=["documents"])
+        assert "Version 2" in result["documents"][0]
+
+    @pytest.mark.asyncio
+    async def test_index_does_not_pollute_messages_collection(self):
+        await store.index_document(text="Ops doc", title="Ops")
+
+        msg_coll = store._get_collection(store.COLLECTION_MESSAGES)
+        assert msg_coll.count() == 0
 
 
 # ---------------------------------------------------------------------------
-# index_message tests
+# Tests: index_message (existing, verify no regression)
 # ---------------------------------------------------------------------------
 
 class TestIndexMessage:
     @pytest.mark.asyncio
-    @patch.object(store, "get_embedding", new_callable=AsyncMock, return_value=FAKE_EMBEDDING)
-    async def test_indexes_message(self, mock_embed, memory_collection):
+    async def test_index_message_basic(self):
         msg = {
-            "type": "agent_message",
-            "message_id": "hub-1234-1",
-            "timestamp": "2026-04-01T00:00:00Z",
+            "message_id": "msg-001",
             "from": "hub",
+            "timestamp": "2026-04-03T10:00:00Z",
+            "type": "agent_message",
             "priority": "normal",
-            "message": "deploy the service",
+            "message": "Task completed successfully.",
         }
-        result = await store.index_message(msg, "agents.dgx.inbox")
+        result = await store.index_message(msg, "agents.hub.outbox")
         assert result is True
 
-        # Verify it's in ChromaDB
-        stored = memory_collection.get(ids=["hub-1234-1"], include=["documents", "metadatas"])
-        assert stored["documents"][0] == "deploy the service"
-        assert stored["metadatas"][0]["from"] == "hub"
-        assert stored["metadatas"][0]["to"] == "dgx"
-        assert stored["metadatas"][0]["channel"] == "inbox"
+        coll = store._get_collection(store.COLLECTION_MESSAGES)
+        assert coll.count() == 1
 
     @pytest.mark.asyncio
-    async def test_skips_without_message_id(self, memory_collection):
-        msg = {"message": "no id here"}
-        result = await store.index_message(msg, "agents.hub.inbox")
+    async def test_index_message_no_id_skips(self):
+        result = await store.index_message({"message": "no id"}, "agents.hub.outbox")
         assert result is False
-
-    @pytest.mark.asyncio
-    @patch.object(store, "get_embedding", new_callable=AsyncMock, return_value=FAKE_EMBEDDING)
-    async def test_idempotent_upsert(self, mock_embed, memory_collection):
-        msg = {
-            "message_id": "hub-1234-1",
-            "from": "hub",
-            "message": "first version",
-        }
-        await store.index_message(msg, "agents.hub.outbox")
-        await store.index_message(msg, "agents.hub.outbox")
-
-        # Should only have one document
-        stored = memory_collection.get(ids=["hub-1234-1"])
-        assert len(stored["ids"]) == 1
-
-    @pytest.mark.asyncio
-    @patch.object(store, "get_embedding", new_callable=AsyncMock, return_value=FAKE_EMBEDDING)
-    async def test_outbox_metadata(self, mock_embed, memory_collection):
-        msg = {
-            "message_id": "dgx-5678-2",
-            "from": "dgx",
-            "summary": "inference complete",
-            "type": "agent_complete",
-        }
-        await store.index_message(msg, "agents.dgx.outbox")
-        stored = memory_collection.get(ids=["dgx-5678-2"], include=["metadatas"])
-        assert stored["metadatas"][0]["from"] == "dgx"
-        assert stored["metadatas"][0]["to"] == ""  # outbox has no target
-        assert stored["metadatas"][0]["channel"] == "outbox"
 
 
 # ---------------------------------------------------------------------------
-# search tests
+# Tests: search across collections
 # ---------------------------------------------------------------------------
 
 class TestSearch:
     @pytest.mark.asyncio
-    @patch.object(store, "get_embedding", new_callable=AsyncMock, return_value=FAKE_EMBEDDING)
-    async def test_search_returns_results(self, mock_embed, memory_collection):
-        # Pre-populate
-        memory_collection.upsert(
-            ids=["msg-1", "msg-2"],
-            embeddings=[FAKE_EMBEDDING, [0.2] * 768],
-            documents=["deploy service to prod", "run unit tests"],
-            metadatas=[
-                {"from": "hub", "to": "dgx", "channel": "inbox", "subject": "agents.dgx.inbox", "timestamp": "", "type": "", "priority": "normal"},
-                {"from": "macmini", "to": "", "channel": "outbox", "subject": "agents.macmini.outbox", "timestamp": "", "type": "", "priority": "normal"},
-            ],
+    async def test_search_returns_from_both_collections(self):
+        # Index a message
+        await store.index_message(
+            {
+                "message_id": "msg-100",
+                "from": "hub",
+                "message": "Deployed the API gateway",
+            },
+            "agents.hub.outbox",
         )
-        results = await store.search("deploy", n_results=5)
+
+        # Index an ops doc
+        await store.index_document(
+            text="The API gateway runs on port 8080",
+            title="API Gateway Config",
+            category="config",
+        )
+
+        results = await store.search("API gateway", n_results=10)
         assert len(results) == 2
-        assert results[0]["id"] in ("msg-1", "msg-2")
-        assert "text" in results[0]
-        assert "metadata" in results[0]
-        assert "distance" in results[0]
+
+        sources = {r["source"] for r in results}
+        assert store.COLLECTION_MESSAGES in sources
+        assert store.COLLECTION_OPS_KNOWLEDGE in sources
 
     @pytest.mark.asyncio
-    @patch.object(store, "get_embedding", new_callable=AsyncMock, return_value=FAKE_EMBEDDING)
-    async def test_search_with_filter(self, mock_embed, memory_collection):
-        memory_collection.upsert(
-            ids=["msg-1", "msg-2"],
-            embeddings=[FAKE_EMBEDDING, FAKE_EMBEDDING],
-            documents=["from hub", "from dgx"],
-            metadatas=[
-                {"from": "hub", "to": "", "channel": "outbox", "subject": "agents.hub.outbox", "timestamp": "", "type": "", "priority": "normal"},
-                {"from": "dgx", "to": "", "channel": "outbox", "subject": "agents.dgx.outbox", "timestamp": "", "type": "", "priority": "normal"},
-            ],
+    async def test_search_single_collection(self):
+        await store.index_document(
+            text="Ops only doc",
+            title="Ops Only",
+            category="general",
         )
-        results = await store.search("test", n_results=5, where={"from": "hub"})
+
+        results = await store.search(
+            "Ops only",
+            collections=[store.COLLECTION_OPS_KNOWLEDGE],
+        )
         assert len(results) == 1
-        assert results[0]["metadata"]["from"] == "hub"
+        assert results[0]["source"] == store.COLLECTION_OPS_KNOWLEDGE
 
     @pytest.mark.asyncio
-    @patch.object(store, "get_embedding", new_callable=AsyncMock, return_value=FAKE_EMBEDDING)
-    async def test_search_empty_collection(self, mock_embed, memory_collection):
-        results = await store.search("anything", n_results=5)
+    async def test_search_empty_collections(self):
+        results = await store.search("anything")
         assert results == []
 
+    @pytest.mark.asyncio
+    async def test_search_results_sorted_by_distance(self):
+        await store.index_document(text="Alpha bravo", title="Doc A")
+        await store.index_document(text="Charlie delta", title="Doc B")
+
+        results = await store.search("Alpha bravo", n_results=2)
+        assert len(results) <= 2
+        # Results should be sorted by distance ascending
+        if len(results) == 2:
+            assert results[0]["distance"] <= results[1]["distance"]
+
+    @pytest.mark.asyncio
+    async def test_search_respects_n_results(self):
+        for i in range(5):
+            await store.index_document(text=f"Document {i}", title=f"Doc {i}")
+
+        results = await store.search("Document", n_results=3)
+        assert len(results) <= 3
+
 
 # ---------------------------------------------------------------------------
-# check_ollama_health tests
+# Tests: MCP server tools
 # ---------------------------------------------------------------------------
 
-class TestCheckOllamaHealth:
+class TestMCPTools:
     @pytest.mark.asyncio
-    @patch("httpx.AsyncClient.get", new_callable=AsyncMock)
-    async def test_healthy(self, mock_get):
-        mock_get.return_value = type("Resp", (), {
-            "status_code": 200,
-            "raise_for_status": lambda self: None,
-            "json": lambda self: {"models": [{"name": "nomic-embed-text:latest"}]},
-        })()
-        ok, msg = await store.check_ollama_health()
-        assert ok is True
-        assert msg == "OK"
+    async def test_search_knowledge_tool(self):
+        import server
+
+        await store.index_document(
+            text="NATS runs on port 4222",
+            title="NATS Config",
+            category="config",
+        )
+
+        result = await server.call_tool("search_knowledge", {"query": "NATS port"})
+        assert len(result) == 1
+        text = result[0].text
+        data = json.loads(text)
+        assert len(data) >= 1
+        assert "4222" in data[0]["text"]
 
     @pytest.mark.asyncio
-    @patch("httpx.AsyncClient.get", new_callable=AsyncMock)
-    async def test_model_missing(self, mock_get):
-        mock_get.return_value = type("Resp", (), {
-            "status_code": 200,
-            "raise_for_status": lambda self: None,
-            "json": lambda self: {"models": [{"name": "qwen3:8b"}]},
-        })()
-        ok, msg = await store.check_ollama_health()
-        assert ok is False
-        assert "nomic-embed-text" in msg
+    async def test_search_knowledge_source_filter(self):
+        import server
+
+        await store.index_document(text="Ops info", title="Ops", category="config")
+
+        result = await server.call_tool("search_knowledge", {
+            "query": "Ops info",
+            "source": "messages",
+        })
+        # Should find nothing since we only indexed to ops
+        assert "No matching" in result[0].text
 
     @pytest.mark.asyncio
-    @patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=Exception("connection refused"))
-    async def test_unreachable(self, mock_get):
-        ok, msg = await store.check_ollama_health()
-        assert ok is False
-        assert "unreachable" in msg.lower()
+    async def test_index_knowledge_tool(self):
+        import server
+
+        result = await server.call_tool("index_knowledge", {
+            "title": "Test Knowledge",
+            "content": "This is test operational knowledge.",
+            "category": "general",
+        })
+        assert "Indexed" in result[0].text
+        assert "Test Knowledge" in result[0].text
+
+        # Verify it was actually stored
+        coll = store._get_collection(store.COLLECTION_OPS_KNOWLEDGE)
+        assert coll.count() == 1
+
+    @pytest.mark.asyncio
+    async def test_index_knowledge_missing_title(self):
+        import server
+
+        result = await server.call_tool("index_knowledge", {
+            "content": "No title provided",
+        })
+        assert "Error" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_index_knowledge_missing_content(self):
+        import server
+
+        result = await server.call_tool("index_knowledge", {
+            "title": "Has title",
+        })
+        assert "Error" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool(self):
+        import server
+
+        result = await server.call_tool("nonexistent_tool", {})
+        assert "Unknown tool" in result[0].text

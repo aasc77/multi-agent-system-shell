@@ -344,7 +344,7 @@ class Console:
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "scripts", "conversation-mode.py",
             )
-            nats_url = self._config.get("nats", {}).get("url", "nats://192.168.1.37:4222")
+            nats_url = self._config.get("nats", {}).get("url", "nats://127.0.0.1:4222")
             self._conversation_proc = subprocess.Popen(
                 ["python3", script, "--nats-url", nats_url],
                 stdout=subprocess.DEVNULL,

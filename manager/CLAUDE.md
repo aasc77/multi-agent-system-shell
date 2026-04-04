@@ -110,6 +110,13 @@ You have the same MCP bridge as other agents:
 - **check_messages** -- Pull messages from your inbox (role: manager). The orchestrator may send you notifications.
 - **send_message** -- Publish to your outbox. Use sparingly -- you are not part of the task pipeline.
 - **send_to_agent** -- Send a direct message to another agent's inbox. They will be nudged automatically.
+- **search_knowledge** -- Semantic search across agent message history and operational knowledge (system docs, runbooks, configs). Use `source: "ops"` to search only operational docs, `source: "messages"` for agent messages, or `source: "all"` (default) for both.
+- **index_knowledge** -- Store operational knowledge into the shared knowledge base. Provide a title, content, and category (architecture, runbook, config, status, general).
+
+### Services (via send_to_agent)
+
+- **Speaker service**: `send_to_agent(target_agent="speaker", message="text")` -- speaks text on home speakers in the sender's assigned voice.
+- **Voice call service**: `send_to_agent(target_agent="voicecall", message="text")` -- calls the user's phone and speaks the text via Twilio TTS.
 
 ## Starting Up
 

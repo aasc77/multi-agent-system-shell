@@ -205,6 +205,15 @@ runtime_claude = os.environ['_RUNTIME_CLAUDE_CODE']
 local_bridge_path = os.path.join(root_dir, bridge_rel_path)
 _home_cache = {}
 
+# For remote agents, replace localhost/127.0.0.1 in NATS URL with this machine's hostname
+# so it resolves correctly regardless of wired/Wi-Fi IP changes (mDNS)
+import socket
+_hostname = socket.gethostname()
+if not _hostname.endswith('.local'):
+    _hostname += '.local'
+import re
+remote_nats_url = re.sub(r'(nats://)(?:localhost|127\.0\.0\.1)', rf'\1{_hostname}', nats_url)
+
 for agent_name, agent_cfg in agents.items():
     if agent_cfg.get('runtime', '') != runtime_claude:
         continue
@@ -243,6 +252,7 @@ for agent_name, agent_cfg in agents.items():
         working_dir = agent_cfg.get('working_dir', project_dir)
 
     cmd = node_cmd if is_remote else 'node'
+    agent_nats_url = remote_nats_url if is_remote else nats_url
     mcp_config = {
         'mcpServers': {
             server_name: {
@@ -250,7 +260,7 @@ for agent_name, agent_cfg in agents.items():
                 'args': [bridge_path],
                 'env': {
                     'AGENT_ROLE': agent_name,
-                    'NATS_URL': nats_url,
+                    'NATS_URL': agent_nats_url,
                     'WORKSPACE_DIR': working_dir,
                 }
             }
@@ -423,6 +433,16 @@ setup_control_window() {
         echo "Knowledge indexer started (PID: $!)"
     fi
 
+    # Start speaker service as a background daemon (routes speak requests to hassio)
+    local speaker_script="${ROOT_DIR}/services/speaker-service.py"
+    if [ -f "$speaker_script" ]; then
+        mkdir -p "${ROOT_DIR}/data"
+        NATS_URL="${NATS_URL}" \
+        NATS_STREAM="${STREAM_NAME:-AGENTS}" \
+            python3 "$speaker_script" >> "${ROOT_DIR}/data/speaker-service.log" 2>&1 &
+        echo "Speaker service started (PID: $!)"
+    fi
+
     tmux_cmd split-window -h -t "${SESSION_NAME}:${CONTROL_WINDOW}"
     tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "nats-monitor"
 
@@ -466,7 +486,7 @@ agents = json.loads(sys.stdin.read())
 print(agents.get('manager', {}).get('system_prompt', ''))
 " <<< "$AGENTS_JSON")
 
-        local manager_cmd="cd ${ROOT_DIR} && unset CLAUDECODE; claude --dangerously-skip-permissions --strict-mcp-config --mcp-config ${mcp_config_path} --allowedTools mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent,mcp__knowledge-store__search_knowledge"
+        local manager_cmd="cd ${ROOT_DIR} && unset CLAUDECODE; claude --dangerously-skip-permissions --strict-mcp-config --mcp-config ${mcp_config_path} --allowedTools mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent,mcp__knowledge-store__search_knowledge,mcp__knowledge-store__index_knowledge"
         if [ -n "$manager_prompt" ]; then
             manager_cmd="${manager_cmd} --append-system-prompt '${manager_prompt}'"
         fi
@@ -523,7 +543,7 @@ build_launch_command() {
     local launch_cmd=""
 
     if [ "$runtime" = "$RUNTIME_CLAUDE_CODE" ]; then
-        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent,mcp__knowledge-store__search_knowledge"
+        local allowed_tools="mcp__mas-bridge__check_messages,mcp__mas-bridge__send_message,mcp__mas-bridge__send_to_agent,mcp__knowledge-store__search_knowledge,mcp__knowledge-store__index_knowledge"
 
         if [ -n "$ssh_host" ]; then
             # Remote agent: use remote paths, pass settings inline to skip onboarding prompts

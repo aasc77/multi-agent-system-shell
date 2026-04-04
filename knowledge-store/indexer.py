@@ -6,7 +6,7 @@ Runs as a background daemon alongside the orchestrator. Uses a durable
 NATS consumer so it can resume from where it left off after restart.
 
 Usage:
-    NATS_URL=nats://192.168.1.37:4222 \
+    NATS_URL=nats://127.0.0.1:4222 \
     CHROMADB_PATH=/path/to/data/chromadb \
     python3 indexer.py
 """

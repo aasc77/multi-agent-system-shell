@@ -20,7 +20,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------
 DGX_HOST="dgx@192.168.1.51"
 MACMINI_HOST="angelserrano@192.168.1.31"
-NATS_URL="nats://192.168.1.37:4222"
+NATS_URL="nats://127.0.0.1:4222"
 VLLM_URL="http://192.168.1.51:5000"
 SSH_TIMEOUT=5
 
