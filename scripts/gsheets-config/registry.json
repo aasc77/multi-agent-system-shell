@@ -1,0 +1,22 @@
+{
+  "yolo-classes": {
+    "sheet_id": "1G5d2R4SanYyAChLz9BrOHJrs53VSQqJ51MQ2Krjo97A",
+    "name": "YOLO-World Camera Classes",
+    "columns": [
+      "Camera Name",
+      "Channel",
+      "Scene Type",
+      "Classes",
+      "Enabled"
+    ]
+  },
+  "qa-test-sheet": {
+    "sheet_id": "1fB2vcLDNxfCAG6iup4PZJYt3iK9_w_-k8OBCLAKhPQE",
+    "name": "QA Test Sheet",
+    "columns": [
+      "Name",
+      "Value",
+      "Enabled"
+    ]
+  }
+}

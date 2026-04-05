@@ -23,6 +23,10 @@ from mcp.types import Tool, TextContent
 sys.path.insert(0, os.path.dirname(__file__))
 import store
 
+# Add gsheets-config to path for Google Sheets tools
+ROOT_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(ROOT_DIR, "scripts", "gsheets-config"))
+
 AGENT_ROLE = os.environ.get("AGENT_ROLE", "unknown")
 
 server = Server("knowledge-store")
@@ -98,6 +102,56 @@ async def list_tools() -> list[Tool]:
                 "required": ["title", "content"],
             },
         ),
+        Tool(
+            name="gsheets_create",
+            description=(
+                "Create a new Google Sheet for config management. Returns the sheet URL and ID. "
+                "Use this to set up new config sheets that can be edited by the user and synced to services."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Title for the Google Sheet",
+                    },
+                    "columns": {
+                        "type": "string",
+                        "description": "Comma-separated column names (e.g., 'Name,Value,Enabled')",
+                    },
+                    "alias": {
+                        "type": "string",
+                        "description": "Short alias for referencing the sheet later (auto-generated if omitted)",
+                    },
+                },
+                "required": ["name", "columns"],
+            },
+        ),
+        Tool(
+            name="gsheets_read",
+            description=(
+                "Read data from a managed Google Sheet. Returns rows as JSON objects "
+                "with column names as keys. Use alias (e.g., 'yolo-classes') or sheet ID."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "alias": {
+                        "type": "string",
+                        "description": "Sheet alias from registry (e.g., 'yolo-classes')",
+                    },
+                    "sheet_id": {
+                        "type": "string",
+                        "description": "Google Sheet ID (alternative to alias)",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="gsheets_list",
+            description="List all managed Google Sheets with their aliases, names, and IDs.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -107,6 +161,8 @@ async def call_tool(name: str, arguments: dict):
         return await _handle_search(arguments)
     elif name == "index_knowledge":
         return await _handle_index(arguments)
+    elif name.startswith("gsheets_"):
+        return await _handle_gsheets(name, arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -181,6 +237,50 @@ async def _handle_index(arguments: dict):
             type="text",
             text=f"Failed to index knowledge: {e}. Is Ollama running at {store.OLLAMA_URL}?",
         )]
+
+
+async def _handle_gsheets(name: str, arguments: dict):
+    try:
+        import gsheets_config
+    except ImportError:
+        return [TextContent(type="text", text="Error: gsheets_config not available. Check scripts/gsheets-config/.")]
+
+    try:
+        if name == "gsheets_create":
+            sheet_name = arguments.get("name", "")
+            columns_str = arguments.get("columns", "")
+            if not sheet_name or not columns_str:
+                return [TextContent(type="text", text="Error: name and columns are required")]
+            columns = [c.strip() for c in columns_str.split(",")]
+            result = gsheets_config.create_sheet(
+                name=sheet_name,
+                columns=columns,
+                alias=arguments.get("alias"),
+            )
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        elif name == "gsheets_read":
+            alias = arguments.get("alias")
+            sheet_id = arguments.get("sheet_id")
+            if alias:
+                registry = gsheets_config.list_sheets()
+                entry = registry.get(alias)
+                if not entry:
+                    return [TextContent(type="text", text=f"Error: alias '{alias}' not found")]
+                sheet_id = entry["sheet_id"]
+            if not sheet_id:
+                return [TextContent(type="text", text="Error: provide alias or sheet_id")]
+            data = gsheets_config.read_sheet(sheet_id)
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+        elif name == "gsheets_list":
+            registry = gsheets_config.list_sheets()
+            if not registry:
+                return [TextContent(type="text", text="No managed sheets.")]
+            return [TextContent(type="text", text=json.dumps(registry, indent=2))]
+
+    except Exception as e:
+        return [TextContent(type="text", text=f"Google Sheets error: {e}")]
 
 
 async def main():
