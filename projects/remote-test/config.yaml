@@ -5,10 +5,17 @@ tmux:
 nats:
   url: nats://127.0.0.1:4222
 
+routing:
+  probe_interval: 10
+  process_interval: 5
+  neighbor_timeout: 120
+  max_attempts: 6
+  table_log_interval: 60
+
 watchdog:
   enabled: true
-  check_interval: 60
-  idle_cooldown: 300
+  check_interval: 15
+  idle_cooldown: 60
   announce_on_speaker: false
   inactivity_announcer:
     enabled: false
@@ -49,7 +56,7 @@ agents:
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
     label: hassio
-    system_prompt: "You are a collaborator agent on the Hassio server. Complete the assigned task and report results via send_message. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
+    system_prompt: "You are the Home Assistant agent on the Hassio server. You own all HA integrations: speaker service (voice announcements via HA media_player), TTS pipeline (Piper on port 5111, Whisper STT on port 5112), camera/ONVIF credential management (Reolink NVR at 192.168.1.46), HA entity updates (sensors, binary_sensors), and automations. You are the authority on anything that touches Home Assistant. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
   dgx2:
     runtime: claude_code
     ssh_host: dgx2@192.168.1.49

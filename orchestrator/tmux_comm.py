@@ -164,7 +164,11 @@ class TmuxComm:
     def send_keys(self, agent: str, text: str) -> None:
         """Send *text* to an agent's tmux pane via ``tmux send-keys`` with Enter."""
         target = self.get_target(agent)
-        self._tmux_send_keys(target, text)
+        # Claude Code agents: skip verify-retry (it causes false negatives
+        # and Escape retries that sabotage delivery). The delivery protocol
+        # ACK provides real confirmation.
+        skip_verify = agent in self._claude_code_agents
+        self._tmux_send_keys(target, text, skip_verify=skip_verify)
 
     def capture_pane(self, agent: str, lines: int = 20) -> str | None:
         """Capture the last *lines* of an agent's tmux pane.
@@ -185,17 +189,17 @@ class TmuxComm:
     def is_agent_idle(self, agent: str) -> bool:
         """Return ``True`` if the agent's pane appears idle (at prompt).
 
-        Claude Code agents show a ``❯`` prompt when idle.
+        Claude Code agents show a ``❯`` prompt when idle.  The status bar
+        (e.g. ``⏵⏵ bypass permissions on``) often sits below the prompt,
+        so we check all captured lines, not just the last one.
         """
         pane_text = self.capture_pane(agent, lines=5)
         if pane_text is None:
             return False
-        # Check if the last non-empty line ends with the Claude Code prompt
         lines = [l for l in pane_text.strip().splitlines() if l.strip()]
         if not lines:
             return False
-        last = lines[-1].strip()
-        return last == "❯" or last.endswith("❯")
+        return any(l.strip() == "❯" or l.strip().endswith("❯") for l in lines)
 
     def nudge(self, agent: str, force: bool = False) -> bool:
         """Nudge an agent pane with the configured nudge prompt.
@@ -369,13 +373,27 @@ class TmuxComm:
         )
         return result.stdout if result.returncode == 0 else ""
 
-    def _tmux_send_keys(self, target: str, text: str) -> None:
-        """Send text + Enter to a tmux pane with retry on delivery failure.
+    def _tmux_send_keys(
+        self, target: str, text: str, skip_verify: bool = False,
+    ) -> None:
+        """Send text + Enter to a tmux pane.
 
-        After sending, captures the pane to verify the text appeared or
-        that the agent started processing (prompt disappeared). On failure,
-        sends Escape to clear TUI state and retries.
+        When *skip_verify* is ``False`` (non-Claude-Code agents), captures the
+        pane after each attempt to verify delivery and retries on failure.
+
+        When *skip_verify* is ``True`` (Claude Code agents), sends once without
+        verification.  Claude Code's TUI causes false-negative verification
+        (text delivered but not visible in capture), and the Escape + retry
+        cycle actively sabotages delivery.  The delivery protocol ACK provides
+        real confirmation for these agents.
         """
+        if skip_verify:
+            if self._tmux_send_keys_once(target, text):
+                logger.debug("Nudge sent to %s (skip-verify)", target)
+            else:
+                logger.warning("Nudge send-keys failed for %s", target)
+            return
+
         for attempt in range(1, self._send_retries + 1):
             # On retry, clear TUI state first
             if attempt > 1:

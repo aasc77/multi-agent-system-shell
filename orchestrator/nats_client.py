@@ -268,6 +268,18 @@ class NatsClient:
         for role in self._agents:
             await self.subscribe_to_inbox(role, callback)
 
+    async def subscribe_ack(self, callback: MessageCallback) -> None:
+        """Subscribe to delivery ACK subjects via core NATS.
+
+        Listens on ``<prefix>.*.ack`` for delivery receipts published
+        by MCP bridges when agents call ``check_messages``.  Uses core
+        NATS (not JetStream) since ACKs are ephemeral.
+        """
+        self._require_connected()
+        subject = f"{self._prefix}.*.ack"
+        await self._conn.subscribe(subject, cb=callback)
+        logger.info("Subscribed to delivery ACKs: %s", subject)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

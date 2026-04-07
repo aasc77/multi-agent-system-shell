@@ -95,11 +95,13 @@ class TaskLifecycleManager:
         nats_client: Any,
         tmux_comm: Any,
         config: dict[str, Any],
+        delivery: Any = None,
     ) -> None:
         self._task_queue = task_queue
         self._state_machine = state_machine
         self._nats_client = nats_client
         self._tmux_comm = tmux_comm
+        self._delivery = delivery
         self._config = config
 
         self._max_attempts: int = (
@@ -295,7 +297,12 @@ class TaskLifecycleManager:
             if target_agent is not None:
                 msg = self._build_task_assignment_message(action_args)
                 await self._nats_client.publish_to_inbox(target_agent, msg)
-                self._tmux_comm.nudge(target_agent, force=True)
+                if self._delivery is not None:
+                    self._delivery.deliver(
+                        target_agent, reason="task_assignment",
+                    )
+                else:
+                    self._tmux_comm.nudge(target_agent, force=True)
 
     def _build_task_assignment_message(
         self, action_args: dict[str, Any],

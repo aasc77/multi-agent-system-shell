@@ -144,6 +144,59 @@ async function connectNats() {
 }
 
 // ---------------------------------------------------------------------------
+// Background inbox subscription -- push notification channel
+// ---------------------------------------------------------------------------
+
+// Messages received via background subscription, waiting for check_messages
+const inboxBuffer = [];
+const MAX_INBOX_BUFFER = 500;
+
+async function startInboxSubscription() {
+  try {
+    const sub = nc.subscribe(inboxSubject);
+    process.stderr.write(
+      `[${new Date().toISOString()}] Background subscription active on ${inboxSubject}\n`,
+    );
+
+    for await (const msg of sub) {
+      try {
+        const data = sc.decode(msg.data);
+        const parsed = JSON.parse(data);
+        if (inboxBuffer.length >= MAX_INBOX_BUFFER) {
+          process.stderr.write(
+            `[${new Date().toISOString()}] Inbox buffer full (${MAX_INBOX_BUFFER}), dropping oldest\n`,
+          );
+          inboxBuffer.shift();
+        }
+        inboxBuffer.push(parsed);
+
+        const sender = parsed.from || 'unknown';
+        const msgType = parsed.type || 'unknown';
+        process.stderr.write(
+          `[${new Date().toISOString()}] Inbox: ${msgType} from ${sender} (buffered: ${inboxBuffer.length})\n`,
+        );
+
+        // Notify Claude Code via MCP logging -- second delivery channel
+        try {
+          await server.sendLoggingMessage({
+            level: 'info',
+            data: `New message from ${sender}: call check_messages to read it.`,
+          });
+        } catch {
+          // Server may not be connected yet -- best effort
+        }
+      } catch {
+        // Parse error -- skip
+      }
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[${new Date().toISOString()}] Background subscription error: ${err.message}\n`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Retry helper -- retries on CONNECTION_CLOSED / transient NATS errors
 // ---------------------------------------------------------------------------
 
@@ -175,11 +228,17 @@ async function withRetry(fn, label, maxRetries = 3) {
 
 async function handleCheckMessages() {
   const durableName = `${agentRole}-${CHANNEL_INBOX}-mcp`;
+  const messages = [];
 
+  // Drain buffer first (messages received via background subscription)
+  while (inboxBuffer.length > 0) {
+    messages.push(inboxBuffer.shift());
+  }
+
+  // Also fetch from JetStream (catches anything the background sub missed)
   try {
     const jsm = await nc.jetstreamManager();
 
-    // Ensure consumer exists
     try {
       await jsm.consumers.info(STREAM_NAME, durableName);
     } catch {
@@ -191,14 +250,19 @@ async function handleCheckMessages() {
     }
 
     const consumer = await js.consumers.get(STREAM_NAME, durableName);
-    const messages = [];
 
     try {
       const batch = await consumer.fetch({ max_messages: 20, expires: 2000 });
       for await (const msg of batch) {
         const data = sc.decode(msg.data);
         try {
-          messages.push(JSON.parse(data));
+          const parsed = JSON.parse(data);
+          // Deduplicate: skip if message_id already in buffer-sourced messages
+          const isDup = parsed.message_id &&
+            messages.some((m) => m.message_id === parsed.message_id);
+          if (!isDup) {
+            messages.push(parsed);
+          }
         } catch {
           messages.push({ raw: data });
         }
@@ -207,23 +271,44 @@ async function handleCheckMessages() {
     } catch {
       // fetch can throw if no messages available -- that's fine
     }
-
-    if (messages.length === 0) {
-      return { content: [{ type: 'text', text: 'No new messages.' }] };
-    }
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(messages, null, 2),
-      }],
-    };
   } catch (err) {
-    return {
-      content: [{ type: 'text', text: `Error checking messages: ${err.message}` }],
-      isError: true,
-    };
+    // JetStream fetch failed but we may still have buffered messages
+    if (messages.length === 0) {
+      return {
+        content: [{ type: 'text', text: `Error checking messages: ${err.message}` }],
+        isError: true,
+      };
+    }
   }
+
+  // Publish delivery ACK so the orchestrator knows we read messages
+  if (messages.length > 0) {
+    try {
+      const ackPayload = {
+        type: 'delivery_ack',
+        agent: agentRole,
+        count: messages.length,
+        timestamp: new Date().toISOString(),
+      };
+      const ackSubject = buildSubject(agentRole, 'ack');
+      nc.publish(ackSubject, sc.encode(JSON.stringify(ackPayload)));
+    } catch (ackErr) {
+      process.stderr.write(
+        `[${new Date().toISOString()}] delivery ACK publish failed: ${ackErr.message}\n`,
+      );
+    }
+  }
+
+  if (messages.length === 0) {
+    return { content: [{ type: 'text', text: 'No new messages.' }] };
+  }
+
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(messages, null, 2),
+    }],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +387,7 @@ async function handleSendToAgent(params) {
 
 const server = new Server(
   { name: 'mas-bridge', version: '0.1.0' },
-  { capabilities: { tools: {} } },
+  { capabilities: { tools: {}, logging: {} } },
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -386,6 +471,10 @@ async function main() {
   await connectNats();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Start background inbox subscription (push notification channel)
+  startInboxSubscription();
+
   process.stderr.write(`MCP bridge ready for "${agentRole}"\n`);
 }
 

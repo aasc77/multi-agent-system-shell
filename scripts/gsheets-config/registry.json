@@ -18,5 +18,16 @@
       "Value",
       "Enabled"
     ]
+  },
+  "ha-voice-utterances": {
+    "sheet_id": "1j7XOVsBGzlCJjuh3SqgGFNieQkYmE-x9k8A53Lr-_wY",
+    "name": "HA Voice Utterance List",
+    "columns": [
+      "Category",
+      "Utterance(s)",
+      "Action",
+      "Entity ID",
+      "Notes"
+    ]
   }
 }

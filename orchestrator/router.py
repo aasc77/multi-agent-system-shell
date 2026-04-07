@@ -83,12 +83,14 @@ class MessageRouter:
         agents: dict[str, Any],
         tmux_comm: Any = None,
         watchdog: Any = None,
+        delivery: Any = None,
     ) -> None:
         self._nats_client = nats_client
         self._state_machine = state_machine
         self._lifecycle_manager = lifecycle_manager
         self._tmux_comm = tmux_comm
         self._watchdog = watchdog
+        self._delivery = delivery
         self._agents = agents
         self._paused = False
         self._last_activity_time: float = time.time()
@@ -280,11 +282,13 @@ class MessageRouter:
         # (e.g. inactivity alerts) to prevent loopback resetting the counter.
         if sender != "orchestrator":
             self._touch_activity()
-        logger.info(
-            "Relaying nudge to %s (agent_message from %s)", target_role, sender,
-        )
-        try:
-            self._tmux_comm.nudge(target_role, force=True)
-        except Exception:
-            logger.debug("Skipping tmux nudge for %s (no pane)", target_role)
+        if self._delivery is not None:
+            self._delivery.deliver(
+                target_role, reason=f"agent_message from {sender}",
+            )
+        elif self._tmux_comm is not None:
+            try:
+                self._tmux_comm.nudge(target_role, force=True)
+            except Exception:
+                logger.debug("Skipping tmux nudge for %s (no pane)", target_role)
         await msg.ack()
