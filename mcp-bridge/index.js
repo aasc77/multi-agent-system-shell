@@ -281,8 +281,10 @@ async function handleCheckMessages() {
     }
   }
 
-  // Publish delivery ACK so the orchestrator knows we read messages
-  if (messages.length > 0) {
+  // Always publish delivery ACK — tells the orchestrator "I checked my
+  // inbox".  Even if empty, this clears the pending flag so the protocol
+  // stops nudging.
+  {
     try {
       const ackPayload = {
         type: 'delivery_ack',

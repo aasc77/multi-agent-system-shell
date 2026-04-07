@@ -1,7 +1,7 @@
 """Tests for the Delivery Protocol (orchestrator/delivery.py).
 
-Covers: neighbor probing, delivery lifecycle, ACK processing,
-coalescing, backoff, dead letters, grace period, push notification.
+Covers: neighbor probing, mailbox flags, ACK processing, soft ACK,
+retransmit/backoff, dead letters, grace period, push notification.
 """
 
 import json
@@ -14,7 +14,7 @@ import pytest
 from orchestrator.delivery import (
     ACK_MESSAGE_TYPE,
     DeliveryProtocol,
-    DeliveryState,
+    MailboxFlag,
     NeighborState,
     _STARTUP_GRACE_PERIOD,
 )
@@ -25,12 +25,11 @@ from orchestrator.delivery import (
 # ---------------------------------------------------------------------------
 
 def _make_config(**routing_overrides):
-    """Build a minimal config dict for DeliveryProtocol."""
     routing = {
         "probe_interval": 10,
         "process_interval": 5,
         "neighbor_timeout": 120,
-        "max_attempts": 4,
+        "max_attempts": 6,
         "table_log_interval": 60,
     }
     routing.update(routing_overrides)
@@ -46,10 +45,8 @@ def _make_config(**routing_overrides):
 
 
 def _make_tmux(idle_agents=None, reachable_agents=None):
-    """Build a mock TmuxComm."""
     idle = set(idle_agents or [])
     reachable = set(reachable_agents or [])
-
     mock = MagicMock()
     mock.is_agent_idle.side_effect = lambda a: a in idle
     mock.capture_pane.side_effect = lambda a, lines=1: "busy" if a in reachable else None
@@ -58,13 +55,12 @@ def _make_tmux(idle_agents=None, reachable_agents=None):
 
 
 def _age_neighbors(dp):
-    """Set all neighbors' last_state_change past the startup grace period."""
+    """Set all neighbors past the startup grace period."""
     for n in dp._neighbors.values():
         n.last_state_change = time.time() - _STARTUP_GRACE_PERIOD - 1
 
 
 def _make_ack_msg(agent, count=1):
-    """Build a fake NATS message with delivery_ack payload."""
     payload = {
         "type": ACK_MESSAGE_TYPE,
         "agent": agent,
@@ -80,23 +76,19 @@ def _make_ack_msg(agent, count=1):
 
 
 class TestNeighborProbe:
-    def test_builds_table_excluding_monitor(self):
-        config = _make_config()
-        tmux = _make_tmux()
-        dp = DeliveryProtocol(tmux_comm=tmux, config=config)
-
+    def test_builds_table_including_all_agents(self):
+        """All agents including monitors should be in the neighbor table."""
+        dp = DeliveryProtocol(tmux_comm=_make_tmux(), config=_make_config())
         assert "hub" in dp._neighbors
         assert "dgx2" in dp._neighbors
         assert "macmini" in dp._neighbors
-        assert "manager" not in dp._neighbors
+        assert "manager" in dp._neighbors  # monitors included now
 
     @pytest.mark.asyncio
     async def test_probe_marks_idle_as_up(self):
         tmux = _make_tmux(idle_agents=["hub", "dgx2"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
-
         await dp._probe_neighbors()
-
         assert dp._neighbors["hub"].state == NeighborState.UP
         assert dp._neighbors["dgx2"].state == NeighborState.UP
 
@@ -104,127 +96,121 @@ class TestNeighborProbe:
     async def test_probe_marks_busy_as_busy(self):
         tmux = _make_tmux(idle_agents=[], reachable_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
-
         await dp._probe_neighbors()
-
         assert dp._neighbors["hub"].state == NeighborState.BUSY
 
     @pytest.mark.asyncio
     async def test_probe_marks_unreachable_as_down(self):
         tmux = _make_tmux(idle_agents=[], reachable_agents=[])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
-
         await dp._probe_neighbors()
-
         assert dp._neighbors["hub"].state == NeighborState.DOWN
-        assert dp._neighbors["dgx2"].state == NeighborState.DOWN
 
     @pytest.mark.asyncio
     async def test_probe_exception_marks_down(self):
         tmux = _make_tmux()
         tmux.is_agent_idle.side_effect = RuntimeError("pane gone")
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
-
         await dp._probe_neighbors()
-
         assert dp._neighbors["hub"].state == NeighborState.DOWN
 
 
 # ---------------------------------------------------------------------------
-# Delivery lifecycle tests
+# Deliver + mailbox flag tests
 # ---------------------------------------------------------------------------
 
 
-class TestDelivery:
+class TestDeliver:
     @pytest.mark.asyncio
-    async def test_deliver_creates_record_and_nudges(self):
+    async def test_deliver_sets_pending_and_nudges(self):
         tmux = _make_tmux(idle_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
         _age_neighbors(dp)
 
-        seq = dp.deliver("hub", reason="task_assignment")
+        dp.deliver("hub", reason="task_assignment")
 
-        assert seq == 1
-        assert len(dp._queue) == 1
-        assert dp._queue[0].state == DeliveryState.SENT
-        assert dp._queue[0].attempts == 1
+        assert dp._neighbors["hub"].mailbox.pending is True
+        assert dp._neighbors["hub"].mailbox.attempt == 1
         tmux.nudge.assert_called_once_with("hub", force=True)
 
     @pytest.mark.asyncio
-    async def test_deliver_coalesces_duplicate(self):
+    async def test_deliver_while_pending_still_nudges(self):
+        """New message while already pending should nudge again."""
         tmux = _make_tmux(idle_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
         _age_neighbors(dp)
 
-        seq1 = dp.deliver("hub", reason="msg1")
-        seq2 = dp.deliver("hub", reason="msg2")
+        dp.deliver("hub", reason="msg1")
+        dp.deliver("hub", reason="msg2")
 
-        assert seq1 == 1
-        assert seq2 == 0  # coalesced
-        assert len(dp._queue) == 1
-        assert tmux.nudge.call_count == 1  # only one nudge
+        assert dp._neighbors["hub"].mailbox.pending is True
+        assert tmux.nudge.call_count == 2  # both nudge
 
     @pytest.mark.asyncio
-    async def test_deliver_different_agents_no_coalesce(self):
+    async def test_deliver_to_different_agents(self):
         tmux = _make_tmux(idle_agents=["hub", "dgx2"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
         _age_neighbors(dp)
 
-        seq1 = dp.deliver("hub", reason="msg1")
-        seq2 = dp.deliver("dgx2", reason="msg2")
+        dp.deliver("hub", reason="msg1")
+        dp.deliver("dgx2", reason="msg2")
 
-        assert seq1 == 1
-        assert seq2 == 2
-        assert len(dp._queue) == 2
+        assert dp._neighbors["hub"].mailbox.pending is True
+        assert dp._neighbors["dgx2"].mailbox.pending is True
 
     @pytest.mark.asyncio
     async def test_deliver_skips_nudge_when_down(self):
         tmux = _make_tmux(idle_agents=[], reachable_agents=[])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
-        await dp._probe_neighbors()  # all DOWN
+        await dp._probe_neighbors()
 
-        seq = dp.deliver("hub", reason="test")
+        dp.deliver("hub", reason="test")
 
-        assert seq == 1
-        assert dp._queue[0].attempts == 1
-        tmux.nudge.assert_not_called()  # skipped because DOWN
+        assert dp._neighbors["hub"].mailbox.pending is True
+        assert dp._neighbors["hub"].mailbox.attempt == 1
+        tmux.nudge.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_pending_count_increments(self):
-        tmux = _make_tmux(idle_agents=["hub"])
+    async def test_deliver_to_monitor_agent(self):
+        """Manager (monitor) should be deliverable now."""
+        tmux = _make_tmux(idle_agents=["manager"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
         _age_neighbors(dp)
 
-        dp.deliver("hub", reason="test")
+        dp.deliver("manager", reason="agent_message from hassio")
 
-        assert dp._neighbors["hub"].pending == 1
+        assert dp._neighbors["manager"].mailbox.pending is True
+        tmux.nudge.assert_called_once_with("manager", force=True)
+
+    def test_deliver_to_unknown_agent_creates_entry(self):
+        dp = DeliveryProtocol(tmux_comm=_make_tmux(), config=_make_config())
+        dp.deliver("new_agent", reason="test")
+        assert "new_agent" in dp._neighbors
+        assert dp._neighbors["new_agent"].mailbox.pending is True
 
 
 # ---------------------------------------------------------------------------
-# ACK processing tests
+# ACK tests
 # ---------------------------------------------------------------------------
 
 
 class TestAck:
     @pytest.mark.asyncio
-    async def test_ack_clears_delivery(self):
+    async def test_ack_clears_pending(self):
         tmux = _make_tmux(idle_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
         _age_neighbors(dp)
         dp.deliver("hub", reason="test")
 
-        assert len(dp._queue) == 1
+        await dp.handle_ack_message(_make_ack_msg("hub"))
 
-        await dp.handle_ack_message(_make_ack_msg("hub", count=3))
-
-        assert len(dp._queue) == 0
-        assert dp._neighbors["hub"].pending == 0
-        assert dp._neighbors["hub"].state == NeighborState.UP
+        assert dp._neighbors["hub"].mailbox.pending is False
+        assert dp._neighbors["hub"].mailbox.attempt == 0
 
     @pytest.mark.asyncio
     async def test_ack_updates_rtt(self):
@@ -233,9 +219,7 @@ class TestAck:
         await dp._probe_neighbors()
         _age_neighbors(dp)
         dp.deliver("hub", reason="test")
-
-        # Simulate time passing
-        dp._queue[0].last_sent = time.time() - 5.0
+        dp._neighbors["hub"].mailbox.last_nudge = time.time() - 5.0
 
         await dp.handle_ack_message(_make_ack_msg("hub"))
 
@@ -243,33 +227,73 @@ class TestAck:
 
     @pytest.mark.asyncio
     async def test_ack_for_unknown_agent_no_crash(self):
-        dp = DeliveryProtocol(
-            tmux_comm=_make_tmux(), config=_make_config(),
-        )
-        # Should not raise
+        dp = DeliveryProtocol(tmux_comm=_make_tmux(), config=_make_config())
         await dp.handle_ack_message(_make_ack_msg("nonexistent"))
 
     @pytest.mark.asyncio
-    async def test_ack_with_no_pending_delivery(self):
+    async def test_ack_with_no_pending_no_crash(self):
         dp = DeliveryProtocol(
-            tmux_comm=_make_tmux(idle_agents=["hub"]),
-            config=_make_config(),
+            tmux_comm=_make_tmux(idle_agents=["hub"]), config=_make_config(),
         )
         await dp._probe_neighbors()
-
-        # ACK without prior delivery
         await dp.handle_ack_message(_make_ack_msg("hub"))
-
-        # Should not crash, neighbor updated
         assert dp._neighbors["hub"].last_ack > 0
 
     @pytest.mark.asyncio
     async def test_ack_invalid_json_no_crash(self):
-        dp = DeliveryProtocol(
-            tmux_comm=_make_tmux(), config=_make_config(),
-        )
-        msg = SimpleNamespace(data=b"not json")
-        await dp.handle_ack_message(msg)  # should not raise
+        dp = DeliveryProtocol(tmux_comm=_make_tmux(), config=_make_config())
+        await dp.handle_ack_message(SimpleNamespace(data=b"not json"))
+
+
+# ---------------------------------------------------------------------------
+# Soft ACK tests
+# ---------------------------------------------------------------------------
+
+
+class TestSoftAck:
+    @pytest.mark.asyncio
+    async def test_busy_to_up_clears_pending(self):
+        """Agent goes BUSY -> UP while pending -> soft ACK clears flag."""
+        tmux_busy = _make_tmux(idle_agents=[], reachable_agents=["hub"])
+        dp = DeliveryProtocol(tmux_comm=tmux_busy, config=_make_config())
+        await dp._probe_neighbors()  # hub = BUSY
+
+        dp._neighbors["hub"].mailbox.pending = True
+        dp._neighbors["hub"].mailbox.attempt = 2
+
+        # Now agent returns to idle
+        tmux_idle = _make_tmux(idle_agents=["hub"])
+        dp._tmux_comm = tmux_idle
+        await dp._probe_neighbors()  # hub BUSY -> UP
+
+        assert dp._neighbors["hub"].mailbox.pending is False
+        assert dp._neighbors["hub"].mailbox.attempt == 0
+
+    @pytest.mark.asyncio
+    async def test_down_to_up_does_not_soft_ack(self):
+        """DOWN -> UP should NOT clear pending (agent wasn't working)."""
+        tmux_down = _make_tmux(idle_agents=[], reachable_agents=[])
+        dp = DeliveryProtocol(tmux_comm=tmux_down, config=_make_config())
+        await dp._probe_neighbors()  # hub = DOWN
+
+        dp._neighbors["hub"].mailbox.pending = True
+
+        tmux_idle = _make_tmux(idle_agents=["hub"])
+        dp._tmux_comm = tmux_idle
+        await dp._probe_neighbors()  # hub DOWN -> UP
+
+        assert dp._neighbors["hub"].mailbox.pending is True  # NOT cleared
+
+    @pytest.mark.asyncio
+    async def test_busy_to_up_without_pending_is_noop(self):
+        """BUSY -> UP with no pending mail should not crash."""
+        tmux_busy = _make_tmux(idle_agents=[], reachable_agents=["hub"])
+        dp = DeliveryProtocol(tmux_comm=tmux_busy, config=_make_config())
+        await dp._probe_neighbors()
+
+        tmux_idle = _make_tmux(idle_agents=["hub"])
+        dp._tmux_comm = tmux_idle
+        await dp._probe_neighbors()  # no crash
 
 
 # ---------------------------------------------------------------------------
@@ -279,60 +303,51 @@ class TestAck:
 
 class TestRetransmit:
     @pytest.mark.asyncio
-    async def test_process_queue_retries_after_backoff(self):
+    async def test_process_renudges_after_backoff(self):
         tmux = _make_tmux(idle_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
         _age_neighbors(dp)
         dp.deliver("hub", reason="test")
 
-        # Force next_retry to be in the past
-        dp._queue[0].next_retry = time.time() - 1
+        # Force last_nudge into the past
+        dp._neighbors["hub"].mailbox.last_nudge = time.time() - 60
+        dp._process_mailboxes()
 
-        dp._process_queue()
-
-        assert dp._queue[0].attempts == 2
-        assert tmux.nudge.call_count == 2  # initial + retry
+        assert dp._neighbors["hub"].mailbox.attempt == 2
+        assert tmux.nudge.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_process_queue_skips_if_not_due(self):
+    async def test_process_skips_during_backoff(self):
         tmux = _make_tmux(idle_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
         _age_neighbors(dp)
         dp.deliver("hub", reason="test")
 
-        # next_retry is in the future (just set by deliver)
-        initial_attempts = dp._queue[0].attempts
+        # last_nudge is recent — backoff not elapsed
+        dp._process_mailboxes()
 
-        dp._process_queue()
-
-        assert dp._queue[0].attempts == initial_attempts  # no retry yet
+        assert dp._neighbors["hub"].mailbox.attempt == 1  # no extra nudge
 
     @pytest.mark.asyncio
     async def test_dead_letter_after_max_attempts(self):
         tmux = _make_tmux(idle_agents=["hub"])
-        config = _make_config(max_attempts=2)
-        dp = DeliveryProtocol(tmux_comm=tmux, config=config)
+        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config(max_attempts=2))
         await dp._probe_neighbors()
         _age_neighbors(dp)
         dp.deliver("hub", reason="test")
 
-        # Exhaust attempts
-        dp._queue[0].attempts = 2
-        dp._queue[0].next_retry = time.time() - 1
+        dp._neighbors["hub"].mailbox.attempt = 2
+        dp._neighbors["hub"].mailbox.last_nudge = time.time() - 9999
+        dp._process_mailboxes()
 
-        dp._process_queue()
-
-        # Record should be cleaned up (dead letter removed from queue)
-        assert len(dp._queue) == 0
-        assert dp._neighbors["hub"].pending == 0
+        assert dp._neighbors["hub"].mailbox.pending is False  # cleared
 
     @pytest.mark.asyncio
     async def test_dead_letter_callback_fires(self):
         tmux = _make_tmux(idle_agents=["hub"])
-        config = _make_config(max_attempts=2)
-        dp = DeliveryProtocol(tmux_comm=tmux, config=config)
+        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config(max_attempts=2))
         await dp._probe_neighbors()
         _age_neighbors(dp)
 
@@ -340,12 +355,11 @@ class TestRetransmit:
         dp.set_dead_letter_callback(callback)
 
         dp.deliver("hub", reason="test")
-        dp._queue[0].attempts = 2
-        dp._queue[0].next_retry = time.time() - 1
+        dp._neighbors["hub"].mailbox.attempt = 2
+        dp._neighbors["hub"].mailbox.last_nudge = time.time() - 9999
+        dp._process_mailboxes()
 
-        dp._process_queue()
-
-        callback.assert_called_once_with("hub", 1)
+        callback.assert_called_once_with("hub", 2)
 
 
 # ---------------------------------------------------------------------------
@@ -356,43 +370,70 @@ class TestRetransmit:
 class TestPushNotify:
     @pytest.mark.asyncio
     @patch("orchestrator.delivery.subprocess")
-    async def test_push_fires_at_escalation_backoff(self, mock_subprocess):
-        """Push notification fires when backoff reaches 1hr threshold."""
-        tmux = _make_tmux(idle_agents=["hub"])
-        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config(max_attempts=6))
-        await dp._probe_neighbors()
-        _age_neighbors(dp)
-        dp.deliver("hub", reason="test")
-
-        record = dp._queue[0]
-        record.attempts = 4  # next backoff = 3600s (escalation threshold)
-        record.next_retry = time.time() - 1
-
-        mock_subprocess.run.return_value = MagicMock(returncode=0)
-        dp._process_queue()
-
-        mock_subprocess.run.assert_called_once()
-        assert record.escalated is True
-
-    @pytest.mark.asyncio
-    @patch("orchestrator.delivery.subprocess")
-    async def test_push_only_fires_once(self, mock_subprocess):
-        """Push notification should not fire twice for the same delivery."""
+    async def test_push_fires_at_escalation(self, mock_subprocess):
         tmux = _make_tmux(idle_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
         _age_neighbors(dp)
         dp.deliver("hub", reason="test")
 
-        record = dp._queue[0]
-        record.attempts = 4
-        record.escalated = True  # already sent
-        record.next_retry = time.time() - 1
+        mb = dp._neighbors["hub"].mailbox
+        mb.attempt = 4  # backoff = 3600s (escalation threshold)
+        mb.last_nudge = time.time() - 9999
 
         mock_subprocess.run.return_value = MagicMock(returncode=0)
-        dp._process_queue()
+        dp._process_mailboxes()
+
+        mock_subprocess.run.assert_called_once()
+        assert mb.escalated is True
+
+    @pytest.mark.asyncio
+    @patch("orchestrator.delivery.subprocess")
+    async def test_push_only_fires_once(self, mock_subprocess):
+        tmux = _make_tmux(idle_agents=["hub"])
+        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
+        await dp._probe_neighbors()
+        _age_neighbors(dp)
+        dp.deliver("hub", reason="test")
+
+        mb = dp._neighbors["hub"].mailbox
+        mb.attempt = 4
+        mb.escalated = True  # already sent
+        mb.last_nudge = time.time() - 9999
+
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        dp._process_mailboxes()
 
         mock_subprocess.run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Grace period tests
+# ---------------------------------------------------------------------------
+
+
+class TestGracePeriod:
+    @pytest.mark.asyncio
+    async def test_grace_defers_nudge(self):
+        tmux = _make_tmux(idle_agents=["hub"])
+        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
+        await dp._probe_neighbors()  # just came UP
+
+        dp.deliver("hub", reason="test")
+
+        tmux.nudge.assert_not_called()
+        assert dp._neighbors["hub"].mailbox.pending is True
+
+    @pytest.mark.asyncio
+    async def test_grace_allows_after_period(self):
+        tmux = _make_tmux(idle_agents=["hub"])
+        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
+        await dp._probe_neighbors()
+        _age_neighbors(dp)
+
+        dp.deliver("hub", reason="test")
+
+        tmux.nudge.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -402,21 +443,18 @@ class TestPushNotify:
 
 class TestStatusReporting:
     @pytest.mark.asyncio
-    async def test_get_neighbor_table(self):
+    async def test_get_neighbor_table_includes_all(self):
         tmux = _make_tmux(idle_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
 
         table = dp.get_neighbor_table()
-
         assert "hub" in table
+        assert "manager" in table
         assert table["hub"]["state"] == "UP"
-        assert "manager" not in table
 
     def test_get_queue_status_empty(self):
-        dp = DeliveryProtocol(
-            tmux_comm=_make_tmux(), config=_make_config(),
-        )
+        dp = DeliveryProtocol(tmux_comm=_make_tmux(), config=_make_config())
         assert dp.get_queue_status() == []
 
     @pytest.mark.asyncio
@@ -428,62 +466,25 @@ class TestStatusReporting:
         dp.deliver("hub", reason="test_reason")
 
         status = dp.get_queue_status()
-
         assert len(status) == 1
         assert status[0]["target"] == "hub"
         assert status[0]["reason"] == "test_reason"
 
     @pytest.mark.asyncio
     async def test_log_route_table_no_crash(self):
-        dp = DeliveryProtocol(
-            tmux_comm=_make_tmux(), config=_make_config(),
-        )
+        dp = DeliveryProtocol(tmux_comm=_make_tmux(), config=_make_config())
         await dp._probe_neighbors()
-        dp._log_route_table()  # should not raise
+        dp._log_route_table()
 
 
 # ---------------------------------------------------------------------------
-# Startup grace period tests
-# ---------------------------------------------------------------------------
-
-
-class TestGracePeriod:
-    @pytest.mark.asyncio
-    async def test_grace_defers_nudge(self):
-        """Agent that just came UP should defer the nudge."""
-        tmux = _make_tmux(idle_agents=["hub"])
-        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
-        await dp._probe_neighbors()  # just came UP — grace active
-
-        dp.deliver("hub", reason="test")
-
-        # Nudge should NOT have been sent (grace period)
-        tmux.nudge.assert_not_called()
-        assert dp._queue[0].state == DeliveryState.QUEUED
-
-    @pytest.mark.asyncio
-    async def test_grace_allows_after_period(self):
-        """After grace period, nudge should proceed normally."""
-        tmux = _make_tmux(idle_agents=["hub"])
-        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
-        await dp._probe_neighbors()
-        _age_neighbors(dp)  # past grace
-
-        dp.deliver("hub", reason="test")
-
-        tmux.nudge.assert_called_once()
-        assert dp._queue[0].state == DeliveryState.SENT
-
-
-# ---------------------------------------------------------------------------
-# After-ACK re-delivery test
+# Re-delivery after ACK
 # ---------------------------------------------------------------------------
 
 
 class TestReDeliveryAfterAck:
     @pytest.mark.asyncio
     async def test_can_deliver_again_after_ack(self):
-        """Once ACKed and cleaned, a new delivery to the same agent works."""
         tmux = _make_tmux(idle_agents=["hub"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
@@ -491,8 +492,8 @@ class TestReDeliveryAfterAck:
 
         dp.deliver("hub", reason="first")
         await dp.handle_ack_message(_make_ack_msg("hub"))
-        assert len(dp._queue) == 0
+        assert dp._neighbors["hub"].mailbox.pending is False
 
-        seq = dp.deliver("hub", reason="second")
-        assert seq > 0
-        assert len(dp._queue) == 1
+        dp.deliver("hub", reason="second")
+        assert dp._neighbors["hub"].mailbox.pending is True
+        assert tmux.nudge.call_count == 2

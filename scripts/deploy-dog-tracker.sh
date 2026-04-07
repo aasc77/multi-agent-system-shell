@@ -44,12 +44,26 @@ ssh "$DGX2_USER@$DGX2_HOST" "cd $REMOTE_DIR && python3 -m venv venv && ./venv/bi
 echo ""
 echo "=== Deploy complete ==="
 echo ""
-echo "To configure camera, edit on DGX2:"
-echo "  ssh $DGX2_USER@$DGX2_HOST"
-echo "  nano $REMOTE_DIR/config.yaml"
+
+# Push credentials from Keychain to remote env file
+SCRIPT_DIR_ABS="$(cd "$(dirname "$0")" && pwd)"
+if command -v security &>/dev/null; then
+    echo "[+] Pushing credentials to remote .env file..."
+    NVR_PASS=$(security find-generic-password -s "nvr/dog-tracker" -a "admin" -w 2>/dev/null || true)
+    if [ -n "$NVR_PASS" ]; then
+        ssh "$DGX2_USER@$DGX2_HOST" "cat > $REMOTE_DIR/.env << 'ENVEOF'
+RTSP_URL=rtsp://admin:${NVR_PASS}@192.168.1.46:554/h264Preview_01_main
+ONVIF_HOST=192.168.1.46
+ONVIF_PORT=8000
+ONVIF_PASSWORD=${NVR_PASS}
+ENVEOF
+chmod 600 $REMOTE_DIR/.env"
+        echo "    Credentials written to $REMOTE_DIR/.env (mode 600)"
+    else
+        echo "    WARNING: NVR password not in Keychain. Run: ./scripts/nvr-credential.sh store"
+    fi
+fi
+
 echo ""
 echo "To start the service:"
-echo "  ssh $DGX2_USER@$DGX2_HOST 'cd $REMOTE_DIR && ./venv/bin/python3 service.py'"
-echo ""
-echo "Or with env overrides:"
-echo "  ssh $DGX2_USER@$DGX2_HOST 'cd $REMOTE_DIR && RTSP_URL=rtsp://... ONVIF_HOST=... ./venv/bin/python3 service.py'"
+echo "  ssh $DGX2_USER@$DGX2_HOST 'cd $REMOTE_DIR && set -a && source .env && set +a && ./venv/bin/python3 service.py'"
