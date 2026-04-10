@@ -174,8 +174,8 @@ class TestDeliver:
         tmux.nudge.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_deliver_to_monitor_agent(self):
-        """Manager (monitor) should be deliverable now."""
+    async def test_deliver_to_monitor_agent_one_shot_nudge(self):
+        """Monitor agents get a one-shot nudge but no pending tracking."""
         tmux = _make_tmux(idle_agents=["manager"])
         dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
         await dp._probe_neighbors()
@@ -183,8 +183,55 @@ class TestDeliver:
 
         dp.deliver("manager", reason="agent_message from hassio")
 
-        assert dp._neighbors["manager"].mailbox.pending is True
+        # Nudge was sent exactly once
         tmux.nudge.assert_called_once_with("manager", force=True)
+        # But no pending state or attempt tracking
+        assert dp._neighbors["manager"].mailbox.pending is False
+        assert dp._neighbors["manager"].mailbox.attempt == 0
+        assert dp._neighbors["manager"].mailbox.escalated is False
+
+    @pytest.mark.asyncio
+    async def test_process_mailboxes_skips_monitor_agents(self):
+        """_process_mailboxes must never touch monitor agents, even if
+        pending were somehow set on them."""
+        tmux = _make_tmux(idle_agents=["manager", "hub"])
+        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
+        await dp._probe_neighbors()
+        _age_neighbors(dp)
+
+        # Artificially force a pending flag on the monitor (shouldn't
+        # happen in practice, but prove the guard holds).
+        dp._neighbors["manager"].mailbox.pending = True
+        dp._neighbors["manager"].mailbox.attempt = 1
+        dp._neighbors["manager"].mailbox.last_nudge = time.time() - 9999
+
+        dp._process_mailboxes()
+
+        # Monitor was not re-nudged — attempt count stayed at 1
+        assert dp._neighbors["manager"].mailbox.attempt == 1
+        tmux.nudge.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("orchestrator.delivery.subprocess")
+    async def test_repeated_deliver_to_monitor_never_escalates(
+        self, mock_subprocess,
+    ):
+        """Calling deliver() N times to a monitor produces N nudges,
+        never flips pending, never triggers the Pushover escalation path."""
+        tmux = _make_tmux(idle_agents=["manager"])
+        dp = DeliveryProtocol(tmux_comm=tmux, config=_make_config())
+        await dp._probe_neighbors()
+        _age_neighbors(dp)
+
+        for i in range(10):
+            dp.deliver("manager", reason=f"msg-{i}")
+
+        assert tmux.nudge.call_count == 10
+        assert dp._neighbors["manager"].mailbox.pending is False
+        assert dp._neighbors["manager"].mailbox.attempt == 0
+        assert dp._neighbors["manager"].mailbox.escalated is False
+        # Pushover subprocess should never have been invoked
+        mock_subprocess.run.assert_not_called()
 
     def test_deliver_to_unknown_agent_creates_entry(self):
         dp = DeliveryProtocol(tmux_comm=_make_tmux(), config=_make_config())

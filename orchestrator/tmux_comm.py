@@ -112,17 +112,29 @@ class TmuxComm:
             name: idx for idx, name in enumerate(pane_agents)
         }
 
-        # Monitor agents live in the control window (start.sh splits pane 0
-        # vertically and places the manager in pane 1).  Build a separate
-        # mapping so nudge/send_keys can reach them.
+        # Monitor agents live in the control window.  Rather than hardcode
+        # pane indices (which break if the user rearranges the layout),
+        # scan the control window for panes whose @label matches the
+        # agent's configured label or name.  Fall back to a legacy
+        # positional layout (pane 1, pane 2, …) if the tmux query fails
+        # (e.g. during unit tests with no live session).
         self._control_pane_mapping: dict[str, str] = {}
-        control_idx = 1  # pane 0 = orchestrator, pane 1 = first monitor agent
-        for name, cfg in config[_CFG_AGENTS].items():
-            if isinstance(cfg, dict) and cfg.get("role") == "monitor":
+        monitors = [
+            (name, cfg.get("label", name) if isinstance(cfg, dict) else name)
+            for name, cfg in config[_CFG_AGENTS].items()
+            if isinstance(cfg, dict) and cfg.get("role") == "monitor"
+        ]
+        if monitors:
+            label_to_index = self._scan_control_pane_labels()
+            for fallback_idx, (name, label) in enumerate(monitors, start=1):
+                idx = label_to_index.get(label)
+                if idx is None:
+                    idx = label_to_index.get(name)
+                if idx is None:
+                    idx = fallback_idx
                 self._control_pane_mapping[name] = (
-                    f"{self._session_name}:control.{control_idx}"
+                    f"{self._session_name}:control.{idx}"
                 )
-                control_idx += 1
 
         # Track which agents are claude_code (skip busy-check for them)
         self._claude_code_agents: set[str] = {
@@ -137,6 +149,42 @@ class TmuxComm:
 
         # Escalation callback
         self._flag_human_callback: Optional[FlagHumanCallback] = None
+
+    def _scan_control_pane_labels(self) -> dict[str, int]:
+        """Scan the control window for pane @labels and return a
+        ``{label: pane_index}`` mapping.
+
+        Returns an empty dict on any failure (tmux not running, session
+        missing, etc.) so the caller can fall back to a default layout.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "tmux", "list-panes",
+                    "-t", f"{self._session_name}:control",
+                    "-F", "#{pane_index}\t#{@label}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return {}
+        if result.returncode != 0:
+            return {}
+        mapping: dict[str, int] = {}
+        for line in result.stdout.splitlines():
+            if "\t" not in line:
+                continue
+            idx_str, label = line.split("\t", 1)
+            label = label.strip()
+            if not label:
+                continue
+            try:
+                mapping[label] = int(idx_str)
+            except ValueError:
+                continue
+        return mapping
 
     # ------------------------------------------------------------------
     # Public API
@@ -190,16 +238,27 @@ class TmuxComm:
         """Return ``True`` if the agent's pane appears idle (at prompt).
 
         Claude Code agents show a ``❯`` prompt when idle.  The status bar
-        (e.g. ``⏵⏵ bypass permissions on``) often sits below the prompt,
-        so we check all captured lines, not just the last one.
+        (e.g. ``⏵⏵ bypass permissions on``, status line, Dapple bubble)
+        often sits below the prompt, so we check enough lines to cover
+        the tallest possible status footer.
         """
-        pane_text = self.capture_pane(agent, lines=5)
+        pane_text = self.capture_pane(agent, lines=10)
         if pane_text is None:
             return False
         lines = [l for l in pane_text.strip().splitlines() if l.strip()]
         if not lines:
             return False
-        return any(l.strip() == "❯" or l.strip().endswith("❯") for l in lines)
+        # Match ❯ alone, at the end, or at the start (e.g.
+        # "❯ Press up to edit queued messages") -- Claude Code
+        # shows the prompt char as a line marker even when hint
+        # text follows it.
+        return any(
+            l.strip() == "❯"
+            or l.strip().endswith("❯")
+            or l.strip().startswith("❯ ")
+            or l.strip().startswith("❯")
+            for l in lines
+        )
 
     def nudge(self, agent: str, force: bool = False) -> bool:
         """Nudge an agent pane with the configured nudge prompt.

@@ -148,11 +148,17 @@ class DeliveryProtocol:
             "table_log_interval", _DEFAULT_TABLE_LOG_INTERVAL,
         )
 
-        # Build neighbor table — ALL agents, including monitors
+        # Build neighbor table — ALL agents, including monitors.
+        # Track which agents are monitors so we can skip delivery for them
+        # (they're always in conversation with the user, the BUSY/UP probe
+        # cycle doesn't apply, and they read messages naturally).
         agents = config.get("agents", {})
         self._neighbors: dict[str, NeighborEntry] = {}
-        for name in agents:
+        self._monitor_agents: set[str] = set()
+        for name, cfg in agents.items():
             self._neighbors[name] = NeighborEntry(agent=name)
+            if isinstance(cfg, dict) and cfg.get("role") == "monitor":
+                self._monitor_agents.add(name)
 
         # Timing
         self._last_probe: float = 0.0
@@ -174,12 +180,27 @@ class DeliveryProtocol:
 
         No coalescing — if the agent already has pending mail, we still
         nudge right away (new message = new nudge attempt).
+
+        Monitor agents (e.g. manager) get a one-shot nudge: we tap the
+        pane once so they notice new mail, but we do NOT set pending,
+        track attempts, or re-process them in the retransmit loop. This
+        avoids the retransmit/escalation false alarms that fire when a
+        monitor is legitimately idle in conversation with the user.
         """
         neighbor = self._neighbors.get(agent)
         if neighbor is None:
             # Dynamic agent — create entry on the fly
             neighbor = NeighborEntry(agent=agent)
             self._neighbors[agent] = neighbor
+
+        # Monitor agents: one-shot nudge, no pending tracking, no retransmit
+        if agent in self._monitor_agents:
+            logger.info("DELIVER one-shot to %s monitor (%s)", agent, reason)
+            try:
+                self._tmux_comm.nudge(agent, force=True)
+            except Exception:
+                logger.exception("monitor nudge failed for %s", agent)
+            return
 
         neighbor.mailbox.pending = True
         neighbor.mailbox.last_reason = reason
@@ -347,6 +368,9 @@ class DeliveryProtocol:
         now = time.time()
 
         for name, neighbor in self._neighbors.items():
+            # Skip monitor agents — they read messages naturally
+            if name in self._monitor_agents:
+                continue
             mb = neighbor.mailbox
             if not mb.pending:
                 continue
