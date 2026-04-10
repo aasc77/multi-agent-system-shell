@@ -19,6 +19,27 @@ venv/
 # Runtime artifacts
 projects/*/.mcp-configs/
 projects/*/orchestrator.log
+workspace/shared/
+**/shared/
+
+# Secrets
+.env
+workspace/.env
+scripts/gsheets-config/client_secret.json
+scripts/gsheets-config/token.json
+
+# Knowledge store data
+data/chromadb/
+
+# Logs
+*.log
+
+# Workspace artifacts
+workspace/data/
+workspace/face-venv/
+workspace/face_swap_live.*
+workspace/test_cam.*
+workspace/test_xtion.py
 
 # OS
 .DS_Store

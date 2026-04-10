@@ -181,6 +181,15 @@ class NatsClient:
         payload = json.dumps(message).encode()
         await self._js.publish(subject, payload)
 
+    async def publish_raw(self, subject: str, payload: bytes) -> None:
+        """Publish raw bytes to an arbitrary NATS subject.
+
+        Raises:
+            NatsClientError: If not connected.
+        """
+        self._require_connected()
+        await self._js.publish(subject, payload)
+
     async def publish_all_done(self, summary: str) -> None:
         """Publish an ``all_done`` message to every agent's inbox.
 
@@ -231,6 +240,45 @@ class NatsClient:
         """
         for role in self._agents:
             await self.subscribe_to_outbox(role, callback)
+
+    async def subscribe_to_inbox(
+        self,
+        role: str,
+        callback: MessageCallback,
+    ) -> None:
+        """Subscribe to ``<prefix>.<role>.inbox`` with a durable consumer.
+
+        Used by the orchestrator to watch for agent-to-agent messages
+        and relay tmux nudges.
+        """
+        self._require_connected()
+        subject = self.inbox_subject(role)
+        durable = f"{role}-{_INBOX_SUFFIX}-relay"
+        try:
+            await self._js.subscribe(subject, cb=callback, durable=durable)
+        except Exception:
+            try:
+                await self._js.delete_consumer(self._stream_name, durable)
+            except Exception:
+                pass
+            await self._js.subscribe(subject, cb=callback, durable=durable)
+
+    async def subscribe_all_inboxes(self, callback: MessageCallback) -> None:
+        """Subscribe to every agent's inbox with a durable consumer."""
+        for role in self._agents:
+            await self.subscribe_to_inbox(role, callback)
+
+    async def subscribe_ack(self, callback: MessageCallback) -> None:
+        """Subscribe to delivery ACK subjects via core NATS.
+
+        Listens on ``<prefix>.*.ack`` for delivery receipts published
+        by MCP bridges when agents call ``check_messages``.  Uses core
+        NATS (not JetStream) since ACKs are ephemeral.
+        """
+        self._require_connected()
+        subject = f"{self._prefix}.*.ack"
+        await self._conn.subscribe(subject, cb=callback)
+        logger.info("Subscribed to delivery ACKs: %s", subject)
 
     # ------------------------------------------------------------------
     # Internal helpers

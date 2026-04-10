@@ -1,0 +1,8 @@
+# Magentic-UI configuration -- local vLLM endpoint override
+#
+# Points Magentic-UI at the local Fara-7B vLLM instance
+# instead of the default cloud API.
+
+provider:
+  endpoint: "http://localhost:5000/v1"
+  model: "microsoft/Fara-7B"

@@ -1,12 +1,13 @@
 nats:
-  url: nats://localhost:4222
+  url: nats://127.0.0.1:4222
   stream: AGENTS
   subjects_prefix: agents
 
 tmux:
-  nudge_prompt: "You have new messages. Use check_messages with your role."
+  nudge_prompt: "You have new messages in your inbox. Use the check_messages MCP tool to read them."
   nudge_cooldown_seconds: 30
   max_nudge_retries: 20
+  nudge_send_retries: 3
 
 tasks:
   max_attempts_per_task: 5

@@ -74,6 +74,10 @@ class TaskQueue:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def reload(self) -> None:
+        """Re-read tasks from disk, picking up external changes."""
+        self._load()
+
     def _load(self) -> None:
         """Load tasks from the JSON file and build the lookup index."""
         data = json.loads(self._file_path.read_text())

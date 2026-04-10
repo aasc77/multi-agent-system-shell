@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mas.daily-status</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/angelserrano/Repositories/multi-agent-system-shell/scripts/daily-status.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/angelserrano/Repositories/multi-agent-system-shell/data/logs/daily-status-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/angelserrano/Repositories/multi-agent-system-shell/data/logs/daily-status-launchd.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>NATS_URL</key>
+        <string>nats://127.0.0.1:4222</string>
+        <key>CHROMADB_PATH</key>
+        <string>/Users/angelserrano/Repositories/multi-agent-system-shell/data/chromadb</string>
+        <key>OLLAMA_URL</key>
+        <string>http://localhost:11434</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

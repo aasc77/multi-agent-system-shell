@@ -1,0 +1,53 @@
+# Dog Tracker Service Configuration
+# All tunables — override via DynamoDB agent config or environment vars
+
+# Camera settings (populate on deploy)
+camera:
+  rtsp_url: ""          # set via RTSP_URL env var (use scripts/nvr-credential.sh rtsp)
+  onvif_host: "192.168.1.46"
+  onvif_port: 8000      # Reolink NVR ONVIF port
+  onvif_user: "admin"
+  onvif_password: ""    # set via ONVIF_PASSWORD env var (use scripts/nvr-credential.sh env)
+  resolution_width: 1920
+  resolution_height: 1080
+
+# NATS messaging
+nats:
+  url: "nats://Angels-MacBook-Pro.local:4222"
+  stream: "AGENTS"
+  inbox: "agents.dogtracker.inbox"
+  outbox: "agents.dogtracker.outbox"
+  consumer: "dogtracker-service"
+
+# YOLO detection
+detection:
+  model: "yolov11n.pt"       # nano model for max speed
+  confidence: 0.4
+  dog_class_id: 16            # COCO class ID for dog
+  tracker: "bytetrack.yaml"
+
+# PID controller
+pid:
+  kp: 0.3
+  ki: 0.01
+  kd: 0.1
+  output_min: -1.0
+  output_max: 1.0
+
+# Tracking behavior
+tracking:
+  dead_zone: 0.05             # ignore offsets below 5% of frame
+  ema_alpha: 0.4              # smoothing factor for detection positions
+  ptz_command_rate_hz: 10     # max PTZ commands per second
+  invert_tilt: true           # invert tilt axis (most cameras need this)
+  idle_fps: 2                 # detection rate in IDLE mode
+  tracking_fps: 30            # detection rate in TRACKING mode
+
+# Lost target timers (seconds)
+lost_target:
+  continue_seconds: 2         # keep moving in last direction
+  search_seconds: 8           # slow pan in last-known direction
+  home_seconds: 15            # return to home preset after this total
+
+# Logging
+log_level: "INFO"

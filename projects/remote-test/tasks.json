@@ -1,11 +1,24 @@
 {
   "tasks": [
     {
-      "id": "rt-1",
-      "title": "Cross-machine test",
-      "description": "Test that tasks flow through local and remote agents correctly.",
+      "id": "test-1",
+      "title": "4-node ping test",
+      "description": "Simple connectivity test across all 4 nodes.",
+      "status": "completed",
+      "attempts": 1
+    },
+    {
+      "id": "dog-tracker-1",
+      "title": "Dog tracker service — deploy and E2E test",
+      "description": "YOLO + ByteTrack + ONVIF PTZ dog tracking service. Dev builds code, DGX2 hosts and runs the service, hassio provides camera credentials, macmini runs E2E QA tests. Service should auto-start in IDLE (2fps scanning), transition to TRACKING when dog detected, control camera PTZ to keep dog centered.",
       "status": "in_progress",
-      "attempts": 0
+      "attempts": 0,
+      "assigned_agents": {
+        "hub": "code complete — service, tests, deploy script, bug fixes delivered",
+        "dgx2": "service running — auto-start, ONVIF connected, scanning at 2fps",
+        "hassio": "camera credentials provided",
+        "macmini": "E2E testing complete — 11/12 pass, 1 fail (double-start bug)"
+      }
     }
   ]
 }

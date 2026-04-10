@@ -74,15 +74,74 @@ session_exists() {
 }
 
 # -----------------------------------------------------------------------
-# Kill tmux session
+# Signal SSH reconnect loops to stop before killing the session
 # -----------------------------------------------------------------------
-if session_exists; then
-    echo "Stopping tmux session '$SESSION_NAME'..."
+echo "Signaling SSH agents to stop reconnecting..."
+for sentinel in /tmp/mas-launch-*; do
+    [ -f "$sentinel" ] || continue
+    agent_name=$(basename "$sentinel" | sed 's/^mas-launch-//; s/\.sh$//')
+    touch "/tmp/mas-stop-${agent_name}"
+done
+
+# -----------------------------------------------------------------------
+# Kill knowledge-store indexer
+# -----------------------------------------------------------------------
+echo "Stopping knowledge indexer..."
+if [ "$DRY_RUN" = "true" ]; then
+    echo "[DRY-RUN] pkill -f knowledge-store/indexer.py"
+else
+    pkill -f "knowledge-store/indexer.py" 2>/dev/null || true
+fi
+
+# -----------------------------------------------------------------------
+# Kill tmux session(s)
+#
+# start.sh creates a grouped-session family:
+#   <name>            -- primary (-d -s <name>)
+#   <name>-control    -- secondary for the control window launcher
+#   <name>-agents     -- secondary for the agents window launcher
+#
+# We must kill ALL of them, otherwise leftover grouped sessions pile up
+# and show stale layouts pointing at whichever window they last attached.
+# Belt-and-suspenders: also query tmux for any remaining sessions in the
+# group (catches historical sessions auto-numbered by tmux pre-fix).
+# -----------------------------------------------------------------------
+kill_tmux_session() {
+    local target="$1"
     if [ "$DRY_RUN" = "true" ]; then
-        echo "[DRY-RUN] tmux kill-session -t $SESSION_NAME"
+        echo "[DRY-RUN] tmux kill-session -t $target"
     else
-        tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        tmux kill-session -t "$target" 2>/dev/null || true
     fi
+}
+
+if session_exists; then
+    echo "Stopping tmux session '$SESSION_NAME' and grouped sessions..."
+
+    # Kill the deterministic names first.
+    for suffix in "" "-control" "-agents"; do
+        target="${SESSION_NAME}${suffix}"
+        if [ "$DRY_RUN" = "true" ]; then
+            kill_tmux_session "$target"
+        else
+            if tmux has-session -t "$target" 2>/dev/null; then
+                kill_tmux_session "$target"
+            fi
+        fi
+    done
+
+    # Belt-and-suspenders: any other sessions in the same group (e.g.
+    # auto-numbered cruft created before the -A -s fix landed).
+    if [ "$DRY_RUN" != "true" ]; then
+        tmux list-sessions -F '#{session_name}|#{session_group}' 2>/dev/null \
+            | awk -F'|' -v g="${SESSION_NAME}" '$2==g {print $1}' \
+            | while read -r stray; do
+                [ -z "$stray" ] && continue
+                echo "Killing stray grouped session: $stray"
+                tmux kill-session -t "$stray" 2>/dev/null || true
+            done
+    fi
+
     echo "Session '$SESSION_NAME' killed."
 else
     echo "Session '$SESSION_NAME' already stopped."

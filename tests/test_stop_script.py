@@ -326,6 +326,122 @@ class TestKillNatsFlag:
 
 
 # ===========================================================================
+# 4a. GROUPED-SESSION CLEANUP
+# ===========================================================================
+
+
+class TestGroupedSessionCleanup:
+    """stop.sh must kill ALL sessions in the group, not just the primary.
+
+    When start.sh opens iTerm windows, it uses
+    `tmux new-session -A -s <name>-control -t <name>` which creates
+    secondary sessions in the same group. Without the grouped-cleanup
+    fix, stop.sh only killed the primary session and the cruft piled up.
+    """
+
+    def test_dry_run_references_control_and_agents_suffixes(self):
+        """In dry-run mode with a session 'present', the output should
+        mention killing the -control and -agents sibling sessions."""
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+
+        result = _run_stop_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "demo-control" in output, (
+            f"stop.sh must attempt to kill 'demo-control' grouped session, got: {output}"
+        )
+        assert "demo-agents" in output, (
+            f"stop.sh must attempt to kill 'demo-agents' grouped session, got: {output}"
+        )
+
+    @pytest.mark.skipif(
+        subprocess.run(["which", "tmux"], capture_output=True).returncode != 0,
+        reason="tmux not installed",
+    )
+    def test_real_tmux_kills_all_grouped_sessions(self, tmp_path):
+        """Integration: create a grouped tmux session family, stop it,
+        verify ALL grouped sessions are gone."""
+        import uuid
+
+        session = f"masstoptest-{uuid.uuid4().hex[:8]}"
+
+        # Clean slate.
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session],
+            capture_output=True,
+        )
+
+        # Create primary + 2 secondaries + 1 stray auto-numbered session.
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session, "-n", "control"],
+            check=True,
+        )
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-A", "-s", f"{session}-control",
+             "-t", session],
+            check=True,
+        )
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-A", "-s", f"{session}-agents",
+             "-t", session],
+            check=True,
+        )
+        # Stray auto-numbered grouped session (old start.sh behavior pre-fix)
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-t", session],
+            check=True,
+        )
+
+        # Verify pre-condition: multiple sessions in the group exist.
+        pre = subprocess.run(
+            ["tmux", "list-sessions", "-F",
+             "#{session_name}|#{session_group}"],
+            capture_output=True, text=True,
+        )
+        group_members = [
+            line.split("|")[0]
+            for line in pre.stdout.splitlines()
+            if line.endswith("|" + session) or line.startswith(session + "|")
+        ]
+        assert len(group_members) >= 3, (
+            f"Pre-condition: expected 3+ grouped sessions, got {group_members}"
+        )
+
+        # Create a minimal project directory so stop.sh doesn't error
+        # on the MCP configs cleanup.
+        project_dir = tmp_path / "projects" / session
+        project_dir.mkdir(parents=True)
+
+        try:
+            result = _run_stop_script(session, cwd=str(tmp_path))
+            assert result.returncode == 0, (
+                f"stop.sh failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
+
+            # Verify post-condition: NO sessions in the group remain.
+            post = subprocess.run(
+                ["tmux", "list-sessions", "-F",
+                 "#{session_name}|#{session_group}"],
+                capture_output=True, text=True,
+            )
+            remaining = [
+                line for line in post.stdout.splitlines()
+                if session in line
+            ]
+            assert len(remaining) == 0, (
+                f"All grouped sessions should be killed, but found: {remaining}"
+            )
+        finally:
+            # Belt-and-suspenders cleanup
+            for suffix in ["", "-control", "-agents"]:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", f"{session}{suffix}"],
+                    capture_output=True,
+                )
+
+
+# ===========================================================================
 # 5. IDEMPOTENT BEHAVIOR (ALREADY STOPPED)
 # ===========================================================================
 
