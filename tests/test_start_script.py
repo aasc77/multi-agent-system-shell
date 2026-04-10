@@ -1245,3 +1245,143 @@ class TestIntegrationScenarios:
             with open(config_path) as f:
                 config = json.load(f)
             assert config["mcpServers"]["mas-bridge"]["env"]["AGENT_ROLE"] == name
+
+
+# ===========================================================================
+# 15. PROVIDER TEMPLATE SUBSTITUTION
+# ===========================================================================
+
+
+def _build_provider_project(tmp_path, agent_prompt, providers_global=None,
+                            project_name="providerproj"):
+    """Spin up a minimal temp project with one local claude_code agent whose
+    ``system_prompt`` is the caller-supplied string. In dry-run mode,
+    start.sh prints each ``tmux send-keys`` invocation (including the
+    agent's resolved ``--append-system-prompt``) to stdout, which the
+    tests then grep.
+    """
+    if providers_global is None:
+        providers_global = {
+            "stt": {"backend": "whisper", "url": "http://192.168.1.51:5112"},
+            "tts": {"backend": "piper", "url": "http://192.168.1.51:5111"},
+        }
+
+    project_dir = tmp_path / "projects" / project_name
+    project_dir.mkdir(parents=True)
+
+    project_config = {
+        "project": project_name,
+        "tmux": {"session_name": project_name},
+        "agents": {
+            "voicebot": {
+                "runtime": "claude_code",
+                "working_dir": str(tmp_path / "ws"),
+                "system_prompt": agent_prompt,
+            },
+        },
+        "state_machine": {
+            "initial": "idle",
+            "states": {"idle": {"description": "noop"}},
+            "transitions": [
+                {"from": "idle", "to": "idle", "trigger": "task_assigned"},
+            ],
+        },
+    }
+    with open(project_dir / "config.yaml", "w") as f:
+        yaml.dump(project_config, f)
+
+    global_config = {
+        "nats": {"url": "nats://localhost:4222"},
+        "tmux": {"nudge_cooldown_seconds": 30, "max_nudge_retries": 20},
+        "providers": providers_global,
+    }
+    with open(tmp_path / "config.yaml", "w") as f:
+        yaml.dump(global_config, f)
+
+    (tmp_path / "ws").mkdir(exist_ok=True)
+    return project_dir
+
+
+class TestProviderSubstitution:
+    """``{{providers.<section>.<field>}}`` placeholders in ``system_prompt``
+    are resolved from the merged config's ``providers`` subtree before the
+    agent launch command is built.
+    """
+
+    def test_placeholder_resolved_to_config_value(self, tmp_path):
+        """``{{providers.stt.url}}`` must be replaced with the config value."""
+        prompt = "STT at {{providers.stt.url}} with backend {{providers.stt.backend}}."
+        _build_provider_project(tmp_path, prompt)
+
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+        result = _run_start_script(
+            "providerproj", env_overrides=env, cwd=str(tmp_path),
+        )
+        output = result.stdout + result.stderr
+
+        # Resolved URL + backend show up in the launch command.
+        assert "http://192.168.1.51:5112" in output, (
+            "Expected resolved providers.stt.url in dry-run launch output"
+        )
+        assert "backend whisper" in output, (
+            "Expected resolved providers.stt.backend in dry-run launch output"
+        )
+        # No raw placeholder survives into the launch command.
+        assert "{{providers.stt.url}}" not in output
+        assert "{{providers.stt.backend}}" not in output
+        # Debug line must be emitted to stderr for operators.
+        assert "providers.stt = whisper @ http://192.168.1.51:5112" in output
+
+    def test_unknown_placeholder_errors_naming_agent_and_token(self, tmp_path):
+        """Unknown ``{{providers.bogus.url}}`` must fail loudly."""
+        prompt = "broken {{providers.bogus.url}} prompt"
+        _build_provider_project(tmp_path, prompt)
+
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+        result = _run_start_script(
+            "providerproj", env_overrides=env, cwd=str(tmp_path),
+        )
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            "start.sh must exit non-zero when a provider placeholder cannot be resolved"
+        )
+        assert "voicebot" in combined, (
+            "Error must name the offending agent (voicebot)"
+        )
+        assert "{{providers.bogus.url}}" in combined, (
+            "Error must name the unresolved token"
+        )
+
+    def test_literal_braces_preserved_and_double_occurrence_resolves(self, tmp_path):
+        """Non-matching ``{{...}}`` sequences are preserved verbatim, and a
+        placeholder that appears twice in the same prompt is resolved both times.
+        """
+        prompt = (
+            "Literal {{not a provider}} stays. "
+            "First {{providers.stt.url}} and second {{providers.stt.url}}."
+        )
+        _build_provider_project(tmp_path, prompt)
+
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+        result = _run_start_script(
+            "providerproj", env_overrides=env, cwd=str(tmp_path),
+        )
+        output = result.stdout + result.stderr
+
+        # The non-matching literal is preserved byte-for-byte.
+        assert "{{not a provider}}" in output, (
+            "Literal non-matching {{...}} must be preserved"
+        )
+        # Both occurrences of the same placeholder resolve.
+        assert output.count("http://192.168.1.51:5112") >= 2, (
+            "A placeholder repeated twice must resolve both times"
+        )
+        # No raw provider placeholder survives.
+        assert "{{providers.stt.url}}" not in output

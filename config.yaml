@@ -11,3 +11,11 @@ tmux:
 
 tasks:
   max_attempts_per_task: 5
+
+providers:
+  stt:
+    backend: whisper
+    url: http://192.168.1.51:5112
+  tts:
+    backend: piper
+    url: http://192.168.1.51:5111

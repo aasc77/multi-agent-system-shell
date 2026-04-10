@@ -106,17 +106,28 @@ if [ ! -f "$PROJECT_CONFIG" ]; then
 fi
 
 # -----------------------------------------------------------------------
-# Parse configs using Python (YAML parsing with deep merge)
+# Parse configs, resolve provider placeholders, extract launcher values
 # -----------------------------------------------------------------------
-parse_configs() {
-    # Parse and merge global + project YAML configs into JSON.
-    # Project values override global; merges two levels deep for dicts.
+parse_and_resolve_config() {
+    # One python3 subprocess merges global+project YAML recursively,
+    # resolves {{providers.<section>.<field>}} placeholders in every
+    # agent's system_prompt, and emits four lines on stdout:
+    #   1. SESSION_NAME
+    #   2. NATS_URL
+    #   3. AGENTS_JSON (with substituted prompts)
+    #   4. CONFIG_JSON (full merged config, used downstream)
+    #
+    # An unresolved or malformed placeholder exits non-zero with a
+    # single "Error: ..." line naming the agent and the token — a
+    # silently-unresolved placeholder would be a launcher-side prompt
+    # corruption and never reaches the running agent.
     python3 -c "
-import json, sys, os
+import json, os, re, sys
 try:
     import yaml
 except ImportError:
-    sys.exit(0)
+    sys.stderr.write('Error: PyYAML is required to parse config files\n')
+    sys.exit(1)
 
 project_config_path = os.environ['_PROJECT_CONFIG']
 global_config_path = os.environ['_GLOBAL_CONFIG']
@@ -129,54 +140,90 @@ if os.path.isfile(global_config_path):
 with open(project_config_path) as f:
     project_cfg = yaml.safe_load(f) or {}
 
-# Deep merge: project overrides global, two levels
-merged = dict(global_cfg)
-for key, val in project_cfg.items():
-    if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
-        merged[key] = {**merged[key], **val}
-    else:
-        merged[key] = val
+def deep_merge(base, override):
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
 
-print(json.dumps(merged))
+config = deep_merge(global_cfg, project_cfg)
+
+session_name = config.get('tmux', {}).get('session_name', config.get('project', '$DEFAULT_SESSION_NAME'))
+nats_url = config.get('nats', {}).get('url', '$DEFAULT_NATS_URL')
+agents = config.get('agents', {})
+providers = config.get('providers', {})
+
+for section_name in sorted(providers):
+    section = providers[section_name]
+    if isinstance(section, dict):
+        backend = section.get('backend', '?')
+        url = section.get('url', '?')
+        sys.stderr.write(f'providers.{section_name} = {backend} @ {url}\n')
+
+PLACEHOLDER_RE = re.compile(r'\{\{providers\.([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\}\}')
+LITERAL_MARKER = '{{providers.'
+
+def resolve_placeholders(agent_name, prompt):
+    def _sub(match):
+        section, field = match.group(1), match.group(2)
+        section_cfg = providers.get(section)
+        if not isinstance(section_cfg, dict) or field not in section_cfg:
+            raise ValueError(
+                f\"agent '{agent_name}' has unresolved placeholder \"
+                f'{{{{providers.{section}.{field}}}}}'
+            )
+        return str(section_cfg[field])
+    resolved = PLACEHOLDER_RE.sub(_sub, prompt)
+    if LITERAL_MARKER in resolved:
+        # A {{providers.*}} prefix made it through re.sub untouched — either
+        # the key shape is wrong or the closing }} is missing. Refuse to ship
+        # a raw placeholder into a live system prompt.
+        raise ValueError(
+            f\"agent '{agent_name}' has an unparseable providers placeholder; \"
+            f\"expected form is \"
+            f'{{{{providers.<section>.<field>}}}}'
+        )
+    return resolved
+
+try:
+    for agent_name, agent_cfg in agents.items():
+        if not isinstance(agent_cfg, dict):
+            continue
+        prompt = agent_cfg.get('system_prompt')
+        if isinstance(prompt, str) and LITERAL_MARKER in prompt:
+            agent_cfg['system_prompt'] = resolve_placeholders(agent_name, prompt)
+except ValueError as e:
+    sys.stderr.write(f'Error: {e}\n')
+    sys.exit(1)
+
+print(session_name)
+print(nats_url)
+print(json.dumps(agents))
+print(json.dumps(config))
 "
 }
 
-CONFIG_JSON=$(
+CONFIG_VALUES=$(
     _PROJECT_CONFIG="$PROJECT_CONFIG" \
     _GLOBAL_CONFIG="$GLOBAL_CONFIG" \
-    parse_configs
-)
+    parse_and_resolve_config
+) || {
+    echo "Error: Failed to parse or resolve config files" >&2
+    exit 1
+}
 
-if [ -z "$CONFIG_JSON" ]; then
+if [ -z "$CONFIG_VALUES" ]; then
     echo "Error: Failed to parse config files" >&2
     exit 1
 fi
 
-# -----------------------------------------------------------------------
-# Extract config values via a single consolidated Python call
-# -----------------------------------------------------------------------
-read_config_values() {
-    # Extract session_name, nats_url, and agents JSON from merged config.
-    # Outputs three lines: SESSION_NAME, NATS_URL, AGENTS_JSON.
-    python3 -c "
-import json, sys
-
-config = json.loads(sys.stdin.read())
-
-session_name = config.get('tmux', {}).get('session_name', config.get('project', '$DEFAULT_SESSION_NAME'))
-nats_url = config.get('nats', {}).get('url', '$DEFAULT_NATS_URL')
-agents = json.dumps(config.get('agents', {}))
-
-print(session_name)
-print(nats_url)
-print(agents)
-" <<< "$CONFIG_JSON"
-}
-
-CONFIG_VALUES=$(read_config_values)
 SESSION_NAME=$(echo "$CONFIG_VALUES" | sed -n '1p')
 NATS_URL=$(echo "$CONFIG_VALUES" | sed -n '2p')
 AGENTS_JSON=$(echo "$CONFIG_VALUES" | sed -n '3p')
+CONFIG_JSON=$(echo "$CONFIG_VALUES" | sed -n '4p')
 
 # -----------------------------------------------------------------------
 # MCP config generation (for claude_code agents only)
