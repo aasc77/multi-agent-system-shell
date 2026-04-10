@@ -11,18 +11,26 @@ control and agents side-by-side on your screen:
 
 ```
  Window 1 — control                     Window 2 — agents
-┌──────────────────┬───────────────┐    ┌──────────────┬──────────────┐
-│   orchestrator   │  nats-monitor │    │  dev (hub)   │  qa (macmini)│
-│  (state machine  │ (live msgs)   │    │ (claude_code)│ (claude_code)│
-│   + console)     │               │    ├──────────────┼──────────────┤
-├──────────────────┘               │    │  dgx1        │  hassio      │
-│   manager (monitor)              │    │ (claude_code)│ (claude_code)│
-│  (autonomous oversight)          │    └──────────────┴──────────────┘
-└──────────────────────────────────┘
+┌──────────┬──────────────────┐         ┌──────────────┬──────────────┐
+│          │  orchestrator    │         │     dev      │   macmini    │
+│          │ (state machine   │         │ (claude_code)│ (claude_code)│
+│          │  + console)      │         ├──────────────┼──────────────┤
+│ manager  ├──────────────────┤         │     dgx1     │     dgx2     │
+│ (monitor)│  nats-monitor    │         │ (claude_code)│ (claude_code)│
+│          │  (live msgs)     │         ├──────────────┼──────────────┤
+│          │                  │         │   RTX5090    │    hassio    │
+│          │                  │         │   (script)   │ (claude_code)│
+└──────────┴──────────────────┘         └──────────────┴──────────────┘
             │                    │
             └────── NATS ────────┘
               JetStream pub/sub
 ```
+
+The control window puts the manager agent on the left at full height (so
+it has room for long conversations), with the orchestrator and NATS
+monitor stacked on the right. The agents window is a tiled grid sized to
+however many agents are in the project config — the example above shows
+the 6-agent `remote-test` layout.
 
 Both windows share the same tmux session via grouped sessions, so each can
 independently view a different tmux window.
@@ -46,6 +54,8 @@ independently view a different tmux window.
 - **Built-in actions**: `assign_to_agent`, `merge_and_assign`, `merge_to_default`, `flag_human`
 - **MCP bridge**: tools for Claude Code agents (`send_message`, `check_messages`, `send_to_agent`)
 - **Manager agent**: autonomous monitor that watches task progress, agent health, and logs
+- **Orchestrator singleton**: flock-based lock at `/tmp/mas-orch-<project>.lock` prevents duplicate orchestrators per project
+- **Delivery protocol**: OSPF-style neighbor table with TCP-style ACK + retransmit (exponential backoff 0→15s→1m→5m→1hr) and Pushover escalation on dead-letter
 - **Idle watchdog**: detects idle agents with pending tasks and alerts the manager
 - **Inactivity announcer**: alerts when no agent has any NATS activity for a configurable threshold
 - **Knowledge store**: ChromaDB + Ollama embeddings for semantic search across agent messages and operational docs
@@ -62,12 +72,13 @@ independently view a different tmux window.
 ```
 multi-agent-system-shell/
 ├── orchestrator/          # Core orchestrator modules
-│   ├── __main__.py        # Entry point (python3 -m orchestrator <project>)
+│   ├── __main__.py        # Entry point + flock singleton lock
 │   ├── config.py          # YAML config loader (global + project merge)
 │   ├── state_machine.py   # Config-driven state engine
 │   ├── task_queue.py      # Task queue manager
 │   ├── nats_client.py     # NATS JetStream wrapper
 │   ├── router.py          # Message router + inbox relay
+│   ├── delivery.py        # OSPF-style neighbor table + ACK delivery protocol
 │   ├── tmux_comm.py       # tmux communication (nudge, clear, send)
 │   ├── lifecycle.py       # Task lifecycle manager
 │   ├── watchdog.py        # Idle agent detection + inactivity announcer
@@ -84,24 +95,28 @@ multi-agent-system-shell/
 │   ├── server.py           # MCP server (search_knowledge, index_knowledge)
 │   └── indexer.py          # NATS message indexer daemon
 ├── services/
-│   ├── speaker-service.py  # NATS→hassio speaker routing with voice map
-│   └── voice-call-service.py # Twilio TTS voice call via NATS
+│   ├── speaker-service.py     # NATS→hassio speaker routing with voice map
+│   ├── voice-call-service.py  # Twilio TTS voice call via NATS
+│   ├── thermostat-service.py  # NATS listener for natural-language HA climate control
+│   └── dog-tracker/           # YOLO + ByteTrack + ONVIF PTZ camera tracker
 ├── mcp-bridge/
 │   ├── index.js           # MCP server (send_message, check_messages)
 │   └── package.json
 ├── scripts/
-│   ├── start.sh           # Launch two iTerm windows with all agents
-│   ├── stop.sh            # Graceful shutdown
-│   ├── setup-nats.sh      # Install and start NATS server
-│   ├── reset-tasks.sh     # Reset task statuses to pending
-│   ├── nats-monitor.sh    # Live NATS message monitor
-│   ├── share-file.sh      # Distribute files to all agent workspaces
-│   ├── tmux-paste-image.sh # Paste clipboard image into any agent pane
-│   ├── ssh-reconnect.sh   # Auto-reconnect wrapper for remote SSH agents
-│   ├── notify.sh          # macOS text-to-speech notification helper
-│   ├── push-notify.py     # Pushover push notification script
-│   ├── sms-notify.py      # Twilio SMS notification script
-│   └── conversation-mode.py # Standalone conversation mode listener
+│   ├── start.sh                 # Launch two terminal windows with all agents
+│   ├── stop.sh                  # Graceful shutdown (kills full session group)
+│   ├── bounce-orchestrator.sh   # Cleanly restart just the orchestrator
+│   ├── start-agent-logging.sh   # Start tmux pipe-pane logging for agent panes
+│   ├── setup-nats.sh            # Install and start NATS server
+│   ├── reset-tasks.sh           # Reset task statuses to pending
+│   ├── nats-monitor.sh          # Live NATS message monitor
+│   ├── share-file.sh            # Distribute files to all agent workspaces
+│   ├── tmux-paste-image.sh      # Paste clipboard image into any agent pane
+│   ├── ssh-reconnect.sh         # Auto-reconnect wrapper for remote SSH agents
+│   ├── notify.sh                # macOS text-to-speech notification helper
+│   ├── push-notify.py           # Pushover push notification script
+│   ├── sms-notify.py            # Twilio SMS notification script
+│   └── conversation-mode.py     # Standalone conversation mode listener
 ├── projects/
 │   └── demo/              # Example project (writer + executor)
 │       ├── config.yaml    # Project config with agents + state machine
