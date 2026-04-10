@@ -17,3 +17,11 @@ tmux:
   nudge_prompt: "You have new messages. Use check_messages with your role."
   nudge_cooldown_seconds: 30
   max_nudge_retries: 20
+
+providers:
+  stt:
+    backend: whisper
+    url: http://192.168.1.51:5112
+  tts:
+    backend: piper
+    url: http://192.168.1.51:5111

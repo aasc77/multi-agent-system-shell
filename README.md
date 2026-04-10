@@ -153,7 +153,31 @@ tmux:
 
 tasks:
   max_attempts_per_task: 5             # retries before task marked stuck
+
+providers:
+  stt:
+    backend: whisper
+    url: http://192.168.1.51:5112
+  tts:
+    backend: piper
+    url: http://192.168.1.51:5111
 ```
+
+### Provider configuration (`providers:`)
+
+The `providers:` subtree gives the realtime STT and TTS backends a single config home. Each slot has two fields — `backend` (engine name) and `url` (endpoint).
+
+Agent `system_prompt` strings can reference any provider field using the `{{providers.<section>.<field>}}` placeholder syntax:
+
+```yaml
+system_prompt: "You run the TTS pipeline ({{providers.tts.backend}} at {{providers.tts.url}}), STT ({{providers.stt.backend}} at {{providers.stt.url}})."
+```
+
+At launch, `scripts/start.sh` runs a substitution pass over each agent's prompt before the MCP config is generated. The placeholders are resolved from the merged global+project `providers:` subtree and the result is passed to `claude --append-system-prompt`. Operators can verify the resolved values in the launcher log — `start.sh` emits one `providers.<section> = <backend> @ <url>` line per slot to stderr at startup.
+
+Switching backends is a one-line edit. When Voxtral replaces Whisper, flip `providers.stt.backend: voxtral` and `providers.stt.url: http://192.168.1.41:5100` in `config.yaml` and bounce the orchestrator — no other file changes. Unknown placeholders fail the launch loudly (naming both the offending agent and the token), so typos are caught immediately instead of silently shipping broken prompts.
+
+Project configs may override individual leaf keys (e.g. `providers.stt.url`) and the global sibling keys (e.g. `providers.stt.backend`) are preserved via recursive deep-merge.
 
 ### Project Config (`projects/<name>/config.yaml`)
 
