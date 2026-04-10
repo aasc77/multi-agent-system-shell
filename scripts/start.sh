@@ -411,16 +411,39 @@ ensure_clean_session
 # Control window: orchestrator + nats-monitor (side-by-side)
 # -----------------------------------------------------------------------
 setup_control_window() {
-    # Configure the control window with panes:
-    #   Pane 0: orchestrator process
-    #   Pane 1: nats-monitor (horizontal split for side-by-side layout)
-    #   Pane 2: manager agent (bottom, if configured -- autonomous monitor)
+    # Configure the control window based on whether a manager agent is
+    # configured.
+    #
+    # Layout WITH manager (3 panes):
+    #   Pane 0: manager agent   (left, full height)
+    #   Pane 1: orchestrator    (top-right)
+    #   Pane 2: nats-monitor    (bottom-right)
+    #
+    # Layout WITHOUT manager (2 panes, legacy fallback):
+    #   Pane 0: orchestrator    (left)
+    #   Pane 1: nats-monitor    (right)
+    #
+    # Pane-index math: tmux assigns indices in spatial reading order
+    # (top-to-bottom, left-to-right). Starting from a single pane and
+    # doing `split -h -t .0` then `split -v -t .1` yields exactly the
+    # three-pane layout above, with pane 1 staying top-right because
+    # the vertical split of pane 1 places the new pane BELOW it.
     local nats_subjects="${NATS_URL##*://}"
     nats_subjects="${nats_subjects%%/*}"
 
-    tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" @label "orchestrator"
-    tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" \
-        "cd ${ROOT_DIR} && python3 -m orchestrator ${PROJECT}" Enter
+    # Detect manager upfront so we can branch on the layout.
+    local has_manager
+    has_manager=$(python3 -c "
+import json, sys
+agents = json.loads(sys.stdin.read())
+mgr = agents.get('manager', {})
+if mgr.get('role') == 'monitor' and mgr.get('runtime') == 'claude_code':
+    print('yes')
+else:
+    print('no')
+" <<< "$AGENTS_JSON")
+
+    # -- Background services (pane-independent) --
 
     # Start knowledge-store indexer as a background daemon (if available)
     local indexer_script="${ROOT_DIR}/knowledge-store/indexer.py"
@@ -453,40 +476,26 @@ setup_control_window() {
         echo "Thermostat service started (PID: $!)"
     fi
 
-    tmux_cmd split-window -h -t "${SESSION_NAME}:${CONTROL_WINDOW}"
-    tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "nats-monitor"
-
     local monitor_script="${SCRIPT_DIR}/nats-monitor.sh"
+    local orch_launch="cd ${ROOT_DIR} && python3 -m orchestrator ${PROJECT}"
+    local monitor_launch
     if [ -f "$monitor_script" ]; then
-        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" \
-            "bash ${monitor_script}" Enter
+        monitor_launch="bash ${monitor_script}"
     else
-        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" \
-            "nats sub 'agents.>'" Enter
+        monitor_launch="nats sub 'agents.>'"
     fi
 
-    # Launch manager agent in the control window if configured
-    local has_manager
-    has_manager=$(python3 -c "
-import json, sys
-agents = json.loads(sys.stdin.read())
-mgr = agents.get('manager', {})
-if mgr.get('role') == 'monitor' and mgr.get('runtime') == 'claude_code':
-    print('yes')
-else:
-    print('no')
-" <<< "$AGENTS_JSON")
-
     if [ "$has_manager" = "yes" ]; then
-        tmux_cmd split-window -v -t "${SESSION_NAME}:${CONTROL_WINDOW}.0"
+        # --- 3-pane layout: [manager | (orch / nats-monitor)] ---
 
+        # Pane 0 = manager (left, full height)
         local manager_label
         manager_label=$(python3 -c "
 import json, sys
 agents = json.loads(sys.stdin.read())
 print(agents.get('manager', {}).get('label', 'manager'))
 " <<< "$AGENTS_JSON")
-        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "$manager_label"
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" @label "$manager_label"
 
         local mcp_config_path="${MCP_DIR}/manager.json"
         local manager_prompt
@@ -500,8 +509,31 @@ print(agents.get('manager', {}).get('system_prompt', ''))
         if [ -n "$manager_prompt" ]; then
             manager_cmd="${manager_cmd} --append-system-prompt '${manager_prompt}'"
         fi
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" "$manager_cmd" Enter
 
-        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" "$manager_cmd" Enter
+        # Pane 1 = orchestrator (top-right). Default 50/50 horizontal
+        # split of pane 0 gives the manager ~100 cols (half of a 200
+        # col window) — wide enough to read messages comfortably.
+        tmux_cmd split-window -h -t "${SESSION_NAME}:${CONTROL_WINDOW}.0"
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "orchestrator"
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" "$orch_launch" Enter
+
+        # Pane 2 = nats-monitor (bottom-right). Vertical split of pane 1
+        # inserts the new pane below, so pane 1 remains the top-right.
+        tmux_cmd split-window -v -t "${SESSION_NAME}:${CONTROL_WINDOW}.1"
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.2" @label "nats-monitor"
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.2" "$monitor_launch" Enter
+    else
+        # --- 2-pane fallback: [orch | nats-monitor] ---
+
+        # Pane 0 = orchestrator
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" @label "orchestrator"
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.0" "$orch_launch" Enter
+
+        # Pane 1 = nats-monitor (right)
+        tmux_cmd split-window -h -t "${SESSION_NAME}:${CONTROL_WINDOW}"
+        tmux_cmd set-option -p -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" @label "nats-monitor"
+        tmux_cmd send-keys -t "${SESSION_NAME}:${CONTROL_WINDOW}.1" "$monitor_launch" Enter
     fi
 }
 
@@ -687,13 +719,20 @@ fi
 
 # -----------------------------------------------------------------------
 # Open two terminal windows (control + agents) using grouped sessions.
-# Each platform gets its own launcher; all share the same tmux commands:
-#   Window 1: tmux new-session -t <session> \; select-window -t control
-#   Window 2: tmux new-session -t <session> \; select-window -t agents
+#
+# We use `new-session -A -s <deterministic-name> -t <group>` so the
+# secondary sessions have predictable names (${SESSION_NAME}-control,
+# ${SESSION_NAME}-agents). Without -A -s, tmux auto-appends a numeric
+# suffix on every attach (remote-test-40, remote-test-42, …) and the
+# cruft piles up because stop.sh only killed the primary session.
+#
+# -A: attach if a session with that name already exists (idempotent)
+# -s <name>: deterministic session name
+# -t <group>: join the group so windows are shared with the primary
 # -----------------------------------------------------------------------
 TMUX_BIN="$(command -v tmux)"
-TMUX_CMD_CONTROL="${TMUX_BIN} new-session -t ${SESSION_NAME} \; select-window -t ${CONTROL_WINDOW}"
-TMUX_CMD_AGENTS="${TMUX_BIN} new-session -t ${SESSION_NAME} \; select-window -t ${AGENTS_WINDOW}"
+TMUX_CMD_CONTROL="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-control -t ${SESSION_NAME} \; select-window -t ${CONTROL_WINDOW}"
+TMUX_CMD_AGENTS="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-agents -t ${SESSION_NAME} \; select-window -t ${AGENTS_WINDOW}"
 
 open_two_windows() {
     if command -v osascript &>/dev/null; then
@@ -739,3 +778,9 @@ open_two_windows() {
 }
 
 open_two_windows
+
+# Start pipe-pane logging on all agent panes (after agents have launched)
+if [ -f "${ROOT_DIR}/scripts/start-agent-logging.sh" ]; then
+    sleep 5  # give panes time to settle
+    bash "${ROOT_DIR}/scripts/start-agent-logging.sh" "$PROJECT" || true
+fi

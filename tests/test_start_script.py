@@ -514,6 +514,188 @@ class TestControlWindow:
 
 
 # ===========================================================================
+# 5a. CONTROL WINDOW 3-PANE LAYOUT (with manager agent)
+# ===========================================================================
+
+
+@pytest.fixture
+def manager_project(tmp_path):
+    """Create a project with a manager agent in monitor role (+ one worker)."""
+    project_dir = tmp_path / "projects" / "mgrtest"
+    project_dir.mkdir(parents=True)
+
+    config = {
+        "project": "mgrtest",
+        "tmux": {"session_name": "mgrtest"},
+        "agents": {
+            "manager": {
+                "role": "monitor",
+                "runtime": "claude_code",
+                "label": "manager",
+                "system_prompt": "You are the manager.",
+            },
+            "dev": {
+                "runtime": "claude_code",
+                "working_dir": str(tmp_path / "dev"),
+            },
+        },
+        "state_machine": {
+            "initial": "idle",
+            "states": {"idle": {}},
+            "transitions": [
+                {"from": "idle", "to": "idle", "trigger": "task_assigned"},
+            ],
+        },
+    }
+    with open(project_dir / "config.yaml", "w") as f:
+        yaml.dump(config, f)
+
+    global_config = {
+        "nats": {"url": "nats://localhost:4222"},
+        "tmux": {"nudge_cooldown_seconds": 30, "max_nudge_retries": 20},
+    }
+    with open(tmp_path / "config.yaml", "w") as f:
+        yaml.dump(global_config, f)
+
+    (tmp_path / "dev").mkdir(exist_ok=True)
+
+    return {"root": tmp_path, "project_dir": project_dir, "config": config}
+
+
+class TestControlWindowLayoutWithManager:
+    """With manager configured, control window = [manager | orch / nats-monitor].
+
+    Target pane indices (spatial order):
+      0 = manager (left, full height)
+      1 = orchestrator (top-right)
+      2 = nats-monitor (bottom-right)
+
+    Verified in dry-run by checking the order of split-window / set-option
+    / send-keys commands emitted.
+    """
+
+    def _dry_run(self, manager_project):
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        result = _run_start_script(
+            "mgrtest",
+            env_overrides=env,
+            cwd=str(manager_project["root"]),
+        )
+        return result.stdout + result.stderr
+
+    def test_pane_0_labelled_manager(self, manager_project):
+        """Pane 0 in control window must be labelled 'manager'."""
+        output = self._dry_run(manager_project)
+        assert "set-option -p -t mgrtest:control.0 @label manager" in output, (
+            f"Expected pane 0 to be labelled 'manager', got:\n{output}"
+        )
+
+    def test_pane_1_labelled_orchestrator(self, manager_project):
+        """Pane 1 in control window must be labelled 'orchestrator'."""
+        output = self._dry_run(manager_project)
+        assert "set-option -p -t mgrtest:control.1 @label orchestrator" in output, (
+            f"Expected pane 1 to be labelled 'orchestrator', got:\n{output}"
+        )
+
+    def test_pane_2_labelled_nats_monitor(self, manager_project):
+        """Pane 2 in control window must be labelled 'nats-monitor'."""
+        output = self._dry_run(manager_project)
+        assert "set-option -p -t mgrtest:control.2 @label nats-monitor" in output, (
+            f"Expected pane 2 to be labelled 'nats-monitor', got:\n{output}"
+        )
+
+    def test_split_order_creates_target_layout(self, manager_project):
+        """The split sequence must be: split -h on pane 0, then split -v on pane 1.
+
+        This order produces the target layout:
+          [manager | (orch / nats-mon)]
+        with manager on the left full-height, orch top-right, nats-mon bot-right.
+        """
+        output = self._dry_run(manager_project)
+        lines = [l for l in output.splitlines() if "split-window" in l]
+        assert len(lines) >= 2, (
+            f"Expected at least 2 control-window splits, got: {lines}"
+        )
+        # First split must be -h on pane 0 (manager -> orch on right)
+        split_h = [l for l in lines if "split-window -h" in l and "mgrtest:control.0" in l]
+        assert split_h, (
+            f"Expected split-window -h -t mgrtest:control.0, got lines: {lines}"
+        )
+        # Second split must be -v on pane 1 (orch -> nats-mon below)
+        split_v = [l for l in lines if "split-window -v" in l and "mgrtest:control.1" in l]
+        assert split_v, (
+            f"Expected split-window -v -t mgrtest:control.1, got lines: {lines}"
+        )
+
+    def test_orchestrator_runs_in_pane_1(self, manager_project):
+        """The orchestrator launch command must be sent to pane 1 (not pane 0)."""
+        output = self._dry_run(manager_project)
+        assert (
+            "send-keys -t mgrtest:control.1 cd" in output
+            and "python3 -m orchestrator mgrtest" in output
+        ), (
+            f"Orchestrator must be launched in pane 1, got:\n{output}"
+        )
+
+    def test_manager_runs_in_pane_0(self, manager_project):
+        """The manager claude command must be sent to pane 0."""
+        output = self._dry_run(manager_project)
+        # Manager's claude command lands in pane 0
+        assert "send-keys -t mgrtest:control.0" in output, (
+            f"Manager must be launched in pane 0, got:\n{output}"
+        )
+        assert "claude" in output and "manager.json" in output
+
+    def test_no_manager_project_keeps_two_pane_fallback(self):
+        """When manager is NOT configured, control window stays 2-pane."""
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        result = _run_start_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+
+        # Demo has no manager; pane 0 should be orchestrator, pane 1 nats-monitor.
+        assert "set-option -p -t demo:control.0 @label orchestrator" in output, (
+            f"Demo (no manager) should keep orch in pane 0, got:\n{output}"
+        )
+        assert "set-option -p -t demo:control.1 @label nats-monitor" in output, (
+            f"Demo (no manager) should keep nats-monitor in pane 1, got:\n{output}"
+        )
+        # No split-window -v on control pane 1 (that's only in 3-pane layout)
+        assert "split-window -v -t demo:control.1" not in output, (
+            f"Demo (no manager) should not vertically split pane 1, got:\n{output}"
+        )
+
+
+# ===========================================================================
+# 5b. DETERMINISTIC GROUPED-SESSION NAMES
+# ===========================================================================
+
+
+class TestGroupedSessionNames:
+    """start.sh must use deterministic names for the control/agents grouped sessions.
+
+    We changed from `tmux new-session -t <name>` (which auto-numbers
+    cruft like remote-test-40, -42, …) to
+    `tmux new-session -A -s <name>-control -t <name>` so secondary
+    sessions have predictable names: <name>-control and <name>-agents.
+    """
+
+    def test_start_script_uses_A_flag_for_grouped_sessions(self):
+        """The start.sh source must invoke new-session with -A -s for the
+        iTerm launcher commands (visible in the script source)."""
+        with open(START_SCRIPT) as f:
+            src = f.read()
+        # The two grouped-session launcher commands
+        assert "new-session -A -s ${SESSION_NAME}-control -t ${SESSION_NAME}" in src, (
+            "start.sh must create a deterministic <session>-control session"
+        )
+        assert "new-session -A -s ${SESSION_NAME}-agents -t ${SESSION_NAME}" in src, (
+            "start.sh must create a deterministic <session>-agents session"
+        )
+
+
+# ===========================================================================
 # 6. AGENTS WINDOW LAYOUT
 # ===========================================================================
 

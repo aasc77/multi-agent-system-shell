@@ -7,8 +7,11 @@ logging, and session report. Runs the async event loop.
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
+import os
+import subprocess
 import sys
 import time
 import threading
@@ -33,6 +36,42 @@ parser = argparse.ArgumentParser(description="Multi-Agent System Shell Orchestra
 parser.add_argument("project", help="Project name (matches projects/<name>/)")
 args = parser.parse_args()
 
+# --- Singleton lock (prevents duplicate orchestrators per project) ---
+# Must run BEFORE NATS connect, delivery protocol, or tmux comm init.
+# The kernel auto-releases flock on process exit (including SIGKILL) because
+# it tracks the underlying fd, so no stale-pidfile recovery is needed.
+#
+# IMPORTANT: open with O_CREAT|O_RDWR (NO O_TRUNC) so a losing contender
+# doesn't wipe the holder's pid from the file. We truncate and write our
+# pid only AFTER we successfully acquire the lock.
+LOCK_PATH = f"/tmp/mas-orch-{args.project}.lock"
+_lock_fd_raw = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+_lock_fd = os.fdopen(_lock_fd_raw, "r+")
+try:
+    fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    try:
+        _lock_fd.seek(0)
+        existing_pid = _lock_fd.read().strip() or "unknown"
+    except OSError:
+        existing_pid = "unknown"
+    print(
+        f"ERROR: another orchestrator is already running for project "
+        f"'{args.project}' (pid {existing_pid})",
+        file=sys.stderr,
+    )
+    print(f"Lock file: {LOCK_PATH}", file=sys.stderr)
+    print(f"If stale, remove with: rm {LOCK_PATH}", file=sys.stderr)
+    sys.exit(1)
+
+# We own the lock. Truncate and write our pid so bounce-orchestrator.sh
+# can read it. Keep _lock_fd alive for process lifetime — do NOT close
+# it or the kernel releases the lock.
+_lock_fd.seek(0)
+_lock_fd.truncate()
+_lock_fd.write(str(os.getpid()))
+_lock_fd.flush()
+
 # --- Paths ---
 root_dir = Path(__file__).parent.parent
 projects_dir = root_dir / "projects"
@@ -51,6 +90,52 @@ logger = setup_logging(log_file)
 logger.info("=" * 50)
 logger.info("MAS Orchestrator starting -- project: %s", args.project)
 logger.info("=" * 50)
+
+
+def _check_duplicate_orchestrator_panes(session: str) -> None:
+    """Warn if more than one pane in the control window is labelled @label=orchestrator.
+
+    This catches zombie-pane cases where a previous orchestrator process
+    exited (releasing the flock) but its tmux pane was never cleaned up.
+    Non-fatal: we log loudly but keep running, since tmux may not even be
+    present (unit tests, CI).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                f"{session}:control",
+                "-F",
+                "#{pane_id} #{@label}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return  # tmux not available or hung -- skip the check
+
+    if result.returncode != 0:
+        return  # session/window doesn't exist yet -- nothing to check
+
+    orch_panes = [
+        line
+        for line in result.stdout.splitlines()
+        if line.strip().endswith(" orchestrator")
+    ]
+    if len(orch_panes) > 1:
+        logger.warning(
+            "Detected %d panes labelled 'orchestrator' in %s:control -- "
+            "zombie panes present: %s",
+            len(orch_panes),
+            session,
+            orch_panes,
+        )
+
+
+_check_duplicate_orchestrator_panes(args.project)
 
 # --- Components ---
 def to_dict(obj):
