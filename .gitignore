@@ -25,6 +25,8 @@ workspace/shared/
 # Secrets
 .env
 workspace/.env
+scripts/gsheets-config/client_secret.json
+scripts/gsheets-config/token.json
 
 # Knowledge store data
 data/chromadb/
