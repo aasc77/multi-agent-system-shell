@@ -505,19 +505,19 @@ class HeartbeatWatcher:
 
         self._staleness_threshold: int = int(
             watchdog_cfg.get(
-                "hub_heartbeat_staleness_seconds",
+                "heartbeat_staleness_seconds",
                 _DEFAULT_HEARTBEAT_STALENESS,
             ),
         )
         self._check_interval: int = int(
             watchdog_cfg.get(
-                "hub_heartbeat_check_interval_seconds",
+                "heartbeat_check_interval_seconds",
                 _DEFAULT_HEARTBEAT_CHECK_INTERVAL,
             ),
         )
         self._grace_multiplier: float = float(
             watchdog_cfg.get(
-                "hub_heartbeat_grace_multiplier",
+                "heartbeat_grace_multiplier",
                 _DEFAULT_HEARTBEAT_GRACE_MULTIPLIER,
             ),
         )
@@ -615,7 +615,22 @@ class HeartbeatWatcher:
             )
             if now < grace_deadline:
                 return
-            staleness = now - self._boot_time
+            # Post-grace semantics: at the moment grace expires, the
+            # first alert must fire at bucket=1 (not 0, not 2+). We
+            # achieve that by pretending the "last heartbeat" happened
+            # exactly one threshold before grace expiry — that makes
+            # `staleness == threshold` at grace expiry, which lands in
+            # bucket 1 and fires immediately. Subsequent ticks roll
+            # into buckets 2, 3, ... as time advances normally.
+            #
+            # Computing staleness from `boot_time` directly would put
+            # the first alert at bucket=2 (or higher, depending on
+            # grace_multiplier), which is a confusing `staleness_bucket`
+            # value for an operator reading the first-ever directive
+            # after a fresh boot. macmini flagged this in the #32 PR
+            # review — the warm path worked correctly but the cold
+            # path was off by one or more buckets.
+            staleness = now - (grace_deadline - self._staleness_threshold)
         else:
             staleness = now - last_seen
 

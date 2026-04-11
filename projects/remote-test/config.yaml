@@ -20,9 +20,9 @@ watchdog:
   heartbeat_watcher:
     enabled: true
   heartbeat_agents: ["hub"]
-  hub_heartbeat_staleness_seconds: 180
-  hub_heartbeat_check_interval_seconds: 30
-  hub_heartbeat_grace_multiplier: 2.0
+  heartbeat_staleness_seconds: 180
+  heartbeat_check_interval_seconds: 30
+  heartbeat_grace_multiplier: 2.0
   inactivity_announcer:
     enabled: false
     threshold_seconds: 300

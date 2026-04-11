@@ -728,6 +728,38 @@ class TestHeartbeatConstants:
         assert not _HEARTBEAT_SUBJECT_PREFIX.startswith("agents.")
         assert _HEARTBEAT_WILDCARD == "system.heartbeat.>"
 
+    def test_heartbeat_subject_not_captured_by_agents_stream(self):
+        """Belt-and-braces: if a future refactor changes the NATS
+        `subjects_prefix` default (e.g. from `agents` to `""`) or adds
+        a second filter to the JetStream stream, the heartbeat subject
+        might silently start landing in the AGENTS stream — defeats
+        the whole #32 storage-cost exemption and puts 1440 heartbeats/
+        day back into the retention budget.
+
+        This test wires the actual NatsClient stream filter against
+        the heartbeat subject and asserts the filter does NOT match.
+        """
+        from orchestrator.nats_client import NatsClient
+        client = NatsClient(
+            config={"url": "nats://localhost:4222"},
+            agents={"hub": {}},
+        )
+        stream_filter = client.wildcard_subject()  # "agents.>"
+        # NATS `>` matches one or more tokens after the literal prefix,
+        # so any subject starting with the filter's pre-`>` prefix is
+        # captured. Reduce to a prefix check and assert the heartbeat
+        # subject does NOT start with it.
+        assert stream_filter.endswith(">"), (
+            f"wildcard_subject() shape changed: {stream_filter!r}"
+        )
+        prefix = stream_filter[:-1]  # drop the trailing `>` leaving `agents.`
+        heartbeat_subject = f"{_HEARTBEAT_SUBJECT_PREFIX}.hub"
+        assert not heartbeat_subject.startswith(prefix), (
+            f"heartbeat subject {heartbeat_subject!r} would be captured by "
+            f"the AGENTS stream filter {stream_filter!r} — #32 storage "
+            f"exemption is broken"
+        )
+
 
 class TestHeartbeatWatcher:
     @pytest.fixture
@@ -735,9 +767,9 @@ class TestHeartbeatWatcher:
         return {
             "watchdog": {
                 "heartbeat_agents": ["hub"],
-                "hub_heartbeat_staleness_seconds": 30,
-                "hub_heartbeat_check_interval_seconds": 5,
-                "hub_heartbeat_grace_multiplier": 2.0,
+                "heartbeat_staleness_seconds": 30,
+                "heartbeat_check_interval_seconds": 5,
+                "heartbeat_grace_multiplier": 2.0,
             }
         }
 
@@ -883,14 +915,56 @@ class TestHeartbeatWatcher:
         """After grace_multiplier * threshold has elapsed with no heartbeat
         ever seen, the watcher fires a hub_unreachable with
         last_heartbeat_seen = None.
+
+        The first post-grace alert MUST be staleness_bucket=1 (not 2+).
+        macmini's #32 PR review caught that computing staleness from
+        boot_time directly put the first alert at bucket=2 or higher,
+        which is confusing for an operator reading a fresh directive
+        after a cold boot. The fix shifts staleness so that at the
+        moment grace expires, staleness == threshold → bucket 1.
         """
-        # Simulate boot time past the grace window: grace = 2.0 * 30s = 60s
-        watcher._boot_time = time.time() - 120  # 2 minutes since boot
+        # Simulate boot time at the exact moment grace expires:
+        # grace_deadline = boot_time + (2.0 * 30) = boot_time + 60
+        # At now = boot_time + 60, grace has just expired and the
+        # first alert must fire at bucket 1.
+        watcher._boot_time = time.time() - 60
         await watcher._check_staleness()
         hb_nats.publish_to_inbox.assert_called_once()
         directive = hb_nats.publish_to_inbox.call_args[0][1]
         assert directive["last_heartbeat_seen"] is None
         assert "never since orchestrator boot" in directive["message"]
+        assert directive["staleness_bucket"] == 1, (
+            f"cold-start first alert must be bucket 1, got "
+            f"{directive['staleness_bucket']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cold_start_next_bucket_after_additional_threshold(
+        self, watcher, hb_nats,
+    ):
+        """Subsequent cold-start alerts progress through bucket 2, 3, …
+        one per threshold interval elapsed past grace expiry. Pins the
+        post-grace bucketing math against the fix from macmini's
+        review.
+        """
+        # Fire the first cold-start alert at the moment grace expires
+        watcher._boot_time = time.time() - 60  # grace expiring now
+        await watcher._check_staleness()
+        assert hb_nats.publish_to_inbox.call_count == 1
+        assert (
+            hb_nats.publish_to_inbox.call_args_list[0][0][1]["staleness_bucket"]
+            == 1
+        )
+
+        # Roll the clock forward by exactly one threshold (30s) past
+        # grace expiry. Rewind boot_time by another 30s so the
+        # effective `now - grace_deadline = 30s`, which makes
+        # staleness = threshold + 30s = 60s → bucket 2.
+        watcher._boot_time = time.time() - 90
+        await watcher._check_staleness()
+        assert hb_nats.publish_to_inbox.call_count == 2
+        second = hb_nats.publish_to_inbox.call_args_list[1][0][1]
+        assert second["staleness_bucket"] == 2
 
     @pytest.mark.asyncio
     async def test_config_overrides_defaults(self, hb_nats):
@@ -898,9 +972,9 @@ class TestHeartbeatWatcher:
         cfg = {
             "watchdog": {
                 "heartbeat_agents": ["hub", "dgx"],
-                "hub_heartbeat_staleness_seconds": 600,
-                "hub_heartbeat_check_interval_seconds": 120,
-                "hub_heartbeat_grace_multiplier": 3.5,
+                "heartbeat_staleness_seconds": 600,
+                "heartbeat_check_interval_seconds": 120,
+                "heartbeat_grace_multiplier": 3.5,
             }
         }
         w = HeartbeatWatcher(nats_client=hb_nats, config=cfg)
@@ -945,9 +1019,9 @@ class TestHeartbeatWatcher:
         cfg = {
             "watchdog": {
                 "heartbeat_agents": ["hub", "dgx"],
-                "hub_heartbeat_staleness_seconds": 30,
-                "hub_heartbeat_check_interval_seconds": 5,
-                "hub_heartbeat_grace_multiplier": 2.0,
+                "heartbeat_staleness_seconds": 30,
+                "heartbeat_check_interval_seconds": 5,
+                "heartbeat_grace_multiplier": 2.0,
             }
         }
         w = HeartbeatWatcher(nats_client=hb_nats, config=cfg)

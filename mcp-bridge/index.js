@@ -37,7 +37,16 @@ const OUTBOX_MESSAGE_TYPE = 'agent_complete';
 // free of 1440 heartbeats/day. Missed heartbeats are the signal:
 // the orchestrator watchdog watches for staleness and emits a
 // `hub_unreachable` manager_directive when a heartbeat falls
-// behind `watchdog.hub_heartbeat_staleness_seconds`.
+// behind `watchdog.heartbeat_staleness_seconds`.
+//
+// setInterval drift note: Node's `setInterval` can drift to
+// ~1.1-1.2× its nominal value under event-loop pressure (long
+// tool calls, GC pauses, etc.). The watchdog side assumes the
+// threshold is at least 3× HEARTBEAT_INTERVAL_MS so single-tick
+// drift doesn't trigger false positives. If the threshold is ever
+// tuned below ~3× the interval, expect false `hub_unreachable`
+// alerts under load. Default threshold is 180s (3×), which is the
+// minimum safe value.
 const HEARTBEAT_SUBJECT_PREFIX = 'system.heartbeat';
 const HEARTBEAT_INTERVAL_MS = 60_000; // 60s — matches watchdog cadence expectation
 const HEARTBEAT_TYPE = 'health_ok';
