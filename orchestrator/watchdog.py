@@ -162,6 +162,13 @@ def _extract_full_line_and_context(
 # probe independent of pane content.
 _DEFAULT_AUTH_SCAN_EXCLUDES: frozenset[str] = frozenset({"hub", "manager"})
 
+# Pane-state staleness cooldown (issue #42). Once an agent is flagged
+# UNKNOWN or CAPTURE_FAILED, suppress repeat directives for this many
+# seconds so a sustained outage does not spam manager's inbox every
+# cycle. 5 min default — long enough to avoid flooding, short enough
+# to re-alert if the operator hasn't acted by then.
+_DEFAULT_UNKNOWN_ALERT_COOLDOWN = 300
+
 _MSG_TYPE_IDLE_ALERT = "idle_alert"
 _MSG_TYPE_MANAGER_RESPONSE = "manager_idle_response"
 _MSG_TYPE_MANAGER_DIRECTIVE = "manager_directive"
@@ -211,6 +218,10 @@ class IdleWatchdog:
         self._auth_alert_cooldown: int = watchdog_cfg.get(
             "auth_alert_cooldown", _DEFAULT_AUTH_ALERT_COOLDOWN,
         )
+        self._unknown_alert_cooldown: int = watchdog_cfg.get(
+            "unknown_state_alert_cooldown_seconds",
+            _DEFAULT_UNKNOWN_ALERT_COOLDOWN,
+        )
         configured_excludes = watchdog_cfg.get("auth_scan_excludes")
         if configured_excludes is None:
             self._auth_scan_excludes: frozenset[str] = _DEFAULT_AUTH_SCAN_EXCLUDES
@@ -229,6 +240,14 @@ class IdleWatchdog:
         # line stays quiet until the cooldown expires.
         self._last_auth_alert: dict[str, float] = {}
         self._last_auth_match: dict[str, str] = {}
+
+        # Pane-state UNKNOWN / CAPTURE_FAILED tracking (issue #42).
+        # Keyed by agent; stores the last alert time so a sustained
+        # outage does not re-emit a directive every cycle. Separate
+        # dicts per subtype so the two alerting paths don't interfere
+        # with each other's cooldowns.
+        self._last_unknown_alert: dict[str, float] = {}
+        self._last_capture_failed_alert: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -252,6 +271,10 @@ class IdleWatchdog:
                 await self._check_auth_failures()
             except Exception:
                 logger.exception("Auth-failure check failed")
+            try:
+                await self._check_unknown_agents()
+            except Exception:
+                logger.exception("Unknown-state check failed")
 
     async def handle_manager_response(self, message: dict[str, Any]) -> None:
         """Process a response from the manager about an idle alert.
@@ -483,6 +506,146 @@ class IdleWatchdog:
 
         self._last_auth_alert[agent] = now
         self._last_auth_match[agent] = matched_line
+
+    async def _check_unknown_agents(self) -> None:
+        """Scan every known agent via :meth:`TmuxComm.get_pane_state`
+        and publish a ``manager_directive`` when an agent enters the
+        ``UNKNOWN`` or ``CAPTURE_FAILED`` state.
+
+        Issue #42: positive-signal pane-diff staleness detection.
+        Runs once per watchdog cycle alongside the existing idle and
+        auth-failure checks. Cooldowns suppress repeat alerts for a
+        sustained outage so manager's inbox does not flood every
+        cycle while the operator is working the issue.
+
+        Unlike the auth-failure scan, this path does NOT exclude hub
+        or manager. The pane-diff mechanism does not rely on pattern
+        matching against pane prose, so the self-reference trap that
+        motivated the #28 hub exclusion does not apply here. Hub
+        liveness is detected for the first time.
+        """
+        get_mapping = getattr(self._tmux_comm, "get_pane_mapping", None)
+        if not callable(get_mapping):
+            return
+        try:
+            agents = list(get_mapping().keys())
+        except Exception:
+            return
+        for agent in agents:
+            try:
+                await self._check_single_agent_pane_state(agent)
+            except Exception:
+                logger.exception(
+                    "Unknown-state scan failed for %s", agent,
+                )
+
+    async def _check_single_agent_pane_state(self, agent: str) -> None:
+        """Derive *agent*'s current pane state via
+        :meth:`TmuxComm.get_pane_state` and dispatch to the matching
+        alert path (UNKNOWN or CAPTURE_FAILED). WORKING and IDLE
+        states are no-ops here — WORKING is the healthy path and
+        IDLE is handled by the existing idle-agent check.
+        """
+        get_state = getattr(self._tmux_comm, "get_pane_state", None)
+        if not callable(get_state):
+            return
+        state = get_state(agent)
+
+        # Late-bind the AgentPaneState enum so tests that mock
+        # `tmux_comm` with MagicMock can return string values or
+        # other sentinel objects without importing the enum. Real
+        # code paths always receive `AgentPaneState` instances.
+        state_value = getattr(state, "value", state)
+
+        if state_value == "unknown":
+            await self._alert_unknown_state(agent)
+        elif state_value == "capture_failed":
+            await self._alert_capture_failed(agent)
+        # WORKING / IDLE / anything else: no action here.
+
+    async def _alert_unknown_state(self, agent: str) -> None:
+        """Publish a ``manager_directive`` with subtype
+        ``agent_pane_unknown`` for an agent whose pane has been
+        unchanged for ``_STALE_DEBOUNCE_CYCLES`` consecutive cycles
+        AND shows no idle prompt. Classic "agent looks hung" case
+        that the pre-#42 ``is_agent_idle`` negative-signal check
+        silently missed.
+        """
+        now = time.time()
+        last = self._last_unknown_alert.get(agent, 0.0)
+        if last > 0 and (now - last) < self._unknown_alert_cooldown:
+            return
+
+        logger.warning(
+            "flag_human: agent pane UNKNOWN (stale, no prompt) on %s",
+            agent,
+        )
+
+        directive = {
+            "type": _MSG_TYPE_MANAGER_DIRECTIVE,
+            "subtype": "agent_pane_unknown",
+            "agent": agent,
+            "message": (
+                f"Watchdog flag: agent '{agent}' pane has been unchanged "
+                f"for multiple consecutive cycles with no idle prompt "
+                f"visible. The agent may be crashed, stuck on a "
+                f"confirmation dialog, showing an error screen, or "
+                f"otherwise hung in a non-responsive state. Check the "
+                f"pane manually and nudge or restart as appropriate."
+            ),
+            "priority": "high",
+        }
+        try:
+            await self._nats_client.publish_to_inbox("manager", directive)
+        except Exception:
+            logger.exception(
+                "Failed to publish agent_pane_unknown directive",
+            )
+            return
+
+        self._last_unknown_alert[agent] = now
+
+    async def _alert_capture_failed(self, agent: str) -> None:
+        """Publish a ``manager_directive`` with subtype
+        ``agent_pane_capture_failed`` when tmux-capture returned
+        ``None`` for ``_STALE_DEBOUNCE_CYCLES`` consecutive cycles.
+        Separate subtype from UNKNOWN because operators troubleshoot
+        this differently (tmux/session health rather than agent
+        health — check that the pane still exists in the session,
+        that the agent name maps to a real index, etc.).
+        """
+        now = time.time()
+        last = self._last_capture_failed_alert.get(agent, 0.0)
+        if last > 0 and (now - last) < self._unknown_alert_cooldown:
+            return
+
+        logger.warning(
+            "flag_human: pane capture failed repeatedly for %s",
+            agent,
+        )
+
+        directive = {
+            "type": _MSG_TYPE_MANAGER_DIRECTIVE,
+            "subtype": "agent_pane_capture_failed",
+            "agent": agent,
+            "message": (
+                f"Watchdog flag: pane capture for agent '{agent}' has "
+                f"failed for multiple consecutive cycles. Check tmux "
+                f"session and pane mapping — the pane may have been "
+                f"killed, the session may have crashed, or the agent "
+                f"name may no longer map to a live pane index."
+            ),
+            "priority": "high",
+        }
+        try:
+            await self._nats_client.publish_to_inbox("manager", directive)
+        except Exception:
+            logger.exception(
+                "Failed to publish agent_pane_capture_failed directive",
+            )
+            return
+
+        self._last_capture_failed_alert[agent] = now
 
     async def _alert_manager(self, agent: str) -> None:
         """Capture pane and send idle alert to manager via NATS."""

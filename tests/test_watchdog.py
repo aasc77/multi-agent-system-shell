@@ -936,3 +936,226 @@ class TestCheckAuthFailuresContextBefore:
         directive = mock_nats.publish_to_inbox.call_args[0][1]
         assert "context_before" in directive
         assert directive["context_before"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Pane-State Detection Tests (issue #42)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckUnknownAgents:
+    """Integration-style tests for IdleWatchdog._check_unknown_agents
+    that drive the new #42 pane-state path end-to-end. Uses string
+    sentinels ("working", "idle", "unknown", "capture_failed") from
+    mock tmux_comm so the tests do not have to import the real
+    AgentPaneState enum — the watchdog late-binds via `.value`.
+    """
+
+    @pytest.fixture
+    def state_tmux(self, mock_tmux):
+        mock_tmux.get_pane_mapping = MagicMock(
+            return_value={"hub": 0, "macmini": 1, "RTX5090": 4},
+        )
+        mock_tmux.get_pane_state = MagicMock(return_value="working")
+        return mock_tmux
+
+    @pytest.fixture
+    def state_watchdog(
+        self, mock_lifecycle, mock_state_machine, mock_nats,
+        state_tmux, mock_task_queue, config,
+    ):
+        return IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=state_tmux,
+            config=config,
+            task_queue=mock_task_queue,
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_working_no_alerts(self, state_watchdog, state_tmux, mock_nats):
+        """Every agent WORKING → no directive published."""
+        state_tmux.get_pane_state.return_value = "working"
+        await state_watchdog._check_unknown_agents()
+        mock_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_all_idle_no_unknown_alerts(
+        self, state_watchdog, state_tmux, mock_nats,
+    ):
+        """Every agent IDLE → no agent_pane_unknown directive
+        (IDLE is handled by the existing _check_idle_agents path,
+        not by _check_unknown_agents).
+        """
+        state_tmux.get_pane_state.return_value = "idle"
+        await state_watchdog._check_unknown_agents()
+        mock_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_state_publishes_directive(
+        self, state_watchdog, state_tmux, mock_nats,
+    ):
+        """One agent in UNKNOWN state → one manager_directive with
+        subtype agent_pane_unknown.
+        """
+        def _state(agent):
+            return "unknown" if agent == "RTX5090" else "working"
+        state_tmux.get_pane_state.side_effect = _state
+
+        await state_watchdog._check_unknown_agents()
+
+        mock_nats.publish_to_inbox.assert_called_once()
+        call = mock_nats.publish_to_inbox.call_args[0]
+        assert call[0] == "manager"
+        directive = call[1]
+        assert directive["type"] == "manager_directive"
+        assert directive["subtype"] == "agent_pane_unknown"
+        assert directive["agent"] == "RTX5090"
+        assert directive["priority"] == "high"
+        assert "message" in directive
+
+    @pytest.mark.asyncio
+    async def test_capture_failed_publishes_different_subtype(
+        self, state_watchdog, state_tmux, mock_nats,
+    ):
+        """CAPTURE_FAILED must produce `agent_pane_capture_failed`
+        subtype, not `agent_pane_unknown`. Operators troubleshoot
+        these differently (tmux session vs agent health).
+        """
+        def _state(agent):
+            return "capture_failed" if agent == "macmini" else "working"
+        state_tmux.get_pane_state.side_effect = _state
+
+        await state_watchdog._check_unknown_agents()
+
+        mock_nats.publish_to_inbox.assert_called_once()
+        directive = mock_nats.publish_to_inbox.call_args[0][1]
+        assert directive["subtype"] == "agent_pane_capture_failed"
+        assert directive["agent"] == "macmini"
+
+    @pytest.mark.asyncio
+    async def test_cooldown_suppresses_repeat_unknown(
+        self, state_watchdog, state_tmux, mock_nats,
+    ):
+        """Two consecutive scans with the same UNKNOWN agent →
+        only ONE directive (cooldown suppression).
+        """
+        state_tmux.get_pane_state.return_value = "unknown"
+        await state_watchdog._check_unknown_agents()
+        await state_watchdog._check_unknown_agents()
+        # 3 agents × 1 alert each, not 3 × 2 = 6
+        assert mock_nats.publish_to_inbox.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_unknown_cooldown_isolated_from_capture_failed(
+        self, state_watchdog, state_tmux, mock_nats,
+    ):
+        """A UNKNOWN alert on agent A must not suppress a subsequent
+        CAPTURE_FAILED alert on agent A — different subtypes, different
+        suppression tracks.
+        """
+        # First pass: unknown on hub
+        state_tmux.get_pane_state.side_effect = (
+            lambda a: "unknown" if a == "hub" else "working"
+        )
+        await state_watchdog._check_unknown_agents()
+
+        # Second pass: capture_failed on hub (different suppression track)
+        state_tmux.get_pane_state.side_effect = (
+            lambda a: "capture_failed" if a == "hub" else "working"
+        )
+        await state_watchdog._check_unknown_agents()
+
+        assert mock_nats.publish_to_inbox.call_count == 2
+        first = mock_nats.publish_to_inbox.call_args_list[0][0][1]
+        second = mock_nats.publish_to_inbox.call_args_list[1][0][1]
+        assert first["subtype"] == "agent_pane_unknown"
+        assert second["subtype"] == "agent_pane_capture_failed"
+
+    @pytest.mark.asyncio
+    async def test_cooldown_expires_allows_realert(
+        self, state_watchdog, state_tmux, mock_nats,
+    ):
+        """After unknown_alert_cooldown seconds, a still-UNKNOWN
+        agent re-alerts.
+        """
+        state_tmux.get_pane_state.return_value = "unknown"
+        await state_watchdog._check_unknown_agents()
+        assert mock_nats.publish_to_inbox.call_count == 3
+
+        # Rewind the per-agent cooldown so the next call re-alerts
+        for agent in ("hub", "macmini", "RTX5090"):
+            state_watchdog._last_unknown_alert[agent] = (
+                time.time() - state_watchdog._unknown_alert_cooldown - 1
+            )
+
+        await state_watchdog._check_unknown_agents()
+        assert mock_nats.publish_to_inbox.call_count == 6
+
+    @pytest.mark.asyncio
+    async def test_hub_is_scanned_unlike_auth_failure_path(
+        self, state_watchdog, state_tmux, mock_nats,
+    ):
+        """#42 pane-diff detection does NOT exclude hub (unlike #28
+        auth-failure scan which had to exclude hub due to the
+        self-reference trap). Pane-diff is immune to the trap —
+        hub gets the same UNKNOWN detection as every other agent.
+        This backfills the #28 hub blind spot.
+        """
+        state_tmux.get_pane_state.side_effect = (
+            lambda a: "unknown" if a == "hub" else "working"
+        )
+        await state_watchdog._check_unknown_agents()
+        mock_nats.publish_to_inbox.assert_called_once()
+        directive = mock_nats.publish_to_inbox.call_args[0][1]
+        assert directive["agent"] == "hub"
+
+    @pytest.mark.asyncio
+    async def test_missing_get_pane_state_is_noop(
+        self, mock_lifecycle, mock_state_machine, mock_nats, config,
+    ):
+        """Watchdog tolerates a tmux_comm without get_pane_state —
+        e.g. legacy tests, partial mocks. Must not raise.
+        """
+        class _BareTmux:
+            def get_pane_mapping(self):
+                return {"hub": 0}
+            # No get_pane_state attribute at all
+
+        wd = IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=_BareTmux(),
+            config=config,
+            task_queue=None,
+        )
+        await wd._check_unknown_agents()  # must not raise
+        mock_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_directive_body_shape_is_wire_ready(
+        self, state_watchdog, state_tmux, mock_nats,
+    ):
+        """Pin the body shape owned by the watchdog. Envelope
+        fields (message_id, timestamp, from) are added downstream
+        by NatsClient._envelope_wrap per #34, not here.
+        """
+        state_tmux.get_pane_state.side_effect = (
+            lambda a: "unknown" if a == "RTX5090" else "working"
+        )
+        await state_watchdog._check_unknown_agents()
+        directive = mock_nats.publish_to_inbox.call_args[0][1]
+
+        # Body fields owned by watchdog
+        assert directive["type"] == "manager_directive"
+        assert directive["subtype"] == "agent_pane_unknown"
+        assert directive["agent"] == "RTX5090"
+        assert directive["priority"] == "high"
+        assert "message" in directive
+
+        # Envelope fields must NOT be set here — library's job
+        assert "message_id" not in directive
+        assert "timestamp" not in directive
+        assert "from" not in directive

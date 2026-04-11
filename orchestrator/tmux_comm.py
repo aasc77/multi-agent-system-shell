@@ -23,12 +23,73 @@ Requirements traced to PRD:
 
 from __future__ import annotations
 
+import enum
+import hashlib
 import logging
 import subprocess
 import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Agent pane state (issue #42)
+# ---------------------------------------------------------------------------
+#
+# Replaces the pre-#42 negative-signal `is_agent_idle()` check (which
+# inferred "working" from the absence of the `❯` prompt character) with
+# a three-state positive-signal model derived from pane-content hashing.
+#
+# How the states are computed (see `TmuxComm.get_pane_state()`):
+#   - WORKING: pane content hash changed since last cycle. Active work
+#     continuously ticks time counters, token streams, and the `Running…`
+#     animation — so a changing hash is direct positive proof of life.
+#   - IDLE: pane unchanged since last cycle AND the `❯` idle prompt is
+#     visible. The agent has parked at a prompt and is waiting for a
+#     nudge. Preserves the existing idle-watchdog behavior.
+#   - UNKNOWN: pane unchanged since last cycle AND no `❯` visible,
+#     observed for at least `_STALE_DEBOUNCE_CYCLES` consecutive cycles.
+#     New detection capability: catches crashed processes, bash prompts,
+#     confirmation dialogs, and other failure modes that the pre-#42
+#     check silently treated as "probably working". Debouncing avoids
+#     one-shot false positives from a capture-timing race.
+#
+# Rejected alternatives (see #42 architectural discussion):
+#   - `esc to interrupt` substring match: the string does not exist in
+#     claude-code v2.1.x UI chrome. Empirically verified across 5 agent
+#     panes — zero hits in live UI, all prose false positives. Also
+#     vulnerable to the same self-reference trap as #28's `-32603`.
+#   - Ranked-signal regex on gerund/Running patterns: needs line-start
+#     anchor + hub exclusion + version parity check, all of which
+#     pane-diff avoids by construction.
+#
+# See also:
+#   - `_AGENT_STATE_CAPTURE_LINES` — hash-window line count
+#   - `_STALE_DEBOUNCE_CYCLES` — min consecutive stale cycles to flag
+#   - `is_agent_idle` — thin backwards-compat wrapper on `get_pane_state`
+
+
+_AGENT_STATE_CAPTURE_LINES = 30
+_STALE_DEBOUNCE_CYCLES = 2
+
+
+class AgentPaneState(enum.Enum):
+    """Positive-signal three-state model for agent pane liveness.
+
+    See module-level comment for the full rationale. Values are
+    string-valued so they serialize cleanly into directive payloads
+    published by the watchdog.
+    """
+
+    WORKING = "working"
+    IDLE = "idle"
+    UNKNOWN = "unknown"
+    #: Pane capture subprocess failed for `_STALE_DEBOUNCE_CYCLES`
+    #: consecutive cycles. Operators troubleshoot this differently
+    #: from UNKNOWN (tmux/session health vs agent health), so it
+    #: gets its own enum value and directive subtype.
+    CAPTURE_FAILED = "capture_failed"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -147,6 +208,14 @@ class TmuxComm:
         self._consecutive_skips: dict[str, int] = {}
         self._escalated: dict[str, bool] = {}
 
+        # Pane state derivation state (issue #42 pane-diff staleness
+        # detection). Keyed by agent name. The watchdog reads these
+        # indirectly via `get_pane_state()`; they are write-once-per-
+        # cycle from the tmux capture path.
+        self._last_pane_hash: dict[str, str] = {}
+        self._consecutive_stale_cycles: dict[str, int] = {}
+        self._consecutive_capture_failures: dict[str, int] = {}
+
         # Escalation callback
         self._flag_human_callback: Optional[FlagHumanCallback] = None
 
@@ -234,17 +303,14 @@ class TmuxComm:
             return None
         return result.stdout
 
-    def is_agent_idle(self, agent: str) -> bool:
-        """Return ``True`` if the agent's pane appears idle (at prompt).
+    def _has_idle_prompt(self, pane_text: str) -> bool:
+        """Return ``True`` if *pane_text* contains Claude Code's
+        ``❯`` idle-prompt marker.
 
-        Claude Code agents show a ``❯`` prompt when idle.  The status bar
-        (e.g. ``⏵⏵ bypass permissions on``, status line, Dapple bubble)
-        often sits below the prompt, so we check enough lines to cover
-        the tallest possible status footer.
+        Pure helper. Shared between :meth:`get_pane_state` (which
+        reads the prompt status as part of the 3-state derivation)
+        and :meth:`is_agent_idle` (backwards-compat wrapper).
         """
-        pane_text = self.capture_pane(agent, lines=10)
-        if pane_text is None:
-            return False
         lines = [l for l in pane_text.strip().splitlines() if l.strip()]
         if not lines:
             return False
@@ -259,6 +325,102 @@ class TmuxComm:
             or l.strip().startswith("❯")
             for l in lines
         )
+
+    def get_pane_state(self, agent: str) -> AgentPaneState:
+        """Return the current 3-state liveness signal for *agent*.
+
+        Captures the agent's pane, hashes the content, and compares
+        against the previous cycle's hash to decide between WORKING
+        (hash changed = active work ticking counters), IDLE (unchanged
+        + ``❯`` visible), UNKNOWN (unchanged + no ``❯`` for at least
+        :data:`_STALE_DEBOUNCE_CYCLES` consecutive cycles), or
+        CAPTURE_FAILED (pane capture returned ``None`` for at least
+        :data:`_STALE_DEBOUNCE_CYCLES` consecutive cycles).
+
+        Issue #42 positive-signal liveness. See module-level comment
+        for the architectural rationale and rejected alternatives.
+
+        Side effect: updates :attr:`_last_pane_hash`,
+        :attr:`_consecutive_stale_cycles`, and
+        :attr:`_consecutive_capture_failures` in place. The watchdog
+        is expected to call this exactly once per check cycle per
+        agent; repeat calls within a cycle would double-count the
+        debounce counter.
+        """
+        pane_text = self.capture_pane(
+            agent, lines=_AGENT_STATE_CAPTURE_LINES,
+        )
+        if pane_text is None:
+            # Transient capture failure — debounce before flagging.
+            # A single failed capture is a test-bench / tmux artifact,
+            # not an agent-state signal. Only a sustained inability
+            # to read the pane warrants a directive.
+            failures = self._consecutive_capture_failures.get(agent, 0) + 1
+            self._consecutive_capture_failures[agent] = failures
+            if failures >= _STALE_DEBOUNCE_CYCLES:
+                return AgentPaneState.CAPTURE_FAILED
+            # Benefit of doubt on the first failure — return the
+            # least-alarming state so existing idle alerts don't
+            # misfire on a transient hiccup. WORKING is a safe
+            # default because it suppresses any follow-on alerting
+            # paths until the next cycle confirms.
+            return AgentPaneState.WORKING
+
+        # Capture succeeded — reset the failure counter.
+        if agent in self._consecutive_capture_failures:
+            del self._consecutive_capture_failures[agent]
+
+        current_hash = hashlib.sha256(
+            pane_text.encode("utf-8", errors="replace"),
+        ).hexdigest()
+        has_prompt = self._has_idle_prompt(pane_text)
+        last_hash = self._last_pane_hash.get(agent)
+        self._last_pane_hash[agent] = current_hash
+
+        if last_hash is None:
+            # First-ever capture for this agent. No prior hash to
+            # compare against → we have no information to flag on.
+            # Return WORKING as the least-alarming default; the next
+            # cycle will have real signal. Do NOT increment the
+            # stale counter on the first capture — debouncing starts
+            # on the second cycle onward.
+            return AgentPaneState.WORKING
+
+        if current_hash != last_hash:
+            # Hash changed → active work. Reset staleness counter.
+            if agent in self._consecutive_stale_cycles:
+                del self._consecutive_stale_cycles[agent]
+            return AgentPaneState.WORKING
+
+        # Unchanged hash.
+        if has_prompt:
+            # Idle at the prompt — reset staleness counter because
+            # the agent is in a known-good state, just waiting for
+            # a nudge.
+            if agent in self._consecutive_stale_cycles:
+                del self._consecutive_stale_cycles[agent]
+            return AgentPaneState.IDLE
+
+        # Unchanged + no prompt → starting to look stale. Debounce
+        # by requiring N consecutive stale cycles before flagging.
+        stale_count = self._consecutive_stale_cycles.get(agent, 0) + 1
+        self._consecutive_stale_cycles[agent] = stale_count
+        if stale_count >= _STALE_DEBOUNCE_CYCLES:
+            return AgentPaneState.UNKNOWN
+        return AgentPaneState.WORKING
+
+    def is_agent_idle(self, agent: str) -> bool:
+        """Return ``True`` if the agent's pane appears idle (at prompt).
+
+        Backwards-compat wrapper on :meth:`get_pane_state` for callers
+        that only need the boolean idle/not-idle distinction (existing
+        idle-watchdog path). Equivalent to
+        ``get_pane_state(agent) == AgentPaneState.IDLE``.
+
+        Callers that need to distinguish WORKING, UNKNOWN, and
+        CAPTURE_FAILED should use :meth:`get_pane_state` directly.
+        """
+        return self.get_pane_state(agent) == AgentPaneState.IDLE
 
     def nudge(self, agent: str, force: bool = False) -> bool:
         """Nudge an agent pane with the configured nudge prompt.
