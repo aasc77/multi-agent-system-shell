@@ -412,15 +412,54 @@ class TmuxComm:
     def is_agent_idle(self, agent: str) -> bool:
         """Return ``True`` if the agent's pane appears idle (at prompt).
 
-        Backwards-compat wrapper on :meth:`get_pane_state` for callers
-        that only need the boolean idle/not-idle distinction (existing
-        idle-watchdog path). Equivalent to
-        ``get_pane_state(agent) == AgentPaneState.IDLE``.
+        Pure function — does NOT mutate the pane-state debounce
+        machinery owned by :meth:`get_pane_state`. Callers from
+        multiple paths and threads (watchdog idle check, delivery
+        probe thread pool, legacy code) can invoke this at any
+        cadence without polluting the 2-cycle debounce counters
+        on UNKNOWN / CAPTURE_FAILED that :meth:`get_pane_state`
+        relies on.
+
+        Why this separation matters: an earlier #42 refactor made
+        ``is_agent_idle`` a thin wrapper around
+        ``get_pane_state``. That looked like a harmless
+        simplification but leaked the side effects on
+        ``_consecutive_stale_cycles`` and
+        ``_consecutive_capture_failures`` into three independent
+        call sites at three different cadences:
+
+        1. watchdog ``_check_idle_agents`` → ``_check_single_agent``
+           → ``is_agent_idle`` (once per watchdog cycle, 15s)
+        2. watchdog ``_check_unknown_agents`` →
+           ``_check_single_agent_pane_state`` → ``get_pane_state``
+           directly (once per watchdog cycle, 15s — same cycle)
+        3. delivery ``_probe_neighbors`` →
+           ``asyncio.to_thread(is_agent_idle, name)`` (once per
+           delivery probe interval, 10s — separate thread)
+
+        Every call advanced the debounce counters. CAPTURE_FAILED
+        fired on the FIRST capture failure instead of the second,
+        because the combined advance rate was 2-3× the designed
+        rate. A single transient tmux hiccup would produce a
+        spurious directive. There was also a thread-safety hazard
+        from ``asyncio.to_thread`` mutating the same dicts the
+        watchdog asyncio loop was reading.
+
+        The fix (macmini's #43 review finding): revert
+        ``is_agent_idle`` to a pure 4-line function that reads a
+        10-line capture and checks for the ``❯`` prompt via
+        :meth:`_has_idle_prompt`, with NO state mutations.
+        :meth:`get_pane_state` remains the single owner of the
+        pane-state debounce machinery, invoked exactly once per
+        watchdog cycle per agent from ``_check_unknown_agents``.
 
         Callers that need to distinguish WORKING, UNKNOWN, and
         CAPTURE_FAILED should use :meth:`get_pane_state` directly.
         """
-        return self.get_pane_state(agent) == AgentPaneState.IDLE
+        pane_text = self.capture_pane(agent, lines=10)
+        if pane_text is None:
+            return False
+        return self._has_idle_prompt(pane_text)
 
     def nudge(self, agent: str, force: bool = False) -> bool:
         """Nudge an agent pane with the configured nudge prompt.

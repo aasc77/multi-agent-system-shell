@@ -522,7 +522,21 @@ class IdleWatchdog:
         or manager. The pane-diff mechanism does not rely on pattern
         matching against pane prose, so the self-reference trap that
         motivated the #28 hub exclusion does not apply here. Hub
-        liveness is detected for the first time.
+        pane-liveness is detected for the first time — a crashed or
+        frozen hub process will produce a ``UNKNOWN`` alert.
+
+        **Scope of the hub coverage upgrade**: this restores
+        pane-liveness detection for hub but does NOT restore hub's
+        coverage for the #28 auth-failure-in-pane-prose case. Hub
+        remains excluded from :meth:`_check_auth_failures` because
+        the pane-grep regex self-triggers on hub's own
+        code-discussion text. Pane-diff catches hung/crashed hub
+        processes — NOT silent MCP auth-token rot where hub's
+        pane keeps ticking (e.g., hub keeps typing while MCP calls
+        silently return errors that don't render to the pane).
+        Operators who see hub behaving oddly should still check
+        for the auth-rot case manually; the watchdog catches
+        frozen-pane hub, not broken-bridge-but-typing hub.
         """
         get_mapping = getattr(self._tmux_comm, "get_pane_mapping", None)
         if not callable(get_mapping):

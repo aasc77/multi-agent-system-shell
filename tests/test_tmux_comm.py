@@ -1149,40 +1149,116 @@ class TestGetPaneStateEmptyCapture:
 
 
 class TestIsAgentIdleBackcompat:
-    """Thin wrapper on get_pane_state — returns True iff IDLE."""
+    """Pure prompt-detection function — NO side effects on the
+    pane-state debounce machinery owned by :meth:`get_pane_state`.
+
+    Revert from the earlier #42 draft that made this a thin
+    wrapper around ``get_pane_state``. Caught in #43 review by
+    macmini: the wrapper leaked state advances into three
+    independent call sites and broke the 2-cycle debounce.
+    """
 
     def test_returns_true_for_idle_pane(self, comm):
-        idle_pane = "banner\n❯ \n"
-        _patch_capture(comm, [idle_pane, idle_pane])
-        comm.get_pane_state("qa")  # establish baseline
+        """A pane ending in ``❯`` returns True — the original
+        contract, preserved.
+        """
+        comm.capture_pane = MagicMock(return_value="banner\n❯ \n")
         assert comm.is_agent_idle("qa") is True
 
-    def test_returns_false_for_working_pane(self, comm):
-        """A pane whose content changes between captures → WORKING →
-        is_agent_idle returns False.
-        """
-        _patch_capture(comm, [
-            "❯ \n",
-            "⎿ Running…\n❯ \n",  # changed = WORKING
-        ])
-        comm.get_pane_state("qa")
+    def test_returns_false_for_busy_pane(self, comm):
+        """A pane without ``❯`` returns False."""
+        comm.capture_pane = MagicMock(return_value="⎿  Running…\n")
         assert comm.is_agent_idle("qa") is False
 
-    def test_returns_false_for_unknown_pane(self, comm):
-        """A stale pane with no prompt → UNKNOWN → is_agent_idle
-        returns False. The existing watchdog path should see
-        "not idle" and NOT fire its idle alert; the new
-        _check_unknown_agents path handles UNKNOWN separately.
+    def test_returns_false_on_capture_failure(self, comm):
+        """Transient capture failure (None) returns False — matches
+        pre-#42 behavior. get_pane_state owns the capture-failure
+        debounce; is_agent_idle just conservatively says "not idle".
         """
-        _patch_capture(comm, ["stuck\n", "stuck\n", "stuck\n"])
-        comm.get_pane_state("qa")
-        comm.get_pane_state("qa")
+        comm.capture_pane = MagicMock(return_value=None)
         assert comm.is_agent_idle("qa") is False
 
-    def test_returns_false_for_capture_failed(self, comm):
-        _patch_capture(comm, [None, None])
-        comm.get_pane_state("qa")
-        assert comm.is_agent_idle("qa") is False
+    def test_requests_10_line_capture_not_30(self, comm):
+        """is_agent_idle continues to request 10 lines (the pre-#42
+        default), NOT the 30-line hash window get_pane_state uses.
+        Preserves the existing fast-path for the delivery probe.
+        """
+        comm.capture_pane = MagicMock(return_value="❯ \n")
+        comm.is_agent_idle("qa")
+        call_kwargs = comm.capture_pane.call_args.kwargs
+        assert call_kwargs.get("lines") == 10
+
+    def test_does_not_advance_capture_failed_debounce(self, comm):
+        """**Regression test for the #43 review finding.**
+
+        ``is_agent_idle`` must NOT mutate
+        ``_consecutive_capture_failures``. Only ``get_pane_state``
+        (called once per watchdog cycle from
+        ``_check_unknown_agents``) is allowed to advance the
+        CAPTURE_FAILED debounce counter.
+
+        Without this guard, ``is_agent_idle`` could be called from
+        multiple code paths and threads (watchdog idle check,
+        delivery probe thread pool) and each call would advance
+        the counter, firing CAPTURE_FAILED on the first capture
+        failure instead of the second. Spurious directive on every
+        transient tmux hiccup.
+        """
+        comm.capture_pane = MagicMock(return_value=None)
+
+        # Call is_agent_idle many times with failing captures
+        for _ in range(10):
+            comm.is_agent_idle("qa")
+
+        # The state machine dicts MUST be untouched
+        assert comm._consecutive_capture_failures.get("qa", 0) == 0, (
+            "is_agent_idle leaked into the CAPTURE_FAILED debounce "
+            "counter — the #43 review finding has regressed"
+        )
+        assert comm._consecutive_stale_cycles.get("qa", 0) == 0
+        assert "qa" not in comm._last_pane_hash
+
+    def test_does_not_advance_unknown_debounce(self, comm):
+        """Same contract for UNKNOWN / ``_consecutive_stale_cycles``.
+
+        ``is_agent_idle`` called many times with a static non-idle
+        pane must not advance the stale-cycle counter, even though
+        that's structurally a "stale" capture from the perspective
+        of ``get_pane_state``.
+        """
+        comm.capture_pane = MagicMock(return_value="busy bash\n")
+        for _ in range(10):
+            comm.is_agent_idle("qa")
+        assert comm._consecutive_stale_cycles.get("qa", 0) == 0
+        assert "qa" not in comm._last_pane_hash
+
+    def test_interleaved_calls_preserve_get_pane_state_debounce(self, comm):
+        """End-to-end gate: interleave ``is_agent_idle`` and
+        ``get_pane_state`` calls the way production does (watchdog
+        idle check → delivery probe → watchdog unknown check) and
+        verify ``get_pane_state`` still honors the exact 2-cycle
+        CAPTURE_FAILED debounce.
+        """
+        comm.capture_pane = MagicMock(return_value=None)
+
+        # Simulate one watchdog cycle: is_agent_idle (idle check) +
+        # delivery probe (is_agent_idle via thread pool) + unknown check
+        # (get_pane_state). Only the get_pane_state call should
+        # advance the counter.
+        comm.is_agent_idle("qa")   # idle check
+        comm.is_agent_idle("qa")   # delivery probe
+        state1 = comm.get_pane_state("qa")  # unknown check, counter = 1
+        assert state1 == AgentPaneState.WORKING, (
+            "first capture failure in first cycle should be debounced"
+        )
+
+        # Second watchdog cycle, same pattern
+        comm.is_agent_idle("qa")
+        comm.is_agent_idle("qa")
+        state2 = comm.get_pane_state("qa")  # counter = 2
+        assert state2 == AgentPaneState.CAPTURE_FAILED, (
+            "second capture failure in second cycle should flag"
+        )
 
 
 class TestStateTransitionTable:

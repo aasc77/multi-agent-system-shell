@@ -1159,3 +1159,169 @@ class TestCheckUnknownAgents:
         assert "message_id" not in directive
         assert "timestamp" not in directive
         assert "from" not in directive
+
+
+class TestStateCouplingRegression:
+    """**Regression tests for the #43 review finding.**
+
+    macmini caught a bug where the watchdog's idle-check path and
+    unknown-check path both advanced :class:`TmuxComm`'s pane-state
+    debounce counters because :meth:`is_agent_idle` was wrapped
+    around :meth:`get_pane_state`. CAPTURE_FAILED fired on the
+    first capture failure instead of the second; UNKNOWN
+    effective debounce was ~1 cycle instead of 2.
+
+    These tests use a **real TmuxComm** (not a mock) with a mocked
+    ``capture_pane`` method, to exercise the actual state-machine
+    interactions between ``is_agent_idle`` (called from
+    ``_check_idle_agents``) and ``get_pane_state`` (called from
+    ``_check_unknown_agents``). Unit-test mocks of ``is_agent_idle``
+    cannot see this coupling because they short-circuit the real
+    method.
+    """
+
+    @pytest.fixture
+    def real_tmux_config(self):
+        return {
+            "tmux": {
+                "session_name": "regression-test",
+                "nudge_prompt": "nudge",
+                "nudge_cooldown_seconds": 30,
+                "max_nudge_retries": 5,
+            },
+            "agents": {
+                "hub": {"runtime": "claude_code", "working_dir": "."},
+                "qa": {"runtime": "claude_code", "working_dir": "."},
+            },
+        }
+
+    @pytest.fixture
+    def real_tmux(self, real_tmux_config):
+        from orchestrator.tmux_comm import TmuxComm
+        return TmuxComm(real_tmux_config)
+
+    @pytest.fixture
+    def real_watchdog(
+        self, mock_lifecycle, mock_state_machine, mock_nats,
+        real_tmux, real_tmux_config,
+    ):
+        return IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=real_tmux,
+            config={
+                "watchdog": {"check_interval": 15, "idle_cooldown": 60},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_idle_check_does_not_leak_into_unknown_debounce(
+        self, real_watchdog, real_tmux, mock_nats,
+    ):
+        """Full watchdog cycle with capture failing: idle check fires
+        first (via is_agent_idle), then unknown check fires second
+        (via get_pane_state). After ONE full cycle,
+        ``_consecutive_capture_failures`` must be exactly 1 (not 2),
+        and no CAPTURE_FAILED directive must have been published.
+
+        Pre-fix behavior: ``is_agent_idle`` advanced the counter
+        to 1, then ``get_pane_state`` advanced it to 2 and fired
+        CAPTURE_FAILED on the first cycle.
+        """
+        real_tmux.capture_pane = MagicMock(return_value=None)
+
+        # Simulate one watchdog cycle: _check_idle_agents runs first
+        # (calls is_agent_idle for each active agent), then
+        # _check_unknown_agents runs (calls get_pane_state for each
+        # agent from get_pane_mapping).
+        await real_watchdog._check_idle_agents()
+        await real_watchdog._check_unknown_agents()
+
+        # After ONE cycle of capture-failure: counter should be 1
+        # per agent (advanced only by get_pane_state), not 2.
+        # CAPTURE_FAILED has _STALE_DEBOUNCE_CYCLES = 2, so NO alert.
+        for agent in ("hub", "qa"):
+            assert real_tmux._consecutive_capture_failures.get(agent, 0) == 1, (
+                f"{agent}: expected counter=1 after one cycle (get_pane_state "
+                f"advance only), got "
+                f"{real_tmux._consecutive_capture_failures.get(agent, 0)} "
+                f"— is_agent_idle is leaking into the debounce counter again"
+            )
+
+        # Verify no CAPTURE_FAILED directive was published
+        for call in mock_nats.publish_to_inbox.call_args_list:
+            directive = call[0][1]
+            assert directive.get("subtype") != "agent_pane_capture_failed", (
+                "CAPTURE_FAILED fired on the first capture-failure cycle "
+                "— the debounce contract has regressed"
+            )
+
+    @pytest.mark.asyncio
+    async def test_two_cycles_of_capture_failure_fires_exactly_once(
+        self, real_watchdog, real_tmux, mock_nats,
+    ):
+        """After TWO full watchdog cycles of capture failure, exactly
+        one CAPTURE_FAILED directive per agent must fire.
+
+        This is the contract the debounce was designed around and
+        the test that pre-fix would have failed (it would have fired
+        after cycle 1 and again after cycle 2, producing two alerts
+        per agent).
+        """
+        real_tmux.capture_pane = MagicMock(return_value=None)
+
+        # Cycle 1: counter → 1, no alert
+        await real_watchdog._check_idle_agents()
+        await real_watchdog._check_unknown_agents()
+        assert mock_nats.publish_to_inbox.call_count == 0
+
+        # Cycle 2: counter → 2, CAPTURE_FAILED fires once per agent
+        await real_watchdog._check_idle_agents()
+        await real_watchdog._check_unknown_agents()
+
+        subtypes = [
+            call[0][1].get("subtype")
+            for call in mock_nats.publish_to_inbox.call_args_list
+        ]
+        capture_failed_count = sum(
+            1 for s in subtypes if s == "agent_pane_capture_failed"
+        )
+        assert capture_failed_count == 2, (
+            f"expected exactly 2 CAPTURE_FAILED directives (one per "
+            f"scanned agent) after 2 cycles, got {capture_failed_count}. "
+            f"All directives: {subtypes}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_delivery_probe_calls_do_not_advance_debounce(
+        self, real_watchdog, real_tmux, mock_nats,
+    ):
+        """Simulate the delivery protocol probing agents via
+        ``is_agent_idle`` mid-cycle (as ``delivery._probe_neighbors``
+        does via ``asyncio.to_thread``). Those probes must NOT
+        advance the pane-state debounce counters — only the
+        watchdog's explicit ``get_pane_state`` call from
+        ``_check_unknown_agents`` owns the counter.
+        """
+        real_tmux.capture_pane = MagicMock(return_value=None)
+
+        # Delivery probes fire between watchdog cycles — simulate
+        # a dozen is_agent_idle calls from the probe thread pool.
+        for _ in range(12):
+            real_tmux.is_agent_idle("hub")
+            real_tmux.is_agent_idle("qa")
+
+        # Counters must still be at 0 — no get_pane_state calls yet
+        for agent in ("hub", "qa"):
+            assert real_tmux._consecutive_capture_failures.get(agent, 0) == 0
+            assert real_tmux._consecutive_stale_cycles.get(agent, 0) == 0
+
+        # Now run one watchdog cycle — counter advances to exactly 1
+        await real_watchdog._check_unknown_agents()
+        for agent in ("hub", "qa"):
+            assert real_tmux._consecutive_capture_failures.get(agent, 0) == 1
+
+        # No directive fired (debounce intact)
+        for call in mock_nats.publish_to_inbox.call_args_list:
+            assert call[0][1].get("subtype") != "agent_pane_capture_failed"
