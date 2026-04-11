@@ -243,6 +243,256 @@ class TestPublishing:
             assert "myprefix.writer.inbox" in str(call_args)
 
 
+class TestEnvelopeWrapping:
+    """publish_to_inbox must envelope-wrap messages so mas-bridge dedup
+    (core-NATS push-sub + durable JetStream pull merge) collapses duplicate
+    deliveries to a single message per publish. See issue #34 for root-cause
+    of the pre-refactor 2x bug observed during the #28 smoke test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_envelope_adds_message_id_timestamp_from(self, nats_config, agents):
+        """Raw bodies get a full envelope before publish."""
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            await client.publish_to_inbox("writer", {"type": "task_assignment"})
+
+            call_args = mock_js.publish.call_args
+            payload = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("payload", b"")
+            parsed = json.loads(payload)
+            assert "message_id" in parsed
+            assert parsed["message_id"]  # non-empty
+            assert parsed["message_id"].startswith("task_assignment-")
+            assert "timestamp" in parsed
+            assert parsed["from"] == "orchestrator"
+
+    @pytest.mark.asyncio
+    async def test_envelope_preserves_caller_set_message_id(self, nats_config, agents):
+        """If the caller sets message_id, the library must NOT clobber it."""
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            await client.publish_to_inbox(
+                "writer",
+                {
+                    "type": "task_assignment",
+                    "message_id": "caller-controlled-id-42",
+                },
+            )
+
+            call_args = mock_js.publish.call_args
+            payload = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("payload", b"")
+            parsed = json.loads(payload)
+            assert parsed["message_id"] == "caller-controlled-id-42"
+
+    @pytest.mark.asyncio
+    async def test_envelope_preserves_caller_set_from(self, nats_config, agents):
+        """If the caller sets `from`, the library must NOT clobber it."""
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            await client.publish_to_inbox(
+                "writer",
+                {"type": "agent_message", "from": "hub"},
+            )
+
+            call_args = mock_js.publish.call_args
+            payload = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("payload", b"")
+            parsed = json.loads(payload)
+            assert parsed["from"] == "hub"
+
+    @pytest.mark.asyncio
+    async def test_envelope_preserves_caller_set_timestamp(self, nats_config, agents):
+        """If the caller sets timestamp, the library must NOT overwrite it."""
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            caller_ts = "2020-01-01T00:00:00+00:00"
+            await client.publish_to_inbox(
+                "writer",
+                {"type": "task_assignment", "timestamp": caller_ts},
+            )
+
+            call_args = mock_js.publish.call_args
+            payload = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("payload", b"")
+            parsed = json.loads(payload)
+            assert parsed["timestamp"] == caller_ts
+
+    @pytest.mark.asyncio
+    async def test_envelope_does_not_mutate_caller_dict(self, nats_config, agents):
+        """The caller's dict must NOT be modified after publish. This matters
+        for fanout callers (publish_all_done) that reuse the same dict across
+        every recipient — if the dict were mutated in place, the SECOND
+        recipient's envelope would see fields from the FIRST recipient.
+        """
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            body = {"type": "all_done", "summary": "done"}
+            await client.publish_to_inbox("writer", body)
+            await client.publish_to_inbox("executor", body)
+
+            # The original body dict must be untouched — no envelope keys.
+            assert "message_id" not in body
+            assert "timestamp" not in body
+            assert "from" not in body
+            assert set(body.keys()) == {"type", "summary"}
+
+    @pytest.mark.asyncio
+    async def test_envelope_generates_fresh_ids_across_publishes(
+        self, nats_config, agents,
+    ):
+        """Successive publishes of the same body must produce distinct
+        message_ids. Equal ids across publishes would cause mas-bridge to
+        suppress one of two legitimately distinct messages on the receiver.
+        """
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            body = {"type": "idle_alert", "agent": "macmini"}
+            await client.publish_to_inbox("manager", body)
+            await client.publish_to_inbox("manager", body)
+
+            ids = []
+            for call in mock_js.publish.call_args_list:
+                payload = call[0][1] if len(call[0]) > 1 else call[1].get("payload", b"")
+                parsed = json.loads(payload)
+                ids.append(parsed["message_id"])
+            assert len(ids) == 2
+            assert ids[0] != ids[1]
+
+    @pytest.mark.asyncio
+    async def test_envelope_message_id_has_type_prefix(
+        self, nats_config, agents,
+    ):
+        """Generated message_ids use the payload's `type` field as a
+        namespace prefix. Gives each publisher distinct ids in traces and
+        widens the dedup hash space.
+        """
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            test_cases = [
+                ({"type": "manager_directive"}, "manager_directive-"),
+                ({"type": "task_assignment"}, "task_assignment-"),
+                ({"type": "idle_alert"}, "idle_alert-"),
+                ({}, "orchestrator-"),  # fallback when type is missing
+            ]
+            for body, expected_prefix in test_cases:
+                mock_js.publish.reset_mock()
+                await client.publish_to_inbox("manager", body)
+                payload = mock_js.publish.call_args[0][1]
+                parsed = json.loads(payload)
+                assert parsed["message_id"].startswith(expected_prefix), (
+                    f"type={body.get('type')!r} produced message_id "
+                    f"{parsed['message_id']!r} (expected prefix {expected_prefix!r})"
+                )
+
+    @pytest.mark.asyncio
+    async def test_publish_all_done_gives_distinct_message_ids_per_recipient(
+        self, nats_config,
+    ):
+        """publish_all_done reuses the same body dict across recipients
+        (loops `for role in self._agents`). Without the no-mutation
+        guarantee on _envelope_wrap, recipient 2+ would inherit
+        recipient 1's message_id and the bridge dedup would collapse
+        them on delivery. This test directly wires the real fanout
+        caller path and asserts each recipient gets a distinct id.
+        """
+        multi_agent_config = {
+            "hub": {"runtime": "claude_code"},
+            "macmini": {"runtime": "claude_code"},
+            "dgx": {"runtime": "claude_code"},
+            "dgx2": {"runtime": "claude_code"},
+        }
+        client = NatsClient(config=nats_config, agents=multi_agent_config)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            await client.publish_all_done("shutdown summary")
+
+            assert mock_js.publish.call_count == len(multi_agent_config)
+            ids = []
+            subjects = []
+            for call in mock_js.publish.call_args_list:
+                subjects.append(call[0][0])
+                payload = call[0][1]
+                parsed = json.loads(payload)
+                ids.append(parsed["message_id"])
+            # Every recipient got a distinct message_id — no fanout collapse.
+            assert len(set(ids)) == len(ids), (
+                f"fanout produced duplicate message_ids: {ids}"
+            )
+            # Every recipient got their own subject.
+            expected_subjects = {
+                f"agents.{role}.inbox" for role in multi_agent_config
+            }
+            assert set(subjects) == expected_subjects
+
+    @pytest.mark.asyncio
+    async def test_envelope_timestamp_is_iso8601_tzaware(
+        self, nats_config, agents,
+    ):
+        """Auto-generated timestamp parses as valid timezone-aware ISO8601."""
+        from datetime import datetime
+
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            await client.publish_to_inbox("writer", {"type": "task_assignment"})
+            payload = mock_js.publish.call_args[0][1]
+            parsed = json.loads(payload)
+            parsed_dt = datetime.fromisoformat(parsed["timestamp"])
+            assert parsed_dt.tzinfo is not None, (
+                "envelope timestamp must be timezone-aware ISO8601"
+            )
+
+
 # ===========================================================================
 # 3. SUBSCRIBING -- Subscribe to agent outbox with callback
 # ===========================================================================

@@ -19,7 +19,6 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -376,24 +375,20 @@ class IdleWatchdog:
             agent, matched_line,
         )
 
-        # Envelope metadata — the mas-bridge deduplicates by message_id
-        # when draining the push-subscription buffer AND the durable
-        # JetStream pull at the same check_messages call. Without a
-        # message_id, both paths deliver the same directive to the
-        # target agent's claude conversation, producing a 2x burst.
-        # The general fix belongs in orchestrator/nats_client.py
-        # (every outbound inbox publish should carry an envelope), but
-        # that is tracked as a follow-up; here we only set what the
-        # watchdog owns so the #28 smoke test passes cleanly.
-        directive_id = (
-            f"watchdog-{agent}-auth-{int(now)}-{abs(hash(matched_line)) % 10_000}"
-        )
-
+        # Envelope fields (message_id, timestamp, from) are filled in
+        # automatically by NatsClient._envelope_wrap(). See #34.
+        #
+        # #28 originally generated a deterministic message_id keyed on
+        # (agent, matched_line) so that identical re-observations
+        # within the bridge cooldown would collapse by id. #34 drops
+        # that: the watchdog's own `_last_auth_alert` / `_last_auth_match`
+        # suppression (15 min keyed on matched_line) is the primary
+        # dedup path and is unit-tested. If a suppression bug ever
+        # produced duplicate publishes, the smoke test's observed-count
+        # check would catch it and we could restore deterministic id
+        # generation as a targeted patch.
         directive = {
             "type": _MSG_TYPE_MANAGER_DIRECTIVE,
-            "message_id": directive_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "from": "orchestrator",
             "subtype": "auth_failure",
             "agent": agent,
             "matched_line": matched_line,

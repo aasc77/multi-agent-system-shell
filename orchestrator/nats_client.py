@@ -20,6 +20,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
 
 import nats
@@ -173,13 +176,74 @@ class NatsClient:
     async def publish_to_inbox(self, role: str, message: dict[str, Any]) -> None:
         """Publish a JSON *message* to ``<prefix>.<role>.inbox``.
 
+        The *message* is envelope-wrapped before publish — ``message_id``,
+        ``timestamp``, and ``from`` are filled in with sensible defaults
+        if the caller has not set them. The envelope enables the
+        mas-bridge ``handleCheckMessages`` dedup path to correctly
+        collapse the push-subscription buffer copy against the durable
+        JetStream pull copy; without an envelope the bridge fails open
+        and delivers every orchestrator-generated message twice to
+        the target agent.
+
+        The caller's *message* dict is NOT mutated — a shallow copy is
+        made before envelope fields are added, so callers that reuse
+        the same dict across multiple publish calls (e.g.
+        ``publish_all_done``) get a fresh envelope on every publish
+        without accidentally sharing ``message_id`` across recipients.
+
+        Callers that set any of ``message_id``, ``timestamp``, or
+        ``from`` themselves retain their values — the library never
+        clobbers caller intent.
+
         Raises:
             NatsClientError: If not connected.
         """
         self._require_connected()
         subject = self.inbox_subject(role)
-        payload = json.dumps(message).encode()
+        enveloped = self._envelope_wrap(message)
+        payload = json.dumps(enveloped).encode()
         await self._js.publish(subject, payload)
+
+    def _envelope_wrap(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Return a shallow copy of *message* with envelope fields filled in.
+
+        Fields added if missing: ``message_id``, ``timestamp``, ``from``.
+        Caller-set values are preserved. The original dict is never
+        mutated so callers can safely reuse it across publish calls.
+
+        Shallow-copy caveat: the envelope fields are all top-level scalars
+        (strings), so a shallow ``dict(message)`` is sufficient to keep
+        the caller's dict isolated from our mutations. Do NOT mutate
+        nested containers on *enveloped* — any nested dict/list is still
+        shared with the caller via reference, and in-place edits there
+        would propagate back to the caller and silently break fanout.
+        """
+        enveloped = dict(message)
+        if not enveloped.get("message_id"):
+            enveloped["message_id"] = self._generate_message_id(enveloped)
+        if not enveloped.get("timestamp"):
+            enveloped["timestamp"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds",
+            )
+        if not enveloped.get("from"):
+            enveloped["from"] = "orchestrator"
+        return enveloped
+
+    @staticmethod
+    def _generate_message_id(message: dict[str, Any]) -> str:
+        """Generate a unique ``message_id`` for *message*.
+
+        Format: ``<type>-<epoch>-<short-uuid>``. Uses the message's
+        ``type`` field (falling back to ``orchestrator``) as the
+        prefix so each publisher namespace stays distinct in traces
+        and the mas-bridge dedup cache has a wider hash space across
+        concurrent senders.
+        """
+        raw_type = str(message.get("type") or "orchestrator")
+        msg_type = raw_type.replace(" ", "_")
+        epoch = int(time.time())
+        short_uuid = uuid.uuid4().hex[:8]
+        return f"{msg_type}-{epoch}-{short_uuid}"
 
     async def publish_raw(self, subject: str, payload: bytes) -> None:
         """Publish raw bytes to an arbitrary NATS subject.
