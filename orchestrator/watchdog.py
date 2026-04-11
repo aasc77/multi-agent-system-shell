@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -31,8 +32,70 @@ _DEFAULT_CHECK_INTERVAL = 60  # seconds between checks
 _DEFAULT_IDLE_COOLDOWN = 300  # don't re-alert same agent within this window
 _CAPTURE_LINES = 20  # lines to capture from pane
 
+# Auth-failure detection (issue #28).
+#
+# Pattern design: must capture real bridge auth failures without
+# false-positiving on prose that merely mentions the error code. Real
+# MCP JSON-RPC auth failures render to claude panes as:
+#
+#     ⎿  Error: MCP error -32603: Authentication failed: Invalid token
+#
+# A strict "MCP error -NNNNN:" JSON-RPC prefix IMMEDIATELY followed by
+# whitespace and an auth phrase is the canonical SDK surface format.
+# Loose anchors (bare "-32603" or bare "Authentication failed")
+# false-positive on dev chatter, briefings, PR descriptions, and
+# anything that discusses the error in prose — see the #28 QA
+# smoke-test run that self-triggered on hub's own pane when hub
+# (dev) briefed another agent about the upcoming test by typing the
+# error code in a message. The narrow proximity match here is the
+# defense-in-depth against that.
+#
+# `\s{0,10}` handles tmux word-wrap between the code and the auth
+# phrase — Python's `\s` already matches `\n` by default, so `re.DOTALL`
+# is belt-and-braces (explicit intent, harmless).
+#
+# Known limitation: if the tmux pane is narrower than ~40 cols, tmux
+# will split mid-word inside `Authentication` itself, and the pattern
+# will miss the wrapped form entirely. No production pane runs that
+# narrow in practice (we set pane geometry explicitly in start.sh),
+# so fixing sub-40-col wrapping is out of scope for #28. If we ever
+# shrink panes below that, see the follow-up tracked for dev-agent
+# self-health (issue #32) which will replace pane-grep with a direct
+# MCP-bridge probe anyway.
+#
+# Agent exclusion (see _DEFAULT_AUTH_SCAN_EXCLUDES) is the other half
+# of the defense: agents that discuss errors as a matter of course
+# (dev/hub, manager-monitor) are skipped because the pattern alone is
+# not enough to rule out their prose. See the trade-off note on the
+# hub exclusion below.
+_DEFAULT_AUTH_ALERT_COOLDOWN = 900  # 15 min burst suppression
+_AUTH_CAPTURE_LINES = 60
+_AUTH_ERROR_PATTERN = re.compile(
+    r"MCP error -\d+:\s{0,10}(?:Authentication failed|Invalid token)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Agents excluded by default from auth-failure pane scanning. Manager
+# is already excluded via the role=monitor filter in TmuxComm's pane
+# mapping, but we list it here as well so removing the monitor role
+# doesn't silently open a cascade hole. Hub (dev) is excluded because
+# it is the builder agent — it discusses auth failures in code,
+# briefings, PR descriptions, and messages to other agents as a
+# normal part of its work. Config override: set
+# `watchdog.auth_scan_excludes: [list]` in the project config.
+#
+# Trade-off accepted for #28: with hub excluded, if hub ITSELF hits a
+# real MCP auth failure the watchdog will not flag it from the pane.
+# Hub's mitigation (self-report via send_to_agent) has a circular
+# dependency — a bridge that cannot auth cannot send. This gap is
+# tracked as the follow-up "dev-agent self-health probe" (issue #32,
+# not yet filed as of #28 merge) which will add a direct MCP bridge
+# probe independent of pane content.
+_DEFAULT_AUTH_SCAN_EXCLUDES: frozenset[str] = frozenset({"hub", "manager"})
+
 _MSG_TYPE_IDLE_ALERT = "idle_alert"
 _MSG_TYPE_MANAGER_RESPONSE = "manager_idle_response"
+_MSG_TYPE_MANAGER_DIRECTIVE = "manager_directive"
 
 # Agent status values that indicate the agent's work is done
 _DONE_PATTERNS = re.compile(
@@ -76,12 +139,27 @@ class IdleWatchdog:
         self._idle_cooldown: int = watchdog_cfg.get(
             "idle_cooldown", _DEFAULT_IDLE_COOLDOWN,
         )
+        self._auth_alert_cooldown: int = watchdog_cfg.get(
+            "auth_alert_cooldown", _DEFAULT_AUTH_ALERT_COOLDOWN,
+        )
+        configured_excludes = watchdog_cfg.get("auth_scan_excludes")
+        if configured_excludes is None:
+            self._auth_scan_excludes: frozenset[str] = _DEFAULT_AUTH_SCAN_EXCLUDES
+        else:
+            self._auth_scan_excludes = frozenset(configured_excludes)
 
         # Track last alert time per agent to avoid spam
         self._last_alert: dict[str, float] = {}
 
         # Pending response from manager (agent -> True means waiting)
         self._awaiting_response: dict[str, bool] = {}
+
+        # Auth-failure tracking: last alert time and last matched line per
+        # agent. Suppression is keyed on (agent, matched_line) so a new
+        # error surfaces immediately while a repeating burst of the same
+        # line stays quiet until the cooldown expires.
+        self._last_auth_alert: dict[str, float] = {}
+        self._last_auth_match: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -101,6 +179,10 @@ class IdleWatchdog:
                 await self._check_idle_agents()
             except Exception:
                 logger.exception("Watchdog check failed")
+            try:
+                await self._check_auth_failures()
+            except Exception:
+                logger.exception("Auth-failure check failed")
 
     async def handle_manager_response(self, message: dict[str, Any]) -> None:
         """Process a response from the manager about an idle alert.
@@ -232,6 +314,106 @@ class IdleWatchdog:
 
         # Agent is idle with a pending task — alert the manager
         await self._alert_manager(agent)
+
+    async def _check_auth_failures(self) -> None:
+        """Scan every known agent pane for MCP auth-failure signatures.
+
+        Issue #28: when an agent's Claude Code OAuth or MCP bridge token
+        rots, ``check_messages`` returns ``MCP error -32603: Authentication
+        failed: Invalid token`` and the agent sits silently while messages
+        pile up in its inbox. The watchdog greps each pane for that
+        signature and flags the manager so the failure is visible within
+        one cycle instead of appearing as mysterious idleness.
+        """
+        get_mapping = getattr(self._tmux_comm, "get_pane_mapping", None)
+        if not callable(get_mapping):
+            return
+        try:
+            agents = list(get_mapping().keys())
+        except Exception:
+            return
+        for agent in agents:
+            if agent in self._auth_scan_excludes:
+                continue
+            try:
+                await self._check_agent_auth_failure(agent)
+            except Exception:
+                logger.exception("Auth-failure scan failed for %s", agent)
+
+    async def _check_agent_auth_failure(self, agent: str) -> None:
+        """Scan a single agent's pane for an auth-failure signature and,
+        on first match of a new burst, publish a ``manager_directive`` to
+        the manager inbox.
+
+        Suppression is keyed on the exact matched line — identical
+        repeating errors are quiet for ``auth_alert_cooldown`` seconds,
+        but a *different* auth error on the same agent surfaces right
+        away.
+        """
+        pane = self._tmux_comm.capture_pane(agent, lines=_AUTH_CAPTURE_LINES)
+        if not pane:
+            return
+        match = _AUTH_ERROR_PATTERN.search(pane)
+        if match is None:
+            return
+
+        # Report the full matched span, collapsing any tmux word-wrap
+        # line breaks that fell inside the match into single spaces so
+        # the directive/log line is readable on one line.
+        matched_line = " ".join(match.group(0).split())
+        if not matched_line:
+            return
+
+        now = time.time()
+        last = self._last_auth_alert.get(agent, 0.0)
+        last_line = self._last_auth_match.get(agent, "")
+        within_cooldown = last > 0 and (now - last) < self._auth_alert_cooldown
+        if within_cooldown and matched_line == last_line:
+            return
+
+        logger.warning(
+            "flag_human: MCP auth failure on agent %s — %s",
+            agent, matched_line,
+        )
+
+        # Envelope metadata — the mas-bridge deduplicates by message_id
+        # when draining the push-subscription buffer AND the durable
+        # JetStream pull at the same check_messages call. Without a
+        # message_id, both paths deliver the same directive to the
+        # target agent's claude conversation, producing a 2x burst.
+        # The general fix belongs in orchestrator/nats_client.py
+        # (every outbound inbox publish should carry an envelope), but
+        # that is tracked as a follow-up; here we only set what the
+        # watchdog owns so the #28 smoke test passes cleanly.
+        directive_id = (
+            f"watchdog-{agent}-auth-{int(now)}-{abs(hash(matched_line)) % 10_000}"
+        )
+
+        directive = {
+            "type": _MSG_TYPE_MANAGER_DIRECTIVE,
+            "message_id": directive_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "from": "orchestrator",
+            "subtype": "auth_failure",
+            "agent": agent,
+            "matched_line": matched_line,
+            "message": (
+                f"Watchdog flag: agent '{agent}' is hitting MCP auth failures "
+                f"({matched_line!r}). Coordinate with dev/user to re-auth the "
+                f"agent's Claude Code OAuth or MCP bridge token."
+            ),
+            "priority": "high",
+        }
+        try:
+            await self._nats_client.publish_to_inbox("manager", directive)
+        except Exception:
+            logger.exception(
+                "Failed to publish auth-failure directive to manager",
+            )
+            return
+
+        self._last_auth_alert[agent] = now
+        self._last_auth_match[agent] = matched_line
 
     async def _alert_manager(self, agent: str) -> None:
         """Capture pane and send idle alert to manager via NATS."""

@@ -20,7 +20,12 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from orchestrator.watchdog import IdleWatchdog, _DONE_PATTERNS
+from orchestrator.watchdog import (
+    IdleWatchdog,
+    _AUTH_ERROR_PATTERN,
+    _DEFAULT_AUTH_SCAN_EXCLUDES,
+    _DONE_PATTERNS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -338,3 +343,383 @@ class TestAlertManager:
         """Alert should nudge manager's tmux pane."""
         await watchdog._alert_manager("macmini")
         mock_tmux.nudge.assert_called_with("manager", force=True)
+
+
+# ---------------------------------------------------------------------------
+# Auth Failure Detection Tests (issue #28)
+# ---------------------------------------------------------------------------
+
+_AUTH_ERROR_LINE = "MCP error -32603: Authentication failed: Invalid token"
+_AUTH_ERROR_PANE = (
+    "some earlier output\n"
+    "  ⎿  user called check_messages\n"
+    f"  ⎿  {_AUTH_ERROR_LINE}\n"
+    "❯ \n"
+)
+
+
+class TestAuthErrorPattern:
+    # Positive matches — canonical MCP JSON-RPC auth failures
+
+    def test_matches_full_error_line(self):
+        assert _AUTH_ERROR_PATTERN.search(
+            "MCP error -32603: Authentication failed: Invalid token",
+        )
+
+    def test_matches_decorated_tool_output(self):
+        assert _AUTH_ERROR_PATTERN.search(
+            "  ⎿  Error: MCP error -32603: Authentication failed: Invalid token",
+        )
+
+    def test_matches_invalid_token_variant(self):
+        assert _AUTH_ERROR_PATTERN.search(
+            "MCP error -32000: Invalid token",
+        )
+
+    def test_matches_case_insensitive_real_shape(self):
+        assert _AUTH_ERROR_PATTERN.search(
+            "mcp ERROR -32603: authentication FAILED",
+        )
+
+    def test_matches_wrapped_across_lines_at_52_cols(self):
+        """Tmux word-wrap at ~52 cols splits the full line in two visual rows.
+
+        The regex must still fire because `\\s` crosses the `\\n`.
+        """
+        wrapped = (
+            "  ⎿  Error: MCP error -32603:\n"
+            "     Authentication failed: Invalid token\n"
+        )
+        assert _AUTH_ERROR_PATTERN.search(wrapped)
+
+    # Negative matches — prose, quotes, fragments (captured from real
+    # smoke-test false positives before the pattern was tightened in #28).
+
+    def test_rejects_bare_error_code(self):
+        """macmini's scenario: backticked code reference in prose."""
+        assert not _AUTH_ERROR_PATTERN.search(
+            "the watchdog matches `-32603` in agent panes",
+        )
+
+    def test_rejects_prose_mentioning_auth_failure(self):
+        """Discussion of the bug without the MCP SDK surface format."""
+        assert not _AUTH_ERROR_PATTERN.search(
+            'the real problem is "Authentication failed" in the error output',
+        )
+
+    def test_rejects_missing_prefix_structure(self):
+        """Even the exact words — if the dash/colon prefix is missing, no match."""
+        assert not _AUTH_ERROR_PATTERN.search(
+            "mcp error 32603 authentication failed",
+        )
+
+    def test_rejects_hub_briefing_text(self):
+        """Exact FP string from the #28 smoke-test first run on hub's pane."""
+        assert not _AUTH_ERROR_PATTERN.search(
+            "In the next ~1-2 minutes macmini will re-inject the `-32603` line into their pane.",
+        )
+
+    def test_rejects_quoted_matched_line_fragment(self):
+        """Another FP captured from hub's pane: explanation of the bug."""
+        assert not _AUTH_ERROR_PATTERN.search(
+            "the literal -32603 string from messages I wrote",
+        )
+
+    def test_rejects_different_jsonrpc_error(self):
+        """Non-auth JSON-RPC errors (like -32601 Method not found) must not match."""
+        assert not _AUTH_ERROR_PATTERN.search(
+            "MCP error -32601: Method not found: foobar",
+        )
+
+    def test_rejects_clean_check_messages_pane(self):
+        pane = (
+            "  ⎿  check_messages()\n"
+            "  ⎿  []\n"
+            "❯ \n"
+        )
+        assert not _AUTH_ERROR_PATTERN.search(pane)
+
+
+class TestCheckAuthFailures:
+    @pytest.fixture
+    def auth_tmux(self, mock_tmux):
+        """Tmux mock with pane_mapping hook and configurable captures."""
+        mock_tmux.get_pane_mapping = MagicMock(
+            return_value={"hub": 0, "RTX5090": 4},
+        )
+        mock_tmux.capture_pane = MagicMock(return_value="❯ \n")
+        return mock_tmux
+
+    @pytest.fixture
+    def auth_watchdog(
+        self, mock_lifecycle, mock_state_machine, mock_nats,
+        auth_tmux, mock_task_queue, config,
+    ):
+        return IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=auth_tmux,
+            config=config,
+            task_queue=mock_task_queue,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_match_no_alert(self, auth_watchdog, auth_tmux, mock_nats):
+        """Clean panes never trigger a manager_directive."""
+        auth_tmux.capture_pane.return_value = "  ⎿  check_messages()\n  ⎿  []\n❯ \n"
+        await auth_watchdog._check_auth_failures()
+        mock_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_match_publishes_directive(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """A -32603 line triggers a manager_directive to the manager inbox."""
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+
+        mock_nats.publish_to_inbox.assert_called_once()
+        call = mock_nats.publish_to_inbox.call_args[0]
+        assert call[0] == "manager"
+        directive = call[1]
+        assert directive["type"] == "manager_directive"
+        assert directive["subtype"] == "auth_failure"
+        assert directive["agent"] == "RTX5090"
+        assert "-32603" in directive["matched_line"]
+
+    @pytest.mark.asyncio
+    async def test_matched_line_logged_as_flag_human(
+        self, auth_watchdog, auth_tmux, mock_nats, caplog,
+    ):
+        """Watchdog writes a flag_human log entry with agent + matched line."""
+        import logging
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        with caplog.at_level(logging.WARNING, logger="orchestrator.watchdog"):
+            await auth_watchdog._check_auth_failures()
+        assert any(
+            "flag_human" in rec.message and "RTX5090" in rec.message
+            and "-32603" in rec.message
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_identical_burst_suppressed(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """Identical error line within cooldown does not re-alert."""
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        await auth_watchdog._check_auth_failures()
+        assert mock_nats.publish_to_inbox.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_different_error_line_alerts_again(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """A different matched line re-alerts even inside the cooldown window."""
+        panes = iter([
+            _AUTH_ERROR_PANE,
+            "  ⎿  Error: MCP error -32000: Invalid token\n❯ \n",
+        ])
+
+        def _capture(agent, lines):
+            if agent != "RTX5090":
+                return "❯ \n"
+            return next(panes)
+
+        auth_tmux.capture_pane.side_effect = _capture
+        await auth_watchdog._check_auth_failures()
+        await auth_watchdog._check_auth_failures()
+        assert mock_nats.publish_to_inbox.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cooldown_expires_allows_realert(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """After auth_alert_cooldown elapses, the same error re-alerts."""
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        # Rewind the remembered alert past the cooldown window.
+        auth_watchdog._last_auth_alert["RTX5090"] = (
+            time.time() - auth_watchdog._auth_alert_cooldown - 1
+        )
+        await auth_watchdog._check_auth_failures()
+        assert mock_nats.publish_to_inbox.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_get_pane_mapping_is_noop(
+        self, mock_lifecycle, mock_state_machine, mock_nats, config,
+    ):
+        """Watchdog does not crash when tmux_comm has no get_pane_mapping."""
+        class _BareTmux:
+            def capture_pane(self, agent, lines=20):
+                return "❯ \n"
+
+        wd = IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=_BareTmux(),
+            config=config,
+            task_queue=None,
+        )
+        await wd._check_auth_failures()  # should not raise
+        mock_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_excluded_hub_pane_is_not_scanned(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """Hub is in the default exclude list, so even a real-shape error
+        in hub's pane must not publish a directive.
+        """
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "hub" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        mock_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_excluded_agent_still_fires(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """RTX5090 is NOT in the exclude list, so a real-shape error fires."""
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        mock_nats.publish_to_inbox.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_config_overrides_exclude_list(
+        self, mock_lifecycle, mock_state_machine, mock_nats, auth_tmux,
+        mock_task_queue,
+    ):
+        """watchdog.auth_scan_excludes in config overrides the default set."""
+        cfg = {
+            "watchdog": {
+                "check_interval": 60,
+                "idle_cooldown": 300,
+                "auth_scan_excludes": ["dgx"],  # explicit -- does NOT include hub
+            }
+        }
+        auth_tmux.get_pane_mapping.return_value = {"hub": 0, "dgx": 2}
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "hub" else "❯ \n"
+        )
+        wd = IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=auth_tmux,
+            config=cfg,
+            task_queue=mock_task_queue,
+        )
+        await wd._check_auth_failures()
+        # hub was NOT excluded here (config replaced the default) — alert fires
+        mock_nats.publish_to_inbox.assert_called_once()
+        assert mock_nats.publish_to_inbox.call_args[0][1]["agent"] == "hub"
+
+    def test_default_exclude_list_has_hub_and_manager(self):
+        """Contract test — the default exclusion set must hold hub + manager."""
+        assert "hub" in _DEFAULT_AUTH_SCAN_EXCLUDES
+        assert "manager" in _DEFAULT_AUTH_SCAN_EXCLUDES
+
+    @pytest.mark.asyncio
+    async def test_directive_carries_envelope_message_id(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """Every published directive must carry a `message_id` so the
+        mas-bridge can deduplicate the push-subscription copy against
+        the durable-pull copy. Without this, agents receive 2x every
+        orchestrator-generated directive — observed and confirmed in
+        the #28 smoke-test run that surfaced this bug.
+
+        This test also validates the envelope field *shapes* (not just
+        presence) — a future refactor that set `message_id` to `None`
+        or `timestamp` to a non-ISO8601 sentinel would silently break
+        the dedup contract on the bridge side, so we pin the format.
+        """
+        from datetime import datetime
+
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        mock_nats.publish_to_inbox.assert_called_once()
+        directive = mock_nats.publish_to_inbox.call_args[0][1]
+
+        # message_id: present, non-None, non-empty, format-pinned
+        assert "message_id" in directive
+        assert directive["message_id"] is not None
+        assert directive["message_id"] != ""
+        assert directive["message_id"].startswith("watchdog-RTX5090-auth-")
+
+        # timestamp: present and parses as valid ISO8601
+        assert "timestamp" in directive
+        assert directive["timestamp"] is not None
+        assert directive["timestamp"] != ""
+        # datetime.fromisoformat raises ValueError on an invalid string
+        parsed_ts = datetime.fromisoformat(directive["timestamp"])
+        assert parsed_ts.tzinfo is not None, (
+            "directive timestamp must be timezone-aware"
+        )
+
+        # from: present and set to the orchestrator-side sentinel
+        assert directive.get("from") == "orchestrator"
+
+    @pytest.mark.asyncio
+    async def test_message_id_differs_for_different_matched_lines(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """Two separate bursts (different matched_line) must yield
+        different message_ids so the bridge dedup path does not collapse
+        a *new* auth failure into the suppression shadow of a prior one.
+        """
+        panes = iter([
+            _AUTH_ERROR_PANE,
+            "  ⎿  Error: MCP error -32000: Invalid token\n❯ \n",
+        ])
+
+        def _capture(agent, lines):
+            return next(panes) if agent == "RTX5090" else "❯ \n"
+
+        auth_tmux.capture_pane.side_effect = _capture
+        await auth_watchdog._check_auth_failures()
+        await auth_watchdog._check_auth_failures()
+        assert mock_nats.publish_to_inbox.call_count == 2
+        first_id = mock_nats.publish_to_inbox.call_args_list[0][0][1]["message_id"]
+        second_id = mock_nats.publish_to_inbox.call_args_list[1][0][1]["message_id"]
+        assert first_id != second_id
+
+    @pytest.mark.asyncio
+    async def test_matched_line_collapses_wrap_whitespace(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """When the match spans a tmux word-wrap, the reported matched_line
+        collapses the embedded newlines/spaces into single spaces so the
+        directive body and log line stay readable on one row.
+        """
+        wrapped_pane = (
+            "  ⎿  Error: MCP error -32603:\n"
+            "     Authentication failed: Invalid token\n"
+            "❯ \n"
+        )
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            wrapped_pane if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        mock_nats.publish_to_inbox.assert_called_once()
+        matched = mock_nats.publish_to_inbox.call_args[0][1]["matched_line"]
+        assert "\n" not in matched
+        assert "MCP error -32603:" in matched
+        assert "Authentication failed" in matched
