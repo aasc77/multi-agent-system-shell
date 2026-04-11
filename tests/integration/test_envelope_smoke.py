@@ -76,6 +76,25 @@ async def test_envelope_wrap_end_to_end_against_live_nats():
 
     push_sub = await observer_nc.subscribe(_TEST_SUBJECT, cb=_push_cb)
 
+    # Purge any stale state from prior test runs. The AGENTS stream
+    # has a 1-hour retention window, so a previous run of this test
+    # (or any other publisher to the isolated subject) leaves old
+    # messages sitting on `agents.envelope-smoke.inbox` waiting for
+    # our fresh durable consumer to replay. Purging the subject at
+    # the start of every run guarantees a clean slate regardless of
+    # prior state — belt-and-braces defense against macmini's #37
+    # review-observation about durable-consumer orphans.
+    try:
+        jsm_preflight = observer_nc.jsm()
+        await jsm_preflight.purge_stream(
+            _STREAM_NAME, subject=_TEST_SUBJECT,
+        )
+    except Exception:
+        # Stream may not exist yet on a fresh dev box; the
+        # orchestrator creates it lazily at boot. A missing stream
+        # just means there's nothing to purge.
+        pass
+
     try:
         # --- 2. Publish via the real NatsClient (enveloped) ---
         nats_config = {

@@ -18,10 +18,10 @@ Usage::
     INTEGRATION=1 python3 -m pytest tests/integration/test_envelope_smoke.py
 
 Prerequisites for ``INTEGRATION=1`` runs:
-- Local NATS JetStream server reachable at ``nats://127.0.0.1:4222``
-  (start via ``scripts/setup-nats.sh``)
+- Local NATS JetStream server reachable at ``nats://127.0.0.1:4222``.
+  Start it with ``bash scripts/setup-nats.sh``.
 - The ``AGENTS`` stream created (orchestrator creates this on boot,
-  or ``setup-nats.sh`` does it idempotently)
+  or ``setup-nats.sh`` does it idempotently).
 
 Contract for new integration tests added to this directory:
 - Must use an isolated NATS subject (e.g. ``agents.<test-name>-smoke.inbox``)
@@ -40,22 +40,19 @@ import os
 
 import pytest
 
-# Gate every test in this directory on INTEGRATION=1. Applied via
-# `pytestmark` so it propagates to every test function without
-# requiring a decorator on each one.
-collect_ignore_glob: list[str] = []
 
-if os.environ.get("INTEGRATION") != "1":
-    # When integration is not opted in, skip every test in this
-    # directory with a clear reason so `pytest --collect-only`
-    # surfaces the gate to operators who wonder why the tests are
-    # not running.
-    def pytest_collection_modifyitems(config, items):
-        skip_reason = (
-            "integration test skipped — set INTEGRATION=1 and run "
-            "a local NATS server at nats://127.0.0.1:4222 to enable"
-        )
-        skip_marker = pytest.mark.skip(reason=skip_reason)
-        for item in items:
-            if "tests/integration/" in str(item.fspath):
-                item.add_marker(skip_marker)
+# Gate every test in this directory on INTEGRATION=1. Applied via
+# pytest's `collect_modifyitems` hook so new tests dropped into the
+# directory inherit the gate with zero boilerplate and no decorator
+# to forget.
+def pytest_collection_modifyitems(config, items):
+    if os.environ.get("INTEGRATION") == "1":
+        return
+    skip_reason = (
+        "integration test skipped — set INTEGRATION=1 and run "
+        "a local NATS server at nats://127.0.0.1:4222 to enable"
+    )
+    skip_marker = pytest.mark.skip(reason=skip_reason)
+    for item in items:
+        if "tests/integration/" in str(item.fspath):
+            item.add_marker(skip_marker)
