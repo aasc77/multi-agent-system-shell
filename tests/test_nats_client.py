@@ -493,6 +493,81 @@ class TestEnvelopeWrapping:
             )
 
 
+class TestSubscribeCore:
+    """`subscribe_core` registers a core-NATS push subscription for
+    request/reply or ephemeral-signal handlers. Used by the #31
+    orchestrator version probe, which registers a handler on
+    `system.orchestrator.version` that responds via `msg.respond()`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_subscribe_core_uses_raw_nats_connection(
+        self, nats_config, agents,
+    ):
+        """`subscribe_core` must go through the underlying nats.Client
+        `.subscribe()` call, NOT the JetStream context. Request/reply
+        and ephemeral signals are core-NATS, not durable.
+        """
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            async def _noop(msg):
+                return
+
+            await client.subscribe_core("system.example.probe", _noop)
+
+            # Must hit the raw core-NATS `.subscribe()` on the
+            # connection, not the JetStream context.
+            mock_conn.subscribe.assert_called_once()
+            call_args = mock_conn.subscribe.call_args
+            assert call_args[0][0] == "system.example.probe"
+            # Callback is passed via the `cb` kwarg (nats.py convention).
+            assert call_args[1].get("cb") is _noop
+            # JetStream subscribe MUST NOT be used for core-NATS subjects.
+            mock_js.subscribe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_subscribe_core_returns_subscription_object(
+        self, nats_config, agents,
+    ):
+        """The returned object is the underlying nats Subscription so
+        callers can `.unsubscribe()` on shutdown.
+        """
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            sentinel_sub = MagicMock(name="core_subscription")
+            mock_conn.subscribe.return_value = sentinel_sub
+            await client.connect()
+
+            async def _noop(msg):
+                return
+
+            returned = await client.subscribe_core("system.example.probe", _noop)
+            assert returned is sentinel_sub
+
+    @pytest.mark.asyncio
+    async def test_subscribe_core_raises_when_not_connected(
+        self, nats_config, agents,
+    ):
+        """Calling subscribe_core before connect() raises."""
+        client = NatsClient(config=nats_config, agents=agents)
+
+        async def _noop(msg):
+            return
+
+        with pytest.raises(Exception):
+            await client.subscribe_core("system.example.probe", _noop)
+
+
 # ===========================================================================
 # 3. SUBSCRIBING -- Subscribe to agent outbox with callback
 # ===========================================================================

@@ -254,6 +254,41 @@ class NatsClient:
         self._require_connected()
         await self._js.publish(subject, payload)
 
+    async def subscribe_core(
+        self,
+        subject: str,
+        callback: MessageCallback,
+    ) -> Any:
+        """Register a core-NATS push subscription on *subject*.
+
+        Use for core-NATS request/reply or ephemeral-signal
+        subscriptions on subjects OUTSIDE the JetStream ``agents.>``
+        wildcard. For durable agent-addressed messages use
+        :meth:`subscribe_to_inbox` / :meth:`subscribe_to_outbox`.
+
+        Unlike the JetStream-backed subscribe methods, this is a
+        plain push subscription with no durable consumer, no ack
+        tracking, and no redelivery on disconnect. Messages missed
+        while the subscriber is down are lost by design — that is
+        exactly the semantic you want for request/reply handlers
+        (the request is scoped to a single call and replies go back
+        over the inbox-subject the request was made on) and for
+        loss-tolerant diagnostic signals.
+
+        First caller: issue #31 orchestrator version probe, which
+        registers a handler on ``system.orchestrator.version`` that
+        responds via ``msg.respond(bytes)`` on the incoming message.
+
+        Returns:
+            The underlying ``nats.aio.subscription.Subscription``
+            object, useful for ``.unsubscribe()`` on shutdown.
+
+        Raises:
+            NatsClientError: If not connected.
+        """
+        self._require_connected()
+        return await self._conn.subscribe(subject, cb=callback)
+
     async def publish_all_done(self, summary: str) -> None:
         """Publish an ``all_done`` message to every agent's inbox.
 
