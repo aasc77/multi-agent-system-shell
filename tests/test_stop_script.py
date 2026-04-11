@@ -205,6 +205,59 @@ class TestTmuxSessionKill:
 
 
 # ===========================================================================
+# 2b. BACKGROUND SERVICES CLEANUP
+# ===========================================================================
+
+
+class TestBackgroundServicesCleanup:
+    """stop.sh must pkill all three background services that start.sh spawns.
+
+    start.sh launches the knowledge indexer, speaker service, and thermostat
+    service as backgrounded Python children (start.sh:495-524). If stop.sh
+    misses any of them, they reparent to launchd (PPID=1) and linger as
+    zombies after a teardown. Each test here asserts the dry-run pkill
+    invocation for one service; together they guard against a future
+    refactor that drops a service from the kill loop.
+    """
+
+    def test_dry_run_kills_knowledge_indexer(self):
+        """stop.sh dry-run must include pkill for knowledge-store/indexer.py."""
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+
+        result = _run_stop_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "pkill -f knowledge-store/indexer.py" in output, (
+            "stop.sh must pkill the knowledge indexer"
+        )
+
+    def test_dry_run_kills_speaker_service(self):
+        """stop.sh dry-run must include pkill for services/speaker-service.py."""
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+
+        result = _run_stop_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "pkill -f services/speaker-service.py" in output, (
+            "stop.sh must pkill the speaker service"
+        )
+
+    def test_dry_run_kills_thermostat_service(self):
+        """stop.sh dry-run must include pkill for services/thermostat-service.py."""
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+
+        result = _run_stop_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "pkill -f services/thermostat-service.py" in output, (
+            "stop.sh must pkill the thermostat service"
+        )
+
+
+# ===========================================================================
 # 3. MCP CONFIGS CLEANUP
 # ===========================================================================
 

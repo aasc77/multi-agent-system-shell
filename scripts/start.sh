@@ -373,6 +373,22 @@ if [ -n "$REMOTE_AGENTS" ]; then
     done <<< "$REMOTE_AGENTS"
 fi
 
+service_is_running() {
+    # Check whether a background service matching the given pgrep pattern
+    # is alive. Takes the pattern and the name of the per-service test env
+    # var (e.g. _TEST_INDEXER_RUNNING) for test overrides. MUST be called
+    # in conditional context (if / && / ||); a bare call would let the
+    # pgrep exit code trip `set -e`.
+    local pattern="$1"
+    local test_var="$2"
+    local override="${!test_var:-}"
+    if [ -n "$override" ]; then
+        [ "$override" = "true" ]
+        return
+    fi
+    pgrep -f "$pattern" &>/dev/null
+}
+
 # -----------------------------------------------------------------------
 # NATS auto-start
 # -----------------------------------------------------------------------
@@ -495,32 +511,44 @@ else:
     # Start knowledge-store indexer as a background daemon (if available)
     local indexer_script="${ROOT_DIR}/knowledge-store/indexer.py"
     if [ -f "$indexer_script" ]; then
-        mkdir -p "${ROOT_DIR}/data"
-        NATS_URL="${NATS_URL}" \
-        CHROMADB_PATH="${ROOT_DIR}/data/chromadb" \
-        OLLAMA_URL="http://localhost:11434" \
-            python3 "$indexer_script" >> "${ROOT_DIR}/data/indexer.log" 2>&1 &
-        echo "Knowledge indexer started (PID: $!)"
+        if service_is_running "knowledge-store/indexer.py" "_TEST_INDEXER_RUNNING"; then
+            echo "Knowledge indexer already running. Skipping."
+        else
+            mkdir -p "${ROOT_DIR}/data"
+            NATS_URL="${NATS_URL}" \
+            CHROMADB_PATH="${ROOT_DIR}/data/chromadb" \
+            OLLAMA_URL="http://localhost:11434" \
+                python3 "$indexer_script" >> "${ROOT_DIR}/data/indexer.log" 2>&1 &
+            echo "Knowledge indexer started (PID: $!)"
+        fi
     fi
 
     # Start speaker service as a background daemon (routes speak requests to hassio)
     local speaker_script="${ROOT_DIR}/services/speaker-service.py"
     if [ -f "$speaker_script" ]; then
-        mkdir -p "${ROOT_DIR}/data"
-        NATS_URL="${NATS_URL}" \
-        NATS_STREAM="${STREAM_NAME:-AGENTS}" \
-            python3 "$speaker_script" >> "${ROOT_DIR}/data/speaker-service.log" 2>&1 &
-        echo "Speaker service started (PID: $!)"
+        if service_is_running "services/speaker-service.py" "_TEST_SPEAKER_RUNNING"; then
+            echo "Speaker service already running. Skipping."
+        else
+            mkdir -p "${ROOT_DIR}/data"
+            NATS_URL="${NATS_URL}" \
+            NATS_STREAM="${STREAM_NAME:-AGENTS}" \
+                python3 "$speaker_script" >> "${ROOT_DIR}/data/speaker-service.log" 2>&1 &
+            echo "Speaker service started (PID: $!)"
+        fi
     fi
 
     # Start thermostat service as a background daemon (HA climate control via NATS)
     local thermostat_script="${ROOT_DIR}/services/thermostat-service.py"
     if [ -f "$thermostat_script" ]; then
-        mkdir -p "${ROOT_DIR}/data"
-        NATS_URL="${NATS_URL}" \
-        NATS_STREAM="${STREAM_NAME:-AGENTS}" \
-            python3 "$thermostat_script" >> "${ROOT_DIR}/data/thermostat-service.log" 2>&1 &
-        echo "Thermostat service started (PID: $!)"
+        if service_is_running "services/thermostat-service.py" "_TEST_THERMOSTAT_RUNNING"; then
+            echo "Thermostat service already running. Skipping."
+        else
+            mkdir -p "${ROOT_DIR}/data"
+            NATS_URL="${NATS_URL}" \
+            NATS_STREAM="${STREAM_NAME:-AGENTS}" \
+                python3 "$thermostat_script" >> "${ROOT_DIR}/data/thermostat-service.log" 2>&1 &
+            echo "Thermostat service started (PID: $!)"
+        fi
     fi
 
     local monitor_script="${SCRIPT_DIR}/nats-monitor.sh"

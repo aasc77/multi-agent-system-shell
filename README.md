@@ -250,6 +250,12 @@ state_machine:
       status: pass
 ```
 
+### Background services
+
+`scripts/start.sh` launches three background daemons alongside the agent panes: the knowledge-store indexer, the speaker service, and the thermostat service. Each is spawned idempotently — if a matching process is already running (for example, a prior `start.sh` run whose children got reparented to launchd, or a separately-installed LaunchAgent), `start.sh` logs `"<service> already running. Skipping."` and bypasses its own spawn so the two don't fight over the same ChromaDB or NATS subjects. `scripts/stop.sh` pkills all three services in addition to killing the tmux session and cleaning up `.mcp-configs/`.
+
+If the `com.local.knowledge-indexer` LaunchAgent plist is installed (`~/Library/LaunchAgents/com.local.knowledge-indexer.plist` with `KeepAlive=true`), it owns the indexer's environment variables whenever it's the first mover; `start.sh` detects the plist-spawned process and skips its own. To apply shell-env changes (`NATS_URL`, `CHROMADB_PATH`, etc.) to the indexer, `launchctl unload` the plist first, then re-run `start.sh`.
+
 ## Dependencies
 
 - **Python 3.10+**: nats-py, pyyaml, requests

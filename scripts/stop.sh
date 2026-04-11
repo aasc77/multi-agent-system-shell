@@ -84,13 +84,50 @@ for sentinel in /tmp/mas-launch-*; do
 done
 
 # -----------------------------------------------------------------------
-# Kill knowledge-store indexer
+# Kill background services spawned by start.sh
+#
+# start.sh launches three daemons as backgrounded children:
+#   - knowledge-store/indexer.py
+#   - services/speaker-service.py
+#   - services/thermostat-service.py
+#
+# When start.sh's parent bash exits they reparent to launchd (PPID=1)
+# and survive a naive tmux-session kill, so we explicitly pkill each.
+# We issue SIGTERM first (services/speaker-service.py and
+# services/thermostat-service.py install their own asyncio-backed
+# SIGTERM handlers for graceful shutdown), wait a short grace period,
+# then escalate to SIGKILL for any stragglers whose event loop was
+# stuck on a blocking await at the time the signal arrived.
+#
+# Caveat: pkill -f is a substring match on the full argv, so a process
+# whose args happen to contain the same string (e.g. `tail -f services/
+# speaker-service.log` or a text editor open on the file) would also be
+# killed. In current repo usage nothing else runs those strings, but
+# future callers of these pkills should be aware.
 # -----------------------------------------------------------------------
-echo "Stopping knowledge indexer..."
-if [ "$DRY_RUN" = "true" ]; then
-    echo "[DRY-RUN] pkill -f knowledge-store/indexer.py"
-else
-    pkill -f "knowledge-store/indexer.py" 2>/dev/null || true
+BG_SERVICES=(
+    "knowledge-store/indexer.py"
+    "services/speaker-service.py"
+    "services/thermostat-service.py"
+)
+
+for svc in "${BG_SERVICES[@]}"; do
+    echo "Stopping $svc..."
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[DRY-RUN] pkill -f $svc"
+    else
+        pkill -f "$svc" 2>/dev/null || true
+    fi
+done
+
+if [ "$DRY_RUN" != "true" ]; then
+    sleep 1
+    for svc in "${BG_SERVICES[@]}"; do
+        if pgrep -f "$svc" &>/dev/null; then
+            echo "SIGKILL stragglers: $svc"
+            pkill -9 -f "$svc" 2>/dev/null || true
+        fi
+    done
 fi
 
 # -----------------------------------------------------------------------

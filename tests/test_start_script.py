@@ -403,6 +403,116 @@ class TestNatsAutoStart:
 
 
 # ===========================================================================
+# 3b. BACKGROUND SERVICE IDEMPOTENCY
+# ===========================================================================
+
+
+class TestServiceIdempotency:
+    """start.sh must skip spawning background services that are already
+    running. A ``com.local.knowledge-indexer`` launchd plist (or a prior
+    start.sh run that didn't get reaped) can leave the indexer / speaker
+    / thermostat daemons alive; start.sh's ``service_is_running`` helper
+    detects each via ``pgrep -f`` and bypasses the spawn to avoid
+    duplicate writers fighting over the same ChromaDB + NATS subjects.
+
+    Tests force the "already running" branch with per-service env vars
+    (``_TEST_INDEXER_RUNNING``, ``_TEST_SPEAKER_RUNNING``,
+    ``_TEST_THERMOSTAT_RUNNING``). The ``test_per_service_isolation``
+    test is what makes the three-env-var design load-bearing: it proves
+    that forcing one service's "running" flag does NOT also suppress
+    the other two. Without it, a broken helper that returned true for
+    everything would still pass the three single-service tests.
+    """
+
+    # All four tests below pin every per-service env var explicitly (even
+    # the ones not under test) so the helper's pgrep fallback never runs
+    # against the real host — otherwise a stray launchd-managed indexer or
+    # a leftover speaker/thermostat from a prior dev session would flip the
+    # result non-deterministically.
+
+    def test_skips_indexer_when_already_running(self):
+        """_TEST_INDEXER_RUNNING=true must bypass the indexer spawn."""
+        env = os.environ.copy()
+        env["_TEST_INDEXER_RUNNING"] = "true"
+        env["_TEST_SPEAKER_RUNNING"] = "false"
+        env["_TEST_THERMOSTAT_RUNNING"] = "false"
+
+        result = _run_start_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "Knowledge indexer already running. Skipping." in output, (
+            "Must log that the indexer spawn was skipped"
+        )
+        assert "Knowledge indexer started (PID" not in output, (
+            "Must NOT start a new indexer when one is already running"
+        )
+
+    def test_skips_speaker_when_already_running(self):
+        """_TEST_SPEAKER_RUNNING=true must bypass the speaker-service spawn."""
+        env = os.environ.copy()
+        env["_TEST_INDEXER_RUNNING"] = "false"
+        env["_TEST_SPEAKER_RUNNING"] = "true"
+        env["_TEST_THERMOSTAT_RUNNING"] = "false"
+
+        result = _run_start_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "Speaker service already running. Skipping." in output, (
+            "Must log that the speaker-service spawn was skipped"
+        )
+        assert "Speaker service started (PID" not in output, (
+            "Must NOT start a new speaker-service when one is already running"
+        )
+
+    def test_skips_thermostat_when_already_running(self):
+        """_TEST_THERMOSTAT_RUNNING=true must bypass the thermostat-service spawn."""
+        env = os.environ.copy()
+        env["_TEST_INDEXER_RUNNING"] = "false"
+        env["_TEST_SPEAKER_RUNNING"] = "false"
+        env["_TEST_THERMOSTAT_RUNNING"] = "true"
+
+        result = _run_start_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "Thermostat service already running. Skipping." in output, (
+            "Must log that the thermostat-service spawn was skipped"
+        )
+        assert "Thermostat service started (PID" not in output, (
+            "Must NOT start a new thermostat-service when one is already running"
+        )
+
+    def test_per_service_isolation(self):
+        """Forcing one service's 'running' flag must NOT suppress the others.
+
+        Sets ``_TEST_SPEAKER_RUNNING=true`` with the other two pinned to
+        ``false`` and asserts speaker is skipped while the indexer and
+        thermostat spawns still fire. This proves the helper's per-service
+        env-var dispatch actually reads each flag independently instead of
+        short-circuiting on any one being set.
+        """
+        env = os.environ.copy()
+        env["_TEST_INDEXER_RUNNING"] = "false"
+        env["_TEST_SPEAKER_RUNNING"] = "true"
+        env["_TEST_THERMOSTAT_RUNNING"] = "false"
+
+        result = _run_start_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+
+        # Speaker is skipped
+        assert "Speaker service already running. Skipping." in output, (
+            "Speaker must be skipped when _TEST_SPEAKER_RUNNING=true"
+        )
+        assert "Speaker service started (PID" not in output, (
+            "Speaker must NOT spawn when _TEST_SPEAKER_RUNNING=true"
+        )
+
+        # Indexer and thermostat still spawn
+        assert "Knowledge indexer started (PID" in output, (
+            "Indexer must still spawn when only speaker is flagged running"
+        )
+        assert "Thermostat service started (PID" in output, (
+            "Thermostat must still spawn when only speaker is flagged running"
+        )
+
+
+# ===========================================================================
 # 4. IDEMPOTENT TMUX SESSION CREATION
 # ===========================================================================
 
