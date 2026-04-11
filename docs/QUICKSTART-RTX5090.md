@@ -96,12 +96,35 @@ Upload `wsl-shell.ps1` to the Windows side. **Do not use a bash/zsh heredoc that
 ```bash
 cat <<'PSEOF' | ssh angel@192.168.1.41 'powershell.exe -NoProfile -Command "$input | Out-File -FilePath C:\ProgramData\ssh\wsl-shell.ps1 -Encoding ascii -Force"'
 # wsl-shell.ps1 - SSH ForceCommand wrapper that routes to WSL Ubuntu bash.
+# Preserves TTY by writing SSH_ORIGINAL_COMMAND to a temp file and exec'ing
+# bash with that file as a script (stdin/stdout/stderr inherit PTY from sshd).
+#
+# SFTP subsystem requests (scp in default SFTP mode) arrive with
+# SSH_ORIGINAL_COMMAND set to "sftp-server.exe" — Windows OpenSSH's
+# Subsystem handler. We refuse those fast so the client's legacy-mode
+# fallback (`scp -O`) kicks in and runs as a regular `scp -t` command,
+# which the wrapper then correctly routes through WSL bash where the
+# actual scp binary lives. Without this early reject, the wrapper would
+# try to execute sftp-server.exe through WSL interop and hang on the
+# garbled pipe protocol.
 $ErrorActionPreference = 'Stop'
 $cmd = $env:SSH_ORIGINAL_COMMAND
+
 if ([string]::IsNullOrEmpty($cmd)) {
+    if ([Console]::IsInputRedirected) {
+        [Console]::Error.WriteLine('wsl-shell.ps1: refusing non-interactive empty command')
+        exit 1
+    }
     & wsl.exe -d Ubuntu
     exit $LASTEXITCODE
 }
+
+$trimmed = $cmd.Trim()
+if ($trimmed -match '^(sftp-server(\.exe)?|internal-sftp)(\s|$)') {
+    [Console]::Error.WriteLine('wsl-shell.ps1: SFTP subsystem not supported through this wrapper; use scp -O (legacy mode)')
+    exit 1
+}
+
 $tmpWin = Join-Path $env:TEMP ("mas-ssh-" + [guid]::NewGuid().ToString("N") + ".sh")
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($tmpWin, $cmd + "`n", $utf8NoBom)
@@ -212,7 +235,7 @@ If the 5090 is reset to a fresh Windows install, repeat steps 0–9 in order. Th
 ## Known pitfalls
 
 1. **`wsl --install -d Ubuntu --no-launch` says "Ubuntu has been installed" but `wsl -l -v` does not show it.** The Appx is staged; the distro isn't registered. Run `ubuntu.exe install --root` from the Appx install dir to complete registration.
-2. **Modern scp (SFTP mode) fails through ForceCommand.** That's expected — subsystem requests are blocked by the wrapper. `scripts/start.sh` already retries with `scp -O`, which is classic mode and runs as a regular command, which the wrapper passes through to WSL bash (and `scp` in WSL handles it). Don't try to "fix" this by adding a subsystem handler — it isn't broken.
+2. **Modern scp (SFTP mode) has to be refused explicitly or it hangs forever.** When scp runs in its default SFTP mode, the client negotiates the `sftp` subsystem and sshd honors our `command="…wsl-shell.ps1"` ForceCommand by invoking the wrapper with `SSH_ORIGINAL_COMMAND='sftp-server.exe '` (the Windows-side `Subsystem sftp sftp-server.exe` handler name). If the wrapper naively writes that to a bash temp file and runs it, WSL's Windows-interop will launch `sftp-server.exe` on the Windows side with its stdio piped through WSL — the SFTP wire protocol gets garbled and **scp hangs indefinitely with no error**. That's why the wrapper has an explicit `sftp-server(\.exe)?|internal-sftp` refusal clause that exits 1 immediately; scp's `-O` legacy-mode retry then runs as a regular `scp -t` shell command, which the wrapper routes through WSL bash, and the real `scp` binary in Ubuntu handles the transfer. `scripts/start.sh` already issues `scp` without `-O` first and falls back to `scp -O` on failure — the refusal + fallback combo is what makes config copies work. Don't remove the refusal clause.
 3. **`$env:USERPROFILE\.ssh\authorized_keys` looks like it has the key but SSH ignores it.** Correct — `angel` is an admin, so Windows OpenSSH *only* reads `C:\ProgramData\ssh\administrators_authorized_keys`. Edit that file.
 4. **`wsl.exe -d Ubuntu` drops you into `/mnt/c/Users/angel`, not `/home/angel`.** That's because the Windows cwd is inherited. The orchestrator always prefixes `cd ~/mas-workspace` so it doesn't matter, but be aware when running ad-hoc commands.
 5. **Heredoc corruption (the bootstrap incident).** PowerShell uses backtick (`` ` ``) as its escape character. zsh and bash also treat backticks as command substitution inside *unquoted* heredocs — which means `\`r\`n` in a ``<<PSEOF`` block is silently replaced by the output of running `r` and `n` as commands (both "not found"). Always use `<<'PSEOF'` (quoted delimiter) when the body contains PowerShell, and use `[char]13 + [char]10` for CR/LF instead of `` `r`n ``.
