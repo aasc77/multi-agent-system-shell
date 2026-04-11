@@ -635,6 +635,51 @@ class TestCheckAuthFailures:
         assert "manager" in _DEFAULT_AUTH_SCAN_EXCLUDES
 
     @pytest.mark.asyncio
+    async def test_directive_carries_envelope_message_id(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """Every published directive must carry a `message_id` so the
+        mas-bridge can deduplicate the push-subscription copy against
+        the durable-pull copy. Without this, agents receive 2x every
+        orchestrator-generated directive — observed and confirmed in
+        the #28 smoke-test run that surfaced this bug.
+        """
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        mock_nats.publish_to_inbox.assert_called_once()
+        directive = mock_nats.publish_to_inbox.call_args[0][1]
+        assert "message_id" in directive
+        assert directive["message_id"].startswith("watchdog-RTX5090-auth-")
+        assert "timestamp" in directive
+        assert directive["from"] == "orchestrator"
+
+    @pytest.mark.asyncio
+    async def test_message_id_differs_for_different_matched_lines(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """Two separate bursts (different matched_line) must yield
+        different message_ids so the bridge dedup path does not collapse
+        a *new* auth failure into the suppression shadow of a prior one.
+        """
+        panes = iter([
+            _AUTH_ERROR_PANE,
+            "  ⎿  Error: MCP error -32000: Invalid token\n❯ \n",
+        ])
+
+        def _capture(agent, lines):
+            return next(panes) if agent == "RTX5090" else "❯ \n"
+
+        auth_tmux.capture_pane.side_effect = _capture
+        await auth_watchdog._check_auth_failures()
+        await auth_watchdog._check_auth_failures()
+        assert mock_nats.publish_to_inbox.call_count == 2
+        first_id = mock_nats.publish_to_inbox.call_args_list[0][0][1]["message_id"]
+        second_id = mock_nats.publish_to_inbox.call_args_list[1][0][1]["message_id"]
+        assert first_id != second_id
+
+    @pytest.mark.asyncio
     async def test_matched_line_collapses_wrap_whitespace(
         self, auth_watchdog, auth_tmux, mock_nats,
     ):
