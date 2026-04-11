@@ -643,17 +643,39 @@ class TestCheckAuthFailures:
         the durable-pull copy. Without this, agents receive 2x every
         orchestrator-generated directive — observed and confirmed in
         the #28 smoke-test run that surfaced this bug.
+
+        This test also validates the envelope field *shapes* (not just
+        presence) — a future refactor that set `message_id` to `None`
+        or `timestamp` to a non-ISO8601 sentinel would silently break
+        the dedup contract on the bridge side, so we pin the format.
         """
+        from datetime import datetime
+
         auth_tmux.capture_pane.side_effect = lambda agent, lines: (
             _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
         )
         await auth_watchdog._check_auth_failures()
         mock_nats.publish_to_inbox.assert_called_once()
         directive = mock_nats.publish_to_inbox.call_args[0][1]
+
+        # message_id: present, non-None, non-empty, format-pinned
         assert "message_id" in directive
+        assert directive["message_id"] is not None
+        assert directive["message_id"] != ""
         assert directive["message_id"].startswith("watchdog-RTX5090-auth-")
+
+        # timestamp: present and parses as valid ISO8601
         assert "timestamp" in directive
-        assert directive["from"] == "orchestrator"
+        assert directive["timestamp"] is not None
+        assert directive["timestamp"] != ""
+        # datetime.fromisoformat raises ValueError on an invalid string
+        parsed_ts = datetime.fromisoformat(directive["timestamp"])
+        assert parsed_ts.tzinfo is not None, (
+            "directive timestamp must be timezone-aware"
+        )
+
+        # from: present and set to the orchestrator-side sentinel
+        assert directive.get("from") == "orchestrator"
 
     @pytest.mark.asyncio
     async def test_message_id_differs_for_different_matched_lines(
