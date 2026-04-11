@@ -635,22 +635,15 @@ class TestCheckAuthFailures:
         assert "manager" in _DEFAULT_AUTH_SCAN_EXCLUDES
 
     @pytest.mark.asyncio
-    async def test_directive_carries_envelope_message_id(
+    async def test_directive_body_shape_is_wire_ready(
         self, auth_watchdog, auth_tmux, mock_nats,
     ):
-        """Every published directive must carry a `message_id` so the
-        mas-bridge can deduplicate the push-subscription copy against
-        the durable-pull copy. Without this, agents receive 2x every
-        orchestrator-generated directive — observed and confirmed in
-        the #28 smoke-test run that surfaced this bug.
-
-        This test also validates the envelope field *shapes* (not just
-        presence) — a future refactor that set `message_id` to `None`
-        or `timestamp` to a non-ISO8601 sentinel would silently break
-        the dedup contract on the bridge side, so we pin the format.
+        """The watchdog builds the *body* of the directive — envelope
+        fields (message_id, timestamp, from) are added downstream by
+        NatsClient._envelope_wrap. This test pins the body shape the
+        watchdog owns; the envelope contract lives in tests/test_nats_client.py
+        per the #34 separation of concerns refactor.
         """
-        from datetime import datetime
-
         auth_tmux.capture_pane.side_effect = lambda agent, lines: (
             _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
         )
@@ -658,48 +651,23 @@ class TestCheckAuthFailures:
         mock_nats.publish_to_inbox.assert_called_once()
         directive = mock_nats.publish_to_inbox.call_args[0][1]
 
-        # message_id: present, non-None, non-empty, format-pinned
-        assert "message_id" in directive
-        assert directive["message_id"] is not None
-        assert directive["message_id"] != ""
-        assert directive["message_id"].startswith("watchdog-RTX5090-auth-")
+        # Watchdog-owned body fields — must be set before the library
+        # wraps the envelope, so the mock sees them here.
+        assert directive["type"] == "manager_directive"
+        assert directive["subtype"] == "auth_failure"
+        assert directive["agent"] == "RTX5090"
+        assert "matched_line" in directive
+        assert "-32603" in directive["matched_line"]
+        assert directive["priority"] == "high"
+        assert "message" in directive
+        assert "auth" in directive["message"].lower()
 
-        # timestamp: present and parses as valid ISO8601
-        assert "timestamp" in directive
-        assert directive["timestamp"] is not None
-        assert directive["timestamp"] != ""
-        # datetime.fromisoformat raises ValueError on an invalid string
-        parsed_ts = datetime.fromisoformat(directive["timestamp"])
-        assert parsed_ts.tzinfo is not None, (
-            "directive timestamp must be timezone-aware"
-        )
-
-        # from: present and set to the orchestrator-side sentinel
-        assert directive.get("from") == "orchestrator"
-
-    @pytest.mark.asyncio
-    async def test_message_id_differs_for_different_matched_lines(
-        self, auth_watchdog, auth_tmux, mock_nats,
-    ):
-        """Two separate bursts (different matched_line) must yield
-        different message_ids so the bridge dedup path does not collapse
-        a *new* auth failure into the suppression shadow of a prior one.
-        """
-        panes = iter([
-            _AUTH_ERROR_PANE,
-            "  ⎿  Error: MCP error -32000: Invalid token\n❯ \n",
-        ])
-
-        def _capture(agent, lines):
-            return next(panes) if agent == "RTX5090" else "❯ \n"
-
-        auth_tmux.capture_pane.side_effect = _capture
-        await auth_watchdog._check_auth_failures()
-        await auth_watchdog._check_auth_failures()
-        assert mock_nats.publish_to_inbox.call_count == 2
-        first_id = mock_nats.publish_to_inbox.call_args_list[0][0][1]["message_id"]
-        second_id = mock_nats.publish_to_inbox.call_args_list[1][0][1]["message_id"]
-        assert first_id != second_id
+        # Envelope fields MUST NOT be set by the watchdog itself — that
+        # is the library's job now. If a future refactor reintroduces
+        # a manual envelope block here, this assertion will catch it.
+        assert "message_id" not in directive
+        assert "timestamp" not in directive
+        assert "from" not in directive
 
     @pytest.mark.asyncio
     async def test_matched_line_collapses_wrap_whitespace(

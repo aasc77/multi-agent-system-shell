@@ -19,7 +19,6 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -376,24 +375,10 @@ class IdleWatchdog:
             agent, matched_line,
         )
 
-        # Envelope metadata — the mas-bridge deduplicates by message_id
-        # when draining the push-subscription buffer AND the durable
-        # JetStream pull at the same check_messages call. Without a
-        # message_id, both paths deliver the same directive to the
-        # target agent's claude conversation, producing a 2x burst.
-        # The general fix belongs in orchestrator/nats_client.py
-        # (every outbound inbox publish should carry an envelope), but
-        # that is tracked as a follow-up; here we only set what the
-        # watchdog owns so the #28 smoke test passes cleanly.
-        directive_id = (
-            f"watchdog-{agent}-auth-{int(now)}-{abs(hash(matched_line)) % 10_000}"
-        )
-
+        # Envelope fields (message_id, timestamp, from) are filled in
+        # automatically by NatsClient._envelope_wrap(). See #34.
         directive = {
             "type": _MSG_TYPE_MANAGER_DIRECTIVE,
-            "message_id": directive_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "from": "orchestrator",
             "subtype": "auth_failure",
             "agent": agent,
             "matched_line": matched_line,
