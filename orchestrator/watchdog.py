@@ -31,8 +31,15 @@ _DEFAULT_CHECK_INTERVAL = 60  # seconds between checks
 _DEFAULT_IDLE_COOLDOWN = 300  # don't re-alert same agent within this window
 _CAPTURE_LINES = 20  # lines to capture from pane
 
+# Auth-failure detection (issue #28). Deeper capture because the error
+# often scrolls above the prompt footer before the watchdog sees it.
+_DEFAULT_AUTH_ALERT_COOLDOWN = 900  # 15 min burst suppression
+_AUTH_CAPTURE_LINES = 60
+_AUTH_ERROR_PATTERN = re.compile(r"-32603|Authentication failed", re.IGNORECASE)
+
 _MSG_TYPE_IDLE_ALERT = "idle_alert"
 _MSG_TYPE_MANAGER_RESPONSE = "manager_idle_response"
+_MSG_TYPE_MANAGER_DIRECTIVE = "manager_directive"
 
 # Agent status values that indicate the agent's work is done
 _DONE_PATTERNS = re.compile(
@@ -76,12 +83,22 @@ class IdleWatchdog:
         self._idle_cooldown: int = watchdog_cfg.get(
             "idle_cooldown", _DEFAULT_IDLE_COOLDOWN,
         )
+        self._auth_alert_cooldown: int = watchdog_cfg.get(
+            "auth_alert_cooldown", _DEFAULT_AUTH_ALERT_COOLDOWN,
+        )
 
         # Track last alert time per agent to avoid spam
         self._last_alert: dict[str, float] = {}
 
         # Pending response from manager (agent -> True means waiting)
         self._awaiting_response: dict[str, bool] = {}
+
+        # Auth-failure tracking: last alert time and last matched line per
+        # agent. Suppression is keyed on (agent, matched_line) so a new
+        # error surfaces immediately while a repeating burst of the same
+        # line stays quiet until the cooldown expires.
+        self._last_auth_alert: dict[str, float] = {}
+        self._last_auth_match: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -101,6 +118,10 @@ class IdleWatchdog:
                 await self._check_idle_agents()
             except Exception:
                 logger.exception("Watchdog check failed")
+            try:
+                await self._check_auth_failures()
+            except Exception:
+                logger.exception("Auth-failure check failed")
 
     async def handle_manager_response(self, message: dict[str, Any]) -> None:
         """Process a response from the manager about an idle alert.
@@ -232,6 +253,88 @@ class IdleWatchdog:
 
         # Agent is idle with a pending task — alert the manager
         await self._alert_manager(agent)
+
+    async def _check_auth_failures(self) -> None:
+        """Scan every known agent pane for MCP auth-failure signatures.
+
+        Issue #28: when an agent's Claude Code OAuth or MCP bridge token
+        rots, ``check_messages`` returns ``MCP error -32603: Authentication
+        failed: Invalid token`` and the agent sits silently while messages
+        pile up in its inbox. The watchdog greps each pane for that
+        signature and flags the manager so the failure is visible within
+        one cycle instead of appearing as mysterious idleness.
+        """
+        get_mapping = getattr(self._tmux_comm, "get_pane_mapping", None)
+        if not callable(get_mapping):
+            return
+        try:
+            agents = list(get_mapping().keys())
+        except Exception:
+            return
+        for agent in agents:
+            try:
+                await self._check_agent_auth_failure(agent)
+            except Exception:
+                logger.exception("Auth-failure scan failed for %s", agent)
+
+    async def _check_agent_auth_failure(self, agent: str) -> None:
+        """Scan a single agent's pane for an auth-failure signature and,
+        on first match of a new burst, publish a ``manager_directive`` to
+        the manager inbox.
+
+        Suppression is keyed on the exact matched line — identical
+        repeating errors are quiet for ``auth_alert_cooldown`` seconds,
+        but a *different* auth error on the same agent surfaces right
+        away.
+        """
+        pane = self._tmux_comm.capture_pane(agent, lines=_AUTH_CAPTURE_LINES)
+        if not pane:
+            return
+        if not _AUTH_ERROR_PATTERN.search(pane):
+            return
+
+        matched_line = ""
+        for line in pane.splitlines():
+            if _AUTH_ERROR_PATTERN.search(line):
+                matched_line = line.strip()
+                break
+        if not matched_line:
+            return
+
+        now = time.time()
+        last = self._last_auth_alert.get(agent, 0.0)
+        last_line = self._last_auth_match.get(agent, "")
+        within_cooldown = last > 0 and (now - last) < self._auth_alert_cooldown
+        if within_cooldown and matched_line == last_line:
+            return
+
+        logger.warning(
+            "flag_human: MCP auth failure on agent %s — %s",
+            agent, matched_line,
+        )
+
+        directive = {
+            "type": _MSG_TYPE_MANAGER_DIRECTIVE,
+            "subtype": "auth_failure",
+            "agent": agent,
+            "matched_line": matched_line,
+            "message": (
+                f"Watchdog flag: agent '{agent}' is hitting MCP auth failures "
+                f"({matched_line!r}). Coordinate with dev/user to re-auth the "
+                f"agent's Claude Code OAuth or MCP bridge token."
+            ),
+            "priority": "high",
+        }
+        try:
+            await self._nats_client.publish_to_inbox("manager", directive)
+        except Exception:
+            logger.exception(
+                "Failed to publish auth-failure directive to manager",
+            )
+            return
+
+        self._last_auth_alert[agent] = now
+        self._last_auth_match[agent] = matched_line
 
     async def _alert_manager(self, agent: str) -> None:
         """Capture pane and send idle alert to manager via NATS."""

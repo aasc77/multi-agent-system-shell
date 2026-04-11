@@ -20,7 +20,11 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from orchestrator.watchdog import IdleWatchdog, _DONE_PATTERNS
+from orchestrator.watchdog import (
+    IdleWatchdog,
+    _AUTH_ERROR_PATTERN,
+    _DONE_PATTERNS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -338,3 +342,173 @@ class TestAlertManager:
         """Alert should nudge manager's tmux pane."""
         await watchdog._alert_manager("macmini")
         mock_tmux.nudge.assert_called_with("manager", force=True)
+
+
+# ---------------------------------------------------------------------------
+# Auth Failure Detection Tests (issue #28)
+# ---------------------------------------------------------------------------
+
+_AUTH_ERROR_LINE = "MCP error -32603: Authentication failed: Invalid token"
+_AUTH_ERROR_PANE = (
+    "some earlier output\n"
+    "  ⎿  user called check_messages\n"
+    f"  ⎿  {_AUTH_ERROR_LINE}\n"
+    "❯ \n"
+)
+
+
+class TestAuthErrorPattern:
+    def test_matches_32603(self):
+        assert _AUTH_ERROR_PATTERN.search(
+            "MCP error -32603: Authentication failed: Invalid token",
+        )
+
+    def test_matches_authentication_failed(self):
+        assert _AUTH_ERROR_PATTERN.search("Authentication failed: Invalid token")
+
+    def test_matches_case_insensitive(self):
+        assert _AUTH_ERROR_PATTERN.search("authentication FAILED")
+
+    def test_does_not_match_clean_check_messages(self):
+        pane = (
+            "  ⎿  check_messages()\n"
+            "  ⎿  []\n"
+            "❯ \n"
+        )
+        assert not _AUTH_ERROR_PATTERN.search(pane)
+
+
+class TestCheckAuthFailures:
+    @pytest.fixture
+    def auth_tmux(self, mock_tmux):
+        """Tmux mock with pane_mapping hook and configurable captures."""
+        mock_tmux.get_pane_mapping = MagicMock(
+            return_value={"hub": 0, "RTX5090": 4},
+        )
+        mock_tmux.capture_pane = MagicMock(return_value="❯ \n")
+        return mock_tmux
+
+    @pytest.fixture
+    def auth_watchdog(
+        self, mock_lifecycle, mock_state_machine, mock_nats,
+        auth_tmux, mock_task_queue, config,
+    ):
+        return IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=auth_tmux,
+            config=config,
+            task_queue=mock_task_queue,
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_match_no_alert(self, auth_watchdog, auth_tmux, mock_nats):
+        """Clean panes never trigger a manager_directive."""
+        auth_tmux.capture_pane.return_value = "  ⎿  check_messages()\n  ⎿  []\n❯ \n"
+        await auth_watchdog._check_auth_failures()
+        mock_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_match_publishes_directive(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """A -32603 line triggers a manager_directive to the manager inbox."""
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+
+        mock_nats.publish_to_inbox.assert_called_once()
+        call = mock_nats.publish_to_inbox.call_args[0]
+        assert call[0] == "manager"
+        directive = call[1]
+        assert directive["type"] == "manager_directive"
+        assert directive["subtype"] == "auth_failure"
+        assert directive["agent"] == "RTX5090"
+        assert "-32603" in directive["matched_line"]
+
+    @pytest.mark.asyncio
+    async def test_matched_line_logged_as_flag_human(
+        self, auth_watchdog, auth_tmux, mock_nats, caplog,
+    ):
+        """Watchdog writes a flag_human log entry with agent + matched line."""
+        import logging
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        with caplog.at_level(logging.WARNING, logger="orchestrator.watchdog"):
+            await auth_watchdog._check_auth_failures()
+        assert any(
+            "flag_human" in rec.message and "RTX5090" in rec.message
+            and "-32603" in rec.message
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_identical_burst_suppressed(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """Identical error line within cooldown does not re-alert."""
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        await auth_watchdog._check_auth_failures()
+        assert mock_nats.publish_to_inbox.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_different_error_line_alerts_again(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """A different matched line re-alerts even inside the cooldown window."""
+        panes = iter([
+            _AUTH_ERROR_PANE,
+            "  ⎿  Authentication failed: Expired token\n❯ \n",
+        ])
+
+        def _capture(agent, lines):
+            if agent != "RTX5090":
+                return "❯ \n"
+            return next(panes)
+
+        auth_tmux.capture_pane.side_effect = _capture
+        await auth_watchdog._check_auth_failures()
+        await auth_watchdog._check_auth_failures()
+        assert mock_nats.publish_to_inbox.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cooldown_expires_allows_realert(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """After auth_alert_cooldown elapses, the same error re-alerts."""
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            _AUTH_ERROR_PANE if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        # Rewind the remembered alert past the cooldown window.
+        auth_watchdog._last_auth_alert["RTX5090"] = (
+            time.time() - auth_watchdog._auth_alert_cooldown - 1
+        )
+        await auth_watchdog._check_auth_failures()
+        assert mock_nats.publish_to_inbox.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_get_pane_mapping_is_noop(
+        self, mock_lifecycle, mock_state_machine, mock_nats, config,
+    ):
+        """Watchdog does not crash when tmux_comm has no get_pane_mapping."""
+        class _BareTmux:
+            def capture_pane(self, agent, lines=20):
+                return "❯ \n"
+
+        wd = IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=_BareTmux(),
+            config=config,
+            task_queue=None,
+        )
+        await wd._check_auth_failures()  # should not raise
+        mock_nats.publish_to_inbox.assert_not_called()
