@@ -31,11 +31,66 @@ _DEFAULT_CHECK_INTERVAL = 60  # seconds between checks
 _DEFAULT_IDLE_COOLDOWN = 300  # don't re-alert same agent within this window
 _CAPTURE_LINES = 20  # lines to capture from pane
 
-# Auth-failure detection (issue #28). Deeper capture because the error
-# often scrolls above the prompt footer before the watchdog sees it.
+# Auth-failure detection (issue #28).
+#
+# Pattern design: must capture real bridge auth failures without
+# false-positiving on prose that merely mentions the error code. Real
+# MCP JSON-RPC auth failures render to claude panes as:
+#
+#     ⎿  Error: MCP error -32603: Authentication failed: Invalid token
+#
+# A strict "MCP error -NNNNN:" JSON-RPC prefix IMMEDIATELY followed by
+# whitespace and an auth phrase is the canonical SDK surface format.
+# Loose anchors (bare "-32603" or bare "Authentication failed")
+# false-positive on dev chatter, briefings, PR descriptions, and
+# anything that discusses the error in prose — see the #28 QA
+# smoke-test run that self-triggered on hub's own pane when hub
+# (dev) briefed another agent about the upcoming test by typing the
+# error code in a message. The narrow proximity match here is the
+# defense-in-depth against that.
+#
+# `\s{0,10}` handles tmux word-wrap between the code and the auth
+# phrase — Python's `\s` already matches `\n` by default, so `re.DOTALL`
+# is belt-and-braces (explicit intent, harmless).
+#
+# Known limitation: if the tmux pane is narrower than ~40 cols, tmux
+# will split mid-word inside `Authentication` itself, and the pattern
+# will miss the wrapped form entirely. No production pane runs that
+# narrow in practice (we set pane geometry explicitly in start.sh),
+# so fixing sub-40-col wrapping is out of scope for #28. If we ever
+# shrink panes below that, see the follow-up tracked for dev-agent
+# self-health (issue #32) which will replace pane-grep with a direct
+# MCP-bridge probe anyway.
+#
+# Agent exclusion (see _DEFAULT_AUTH_SCAN_EXCLUDES) is the other half
+# of the defense: agents that discuss errors as a matter of course
+# (dev/hub, manager-monitor) are skipped because the pattern alone is
+# not enough to rule out their prose. See the trade-off note on the
+# hub exclusion below.
 _DEFAULT_AUTH_ALERT_COOLDOWN = 900  # 15 min burst suppression
 _AUTH_CAPTURE_LINES = 60
-_AUTH_ERROR_PATTERN = re.compile(r"-32603|Authentication failed", re.IGNORECASE)
+_AUTH_ERROR_PATTERN = re.compile(
+    r"MCP error -\d+:\s{0,10}(?:Authentication failed|Invalid token)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Agents excluded by default from auth-failure pane scanning. Manager
+# is already excluded via the role=monitor filter in TmuxComm's pane
+# mapping, but we list it here as well so removing the monitor role
+# doesn't silently open a cascade hole. Hub (dev) is excluded because
+# it is the builder agent — it discusses auth failures in code,
+# briefings, PR descriptions, and messages to other agents as a
+# normal part of its work. Config override: set
+# `watchdog.auth_scan_excludes: [list]` in the project config.
+#
+# Trade-off accepted for #28: with hub excluded, if hub ITSELF hits a
+# real MCP auth failure the watchdog will not flag it from the pane.
+# Hub's mitigation (self-report via send_to_agent) has a circular
+# dependency — a bridge that cannot auth cannot send. This gap is
+# tracked as the follow-up "dev-agent self-health probe" (issue #32,
+# not yet filed as of #28 merge) which will add a direct MCP bridge
+# probe independent of pane content.
+_DEFAULT_AUTH_SCAN_EXCLUDES: frozenset[str] = frozenset({"hub", "manager"})
 
 _MSG_TYPE_IDLE_ALERT = "idle_alert"
 _MSG_TYPE_MANAGER_RESPONSE = "manager_idle_response"
@@ -86,6 +141,11 @@ class IdleWatchdog:
         self._auth_alert_cooldown: int = watchdog_cfg.get(
             "auth_alert_cooldown", _DEFAULT_AUTH_ALERT_COOLDOWN,
         )
+        configured_excludes = watchdog_cfg.get("auth_scan_excludes")
+        if configured_excludes is None:
+            self._auth_scan_excludes: frozenset[str] = _DEFAULT_AUTH_SCAN_EXCLUDES
+        else:
+            self._auth_scan_excludes = frozenset(configured_excludes)
 
         # Track last alert time per agent to avoid spam
         self._last_alert: dict[str, float] = {}
@@ -272,6 +332,8 @@ class IdleWatchdog:
         except Exception:
             return
         for agent in agents:
+            if agent in self._auth_scan_excludes:
+                continue
             try:
                 await self._check_agent_auth_failure(agent)
             except Exception:
@@ -290,14 +352,14 @@ class IdleWatchdog:
         pane = self._tmux_comm.capture_pane(agent, lines=_AUTH_CAPTURE_LINES)
         if not pane:
             return
-        if not _AUTH_ERROR_PATTERN.search(pane):
+        match = _AUTH_ERROR_PATTERN.search(pane)
+        if match is None:
             return
 
-        matched_line = ""
-        for line in pane.splitlines():
-            if _AUTH_ERROR_PATTERN.search(line):
-                matched_line = line.strip()
-                break
+        # Report the full matched span, collapsing any tmux word-wrap
+        # line breaks that fell inside the match into single spaces so
+        # the directive/log line is readable on one line.
+        matched_line = " ".join(match.group(0).split())
         if not matched_line:
             return
 
