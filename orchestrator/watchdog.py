@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,29 @@ _DEFAULT_AUTH_SCAN_EXCLUDES: frozenset[str] = frozenset({"hub", "manager"})
 _MSG_TYPE_IDLE_ALERT = "idle_alert"
 _MSG_TYPE_MANAGER_RESPONSE = "manager_idle_response"
 _MSG_TYPE_MANAGER_DIRECTIVE = "manager_directive"
+_MSG_TYPE_HEALTH_OK = "health_ok"
+
+# Heartbeat watcher (issue #32) — backfills the #28 hub-exclusion gap.
+#
+# Hub's MCP bridge publishes a `health_ok` heartbeat to
+# `system.heartbeat.<agent>` every 60s via core NATS (fire-and-forget,
+# outside the `agents.>` JetStream wildcard so it is NOT stored in
+# the AGENTS stream). The watchdog subscribes to the `>` wildcard and
+# records the last-seen timestamp per agent. On staleness (no heartbeat
+# within threshold), it publishes a `hub_unreachable` manager_directive
+# — a signal that the pane-grep auth detection in #28 CANNOT produce
+# for hub because hub is excluded from that scan.
+#
+# Absence IS the signal. A bridge with rotted OAuth credentials cannot
+# send, so the heartbeat stops, and staleness crosses the threshold.
+# The watchdog doesn't wait for an explicit "health_failed" event —
+# that event could never be delivered reliably by a broken bridge.
+_HEARTBEAT_SUBJECT_PREFIX = "system.heartbeat"
+_HEARTBEAT_WILDCARD = f"{_HEARTBEAT_SUBJECT_PREFIX}.>"
+_DEFAULT_HEARTBEAT_AGENTS: tuple[str, ...] = ("hub",)
+_DEFAULT_HEARTBEAT_STALENESS = 180  # 3× the 60s bridge publish cadence
+_DEFAULT_HEARTBEAT_CHECK_INTERVAL = 30  # staleness check cadence
+_DEFAULT_HEARTBEAT_GRACE_MULTIPLIER = 2.0  # cold-start grace: 2× staleness
 
 # Agent status values that indicate the agent's work is done
 _DONE_PATTERNS = re.compile(
@@ -432,6 +456,236 @@ class IdleWatchdog:
 
         self._last_alert[agent] = time.time()
         self._awaiting_response[agent] = True
+
+
+class HeartbeatWatcher:
+    """Watches ephemeral ``system.heartbeat.<agent>`` pings and flags
+    staleness to the manager. Backfills the hub-exclusion gap from the
+    #28 pane-grep auth detection (issue #32).
+
+    How it works:
+
+    1. On :meth:`start`, subscribes to ``system.heartbeat.>`` via core
+       NATS. Each agent's MCP bridge publishes a ``health_ok`` signal
+       at a fixed cadence (60s today) from the same NATS connection it
+       already holds open.
+    2. Every incoming heartbeat updates
+       :attr:`_last_heartbeat_seen` ``[agent] = time.time()``. Messages
+       with an unexpected shape are silently dropped.
+    3. :meth:`run` ticks every ``check_interval`` seconds and, for each
+       expected heartbeat agent, compares ``now - last_seen`` against
+       the configured staleness threshold. On stale, a
+       ``manager_directive`` with ``subtype='hub_unreachable'`` lands
+       in ``agents.manager.inbox`` (inheriting the #34 envelope wrap).
+    4. Suppression: alerts are bucketed on ``floor(staleness / threshold)``
+       so we re-alert at 1×, 2×, 3×, … threshold — not every tick. A
+       fresh heartbeat clears the bucket so the agent can re-alert
+       cleanly on the next outage.
+    5. Cold-start grace: if no heartbeat has ever been seen for an
+       agent AND the orchestrator is younger than
+       ``grace_multiplier × staleness_threshold``, alerts are
+       suppressed. Prevents spurious ``hub_unreachable`` at boot when
+       the bridge hasn't had time to publish its first heartbeat yet.
+
+    Args:
+        nats_client: NatsClient with :meth:`subscribe_core` and
+            :meth:`publish_to_inbox` available.
+        config: Merged config dict. Reads from ``config.watchdog``.
+    """
+
+    def __init__(self, nats_client: Any, config: dict[str, Any]) -> None:
+        self._nats_client = nats_client
+
+        watchdog_cfg = config.get("watchdog", {})
+        configured_agents = watchdog_cfg.get("heartbeat_agents")
+        if configured_agents is None:
+            self._heartbeat_agents: tuple[str, ...] = tuple(_DEFAULT_HEARTBEAT_AGENTS)
+        else:
+            self._heartbeat_agents = tuple(configured_agents)
+
+        self._staleness_threshold: int = int(
+            watchdog_cfg.get(
+                "hub_heartbeat_staleness_seconds",
+                _DEFAULT_HEARTBEAT_STALENESS,
+            ),
+        )
+        self._check_interval: int = int(
+            watchdog_cfg.get(
+                "hub_heartbeat_check_interval_seconds",
+                _DEFAULT_HEARTBEAT_CHECK_INTERVAL,
+            ),
+        )
+        self._grace_multiplier: float = float(
+            watchdog_cfg.get(
+                "hub_heartbeat_grace_multiplier",
+                _DEFAULT_HEARTBEAT_GRACE_MULTIPLIER,
+            ),
+        )
+
+        self._last_heartbeat_seen: dict[str, float] = {}
+        self._last_alert_bucket: dict[str, int] = {}
+        self._boot_time: float = time.time()
+        self._subscription: Any = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Subscribe to the heartbeat wildcard subject.
+
+        Must be called before :meth:`run`. Idempotent — subscribing
+        twice is a no-op.
+        """
+        if self._subscription is not None:
+            return
+        self._subscription = await self._nats_client.subscribe_core(
+            _HEARTBEAT_WILDCARD,
+            self._handle_heartbeat,
+        )
+        logger.info(
+            "HeartbeatWatcher subscribed on %s (%d expected agents, "
+            "staleness=%ds, check_interval=%ds, grace=%.1fx)",
+            _HEARTBEAT_WILDCARD,
+            len(self._heartbeat_agents),
+            self._staleness_threshold,
+            self._check_interval,
+            self._grace_multiplier,
+        )
+
+    async def run(self) -> None:
+        """Main staleness check loop. Call as an asyncio task after :meth:`start`."""
+        logger.info(
+            "HeartbeatWatcher loop started (check_interval=%ds)",
+            self._check_interval,
+        )
+        while True:
+            await asyncio.sleep(self._check_interval)
+            try:
+                await self._check_staleness()
+            except Exception:
+                logger.exception("HeartbeatWatcher check failed")
+
+    # ------------------------------------------------------------------
+    # Subscription callback
+    # ------------------------------------------------------------------
+
+    async def _handle_heartbeat(self, msg: Any) -> None:
+        """Record an incoming heartbeat's timestamp for the sending agent.
+
+        Tolerates malformed payloads and unexpected message types
+        gracefully — silent drop, no exception, no alert.
+        """
+        try:
+            payload = json.loads(msg.data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            return
+        if payload.get("type") != _MSG_TYPE_HEALTH_OK:
+            return
+        agent = payload.get("agent")
+        if not agent or not isinstance(agent, str):
+            return
+        self._last_heartbeat_seen[agent] = time.time()
+        # Clearing the alert bucket on heartbeat allows a subsequent
+        # outage to re-alert cleanly from bucket 1 again. Without
+        # this, the bucket would stay pinned at the last-alerted
+        # value until the orchestrator restarted.
+        if agent in self._last_alert_bucket:
+            del self._last_alert_bucket[agent]
+
+    # ------------------------------------------------------------------
+    # Staleness check
+    # ------------------------------------------------------------------
+
+    async def _check_staleness(self) -> None:
+        now = time.time()
+        for agent in self._heartbeat_agents:
+            await self._check_single_agent(agent, now)
+
+    async def _check_single_agent(self, agent: str, now: float) -> None:
+        last_seen = self._last_heartbeat_seen.get(agent)
+
+        if last_seen is None:
+            # Cold-start grace: if we have NEVER seen a heartbeat for
+            # this agent and the orchestrator is still inside the
+            # grace window, do not alert.
+            grace_deadline = (
+                self._boot_time
+                + (self._staleness_threshold * self._grace_multiplier)
+            )
+            if now < grace_deadline:
+                return
+            staleness = now - self._boot_time
+        else:
+            staleness = now - last_seen
+
+        if staleness < self._staleness_threshold:
+            # Heartbeat fresh — no alert needed. Bucket was already
+            # cleared by the heartbeat callback.
+            return
+
+        current_bucket = int(staleness // self._staleness_threshold)
+        last_bucket = self._last_alert_bucket.get(agent, 0)
+        if current_bucket <= last_bucket:
+            # Same bucket already alerted; wait for the next threshold
+            # multiple before re-alerting.
+            return
+
+        self._last_alert_bucket[agent] = current_bucket
+        await self._alert_unreachable(agent, last_seen, staleness, current_bucket)
+
+    async def _alert_unreachable(
+        self,
+        agent: str,
+        last_seen: Optional[float],
+        staleness: float,
+        bucket: int,
+    ) -> None:
+        last_seen_iso: Optional[str]
+        if last_seen is not None:
+            last_seen_iso = datetime.fromtimestamp(
+                last_seen, tz=timezone.utc,
+            ).isoformat(timespec="seconds")
+        else:
+            last_seen_iso = None
+
+        logger.warning(
+            "flag_human: heartbeat stale on agent %s — "
+            "last_seen=%s staleness=%ds threshold=%ds bucket=%d",
+            agent,
+            last_seen_iso or "never",
+            int(staleness),
+            self._staleness_threshold,
+            bucket,
+        )
+
+        directive = {
+            "type": _MSG_TYPE_MANAGER_DIRECTIVE,
+            "subtype": "hub_unreachable",
+            "agent": agent,
+            "last_heartbeat_seen": last_seen_iso,
+            "staleness_seconds": int(staleness),
+            "staleness_bucket": bucket,
+            "threshold_seconds": self._staleness_threshold,
+            "message": (
+                f"Watchdog flag: agent '{agent}' has not published a "
+                f"heartbeat on system.heartbeat.{agent} for "
+                f"{int(staleness)}s (threshold={self._staleness_threshold}s, "
+                f"bucket={bucket}). Last seen: "
+                f"{last_seen_iso or 'never since orchestrator boot'}. "
+                f"The bridge may be down, the OAuth credential may have "
+                f"expired, or the process itself may have died. "
+                f"Coordinate with dev/user to investigate and re-auth "
+                f"or restart."
+            ),
+            "priority": "high",
+        }
+        try:
+            await self._nats_client.publish_to_inbox("manager", directive)
+        except Exception:
+            logger.exception(
+                "Failed to publish hub_unreachable directive to manager",
+            )
 
 
 class InactivityAnnouncer:

@@ -30,6 +30,18 @@ const CHANNEL_OUTBOX = 'outbox';
 const STREAM_NAME = 'AGENTS';
 const OUTBOX_MESSAGE_TYPE = 'agent_complete';
 
+// Heartbeat (issue #32): publishes a periodic health signal via
+// core NATS to `system.heartbeat.<role>`. Lives outside the
+// `agents.>` JetStream wildcard so it is NOT stored in the AGENTS
+// stream — keeps the stream budget clean and the manager inbox
+// free of 1440 heartbeats/day. Missed heartbeats are the signal:
+// the orchestrator watchdog watches for staleness and emits a
+// `hub_unreachable` manager_directive when a heartbeat falls
+// behind `watchdog.hub_heartbeat_staleness_seconds`.
+const HEARTBEAT_SUBJECT_PREFIX = 'system.heartbeat';
+const HEARTBEAT_INTERVAL_MS = 60_000; // 60s — matches watchdog cadence expectation
+const HEARTBEAT_TYPE = 'health_ok';
+
 const TOOL_CHECK_MESSAGES = 'check_messages';
 const TOOL_SEND_MESSAGE = 'send_message';
 const TOOL_SEND_TO_AGENT = 'send_to_agent';
@@ -469,6 +481,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // Main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Heartbeat publisher (issue #32)
+// ---------------------------------------------------------------------------
+
+let heartbeatTimer = null;
+const bridgeStartMs = Date.now();
+
+async function publishHeartbeat() {
+  if (nc === null) {
+    return;
+  }
+  try {
+    const payload = {
+      type: HEARTBEAT_TYPE,
+      agent: agentRole,
+      ts: new Date().toISOString(),
+      bridge_pid: process.pid,
+      uptime_seconds: Math.floor((Date.now() - bridgeStartMs) / 1000),
+    };
+    const subject = `${HEARTBEAT_SUBJECT_PREFIX}.${agentRole}`;
+    nc.publish(subject, sc.encode(JSON.stringify(payload)));
+  } catch (err) {
+    process.stderr.write(
+      `[${new Date().toISOString()}] heartbeat publish failed: ${err.message}\n`,
+    );
+  }
+}
+
+function startHeartbeatPublisher() {
+  // Fire one heartbeat immediately so the watchdog doesn't have to wait
+  // a full interval to see this agent as healthy on boot.
+  publishHeartbeat();
+  heartbeatTimer = setInterval(publishHeartbeat, HEARTBEAT_INTERVAL_MS);
+  process.stderr.write(
+    `[${new Date().toISOString()}] Heartbeat publisher active on ${HEARTBEAT_SUBJECT_PREFIX}.${agentRole} (interval=${HEARTBEAT_INTERVAL_MS}ms)\n`,
+  );
+}
+
+function stopHeartbeatPublisher() {
+  if (heartbeatTimer !== null) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
 async function main() {
   await connectNats();
   const transport = new StdioServerTransport();
@@ -476,6 +533,10 @@ async function main() {
 
   // Start background inbox subscription (push notification channel)
   startInboxSubscription();
+
+  // Start heartbeat publisher (issue #32) — fire-and-forget signal
+  // that the bridge is alive and its NATS connection is healthy.
+  startHeartbeatPublisher();
 
   process.stderr.write(`MCP bridge ready for "${agentRole}"\n`);
 }

@@ -28,7 +28,7 @@ from orchestrator.lifecycle import TaskLifecycleManager
 from orchestrator.console import Console
 from orchestrator.logging_setup import setup_logging
 from orchestrator.session_report import SessionReport
-from orchestrator.watchdog import IdleWatchdog, InactivityAnnouncer
+from orchestrator.watchdog import HeartbeatWatcher, IdleWatchdog, InactivityAnnouncer
 from orchestrator.delivery import DeliveryProtocol
 
 # --- CLI ---
@@ -289,6 +289,22 @@ async def main():
         logger.info("Idle watchdog enabled")
     else:
         logger.info("Idle watchdog disabled (set watchdog.enabled: true to enable)")
+
+    # Heartbeat watcher — ephemeral system.heartbeat.<agent> staleness
+    # detector. Backfills the #28 hub-exclusion gap (issue #32).
+    heartbeat_cfg = watchdog_cfg.get("heartbeat_watcher", {})
+    if heartbeat_cfg.get("enabled", False):
+        heartbeat_watcher = HeartbeatWatcher(
+            nats_client=nats_client, config=component_config,
+        )
+        await heartbeat_watcher.start()
+        asyncio.create_task(heartbeat_watcher.run())
+        logger.info("Heartbeat watcher enabled")
+    else:
+        logger.info(
+            "Heartbeat watcher disabled "
+            "(set watchdog.heartbeat_watcher.enabled: true to enable)"
+        )
 
     # Inactivity announcer
     announcer_cfg = watchdog_cfg.get("inactivity_announcer", {})

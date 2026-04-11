@@ -254,6 +254,55 @@ class NatsClient:
         self._require_connected()
         await self._js.publish(subject, payload)
 
+    async def publish_core(self, subject: str, payload: bytes) -> None:
+        """Publish raw bytes to *subject* via core NATS (fire-and-forget).
+
+        Unlike :meth:`publish_raw`, this bypasses JetStream entirely —
+        no stream ack, no durable storage, no delivery guarantees.
+
+        Intended for ephemeral, loss-tolerant signals where missing a
+        message is acceptable and JetStream storage overhead would
+        be wasteful. Examples: periodic heartbeats (``system.heartbeat.*``),
+        routing probes, debug traces.
+
+        The target *subject* must NOT match a JetStream stream's
+        subject filter — the core-publish path is the point of using
+        this method in the first place. See #32 heartbeat infrastructure
+        for the canonical caller.
+
+        Raises:
+            NatsClientError: If not connected.
+        """
+        self._require_connected()
+        await self._conn.publish(subject, payload)
+
+    async def subscribe_core(
+        self,
+        subject: str,
+        callback: MessageCallback,
+    ) -> Any:
+        """Subscribe to *subject* via core NATS (push notifications).
+
+        Unlike :meth:`subscribe_to_outbox` / :meth:`subscribe_to_inbox`,
+        this is a plain core-NATS subscription with no durable consumer,
+        no JetStream ack tracking, and no redelivery on disconnect.
+        Messages missed while the subscriber is down are lost by design.
+
+        Intended for ephemeral signal subjects like ``system.heartbeat.*``
+        where the watchdog only cares about the *latest* observed state
+        and missed heartbeats turn into staleness naturally without
+        needing replay.
+
+        Returns:
+            The underlying ``nats.aio.subscription.Subscription`` object,
+            useful for ``unsubscribe()`` on shutdown.
+
+        Raises:
+            NatsClientError: If not connected.
+        """
+        self._require_connected()
+        return await self._conn.subscribe(subject, cb=callback)
+
     async def publish_all_done(self, summary: str) -> None:
         """Publish an ``all_done`` message to every agent's inbox.
 

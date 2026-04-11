@@ -21,10 +21,13 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from orchestrator.watchdog import (
+    HeartbeatWatcher,
     IdleWatchdog,
     _AUTH_ERROR_PATTERN,
     _DEFAULT_AUTH_SCAN_EXCLUDES,
     _DONE_PATTERNS,
+    _HEARTBEAT_SUBJECT_PREFIX,
+    _HEARTBEAT_WILDCARD,
 )
 
 
@@ -691,3 +694,266 @@ class TestCheckAuthFailures:
         assert "\n" not in matched
         assert "MCP error -32603:" in matched
         assert "Authentication failed" in matched
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat Watcher Tests (issue #32 — dev-agent self-health probe)
+# ---------------------------------------------------------------------------
+
+
+def _heartbeat_msg(agent: str, payload_type: str = "health_ok") -> MagicMock:
+    """Build a fake core-NATS message whose `.data` decodes to a
+    heartbeat JSON body for *agent*.
+    """
+    import json as _json
+    m = MagicMock()
+    body = {
+        "type": payload_type,
+        "agent": agent,
+        "ts": "2026-04-11T20:00:00+00:00",
+        "bridge_pid": 12345,
+        "uptime_seconds": 42,
+    }
+    m.data = _json.dumps(body).encode("utf-8")
+    return m
+
+
+class TestHeartbeatConstants:
+    def test_subject_prefix_outside_agents_wildcard(self):
+        """Heartbeat subjects must NOT match the `agents.>` JetStream
+        stream filter, otherwise every heartbeat would land in the
+        stream and hit the 10k-msg retention budget.
+        """
+        assert _HEARTBEAT_SUBJECT_PREFIX == "system.heartbeat"
+        assert not _HEARTBEAT_SUBJECT_PREFIX.startswith("agents.")
+        assert _HEARTBEAT_WILDCARD == "system.heartbeat.>"
+
+
+class TestHeartbeatWatcher:
+    @pytest.fixture
+    def hb_config(self):
+        return {
+            "watchdog": {
+                "heartbeat_agents": ["hub"],
+                "hub_heartbeat_staleness_seconds": 30,
+                "hub_heartbeat_check_interval_seconds": 5,
+                "hub_heartbeat_grace_multiplier": 2.0,
+            }
+        }
+
+    @pytest.fixture
+    def hb_nats(self):
+        nc = MagicMock()
+        nc.subscribe_core = AsyncMock(return_value=MagicMock())
+        nc.publish_to_inbox = AsyncMock()
+        return nc
+
+    @pytest.fixture
+    def watcher(self, hb_nats, hb_config):
+        return HeartbeatWatcher(nats_client=hb_nats, config=hb_config)
+
+    @pytest.mark.asyncio
+    async def test_start_subscribes_to_wildcard(self, watcher, hb_nats):
+        """start() subscribes to the `system.heartbeat.>` wildcard."""
+        await watcher.start()
+        hb_nats.subscribe_core.assert_called_once()
+        args = hb_nats.subscribe_core.call_args[0]
+        assert args[0] == "system.heartbeat.>"
+
+    @pytest.mark.asyncio
+    async def test_start_is_idempotent(self, watcher, hb_nats):
+        """Calling start() twice must not subscribe twice."""
+        await watcher.start()
+        await watcher.start()
+        assert hb_nats.subscribe_core.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_handle_heartbeat_records_timestamp(self, watcher):
+        await watcher._handle_heartbeat(_heartbeat_msg("hub"))
+        assert "hub" in watcher._last_heartbeat_seen
+        assert (
+            time.time() - watcher._last_heartbeat_seen["hub"] < 1.0
+        ), "last_heartbeat_seen should be ~now"
+
+    @pytest.mark.asyncio
+    async def test_handle_heartbeat_drops_malformed_json(self, watcher):
+        msg = MagicMock()
+        msg.data = b"{not valid json"
+        await watcher._handle_heartbeat(msg)
+        assert "hub" not in watcher._last_heartbeat_seen
+
+    @pytest.mark.asyncio
+    async def test_handle_heartbeat_drops_wrong_type(self, watcher):
+        await watcher._handle_heartbeat(_heartbeat_msg("hub", payload_type="other"))
+        assert "hub" not in watcher._last_heartbeat_seen
+
+    @pytest.mark.asyncio
+    async def test_handle_heartbeat_drops_missing_agent(self, watcher):
+        import json as _json
+        msg = MagicMock()
+        msg.data = _json.dumps({"type": "health_ok"}).encode("utf-8")
+        await watcher._handle_heartbeat(msg)
+        assert len(watcher._last_heartbeat_seen) == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeat_no_alert(self, watcher, hb_nats):
+        """A heartbeat within the staleness window does not alert."""
+        watcher._last_heartbeat_seen["hub"] = time.time()
+        await watcher._check_staleness()
+        hb_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_heartbeat_alerts(self, watcher, hb_nats):
+        """A heartbeat older than the threshold fires a hub_unreachable."""
+        watcher._last_heartbeat_seen["hub"] = time.time() - 35  # 5s past 30s threshold
+        await watcher._check_staleness()
+        hb_nats.publish_to_inbox.assert_called_once()
+        call = hb_nats.publish_to_inbox.call_args[0]
+        assert call[0] == "manager"
+        directive = call[1]
+        assert directive["type"] == "manager_directive"
+        assert directive["subtype"] == "hub_unreachable"
+        assert directive["agent"] == "hub"
+        assert directive["staleness_seconds"] >= 30
+        assert directive["threshold_seconds"] == 30
+        assert directive["staleness_bucket"] == 1
+        assert "last_heartbeat_seen" in directive
+        assert directive["priority"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_suppression_same_bucket_no_realert(self, watcher, hb_nats):
+        """Two consecutive check_staleness calls inside the same bucket
+        produce exactly one directive, not two.
+        """
+        watcher._last_heartbeat_seen["hub"] = time.time() - 35
+        await watcher._check_staleness()
+        await watcher._check_staleness()
+        assert hb_nats.publish_to_inbox.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_suppression_next_bucket_realerts(self, watcher, hb_nats):
+        """Crossing into the next threshold-multiple bucket fires again."""
+        # Bucket 1: 30-59s stale
+        watcher._last_heartbeat_seen["hub"] = time.time() - 35
+        await watcher._check_staleness()
+        assert hb_nats.publish_to_inbox.call_count == 1
+        # Rewind last_seen to push us into bucket 2 (60-89s stale)
+        watcher._last_heartbeat_seen["hub"] = time.time() - 65
+        await watcher._check_staleness()
+        assert hb_nats.publish_to_inbox.call_count == 2
+        # Second directive has bucket=2
+        second = hb_nats.publish_to_inbox.call_args_list[1][0][1]
+        assert second["staleness_bucket"] == 2
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeat_clears_suppression(self, watcher, hb_nats):
+        """After alerting, a fresh heartbeat must clear the suppression
+        bucket so the NEXT outage can alert from bucket 1 again.
+        """
+        watcher._last_heartbeat_seen["hub"] = time.time() - 35
+        await watcher._check_staleness()
+        assert hb_nats.publish_to_inbox.call_count == 1
+
+        # Fresh heartbeat arrives — should clear bucket
+        await watcher._handle_heartbeat(_heartbeat_msg("hub"))
+        assert "hub" not in watcher._last_alert_bucket
+
+        # New outage — bucket 1 re-alerts
+        watcher._last_heartbeat_seen["hub"] = time.time() - 35
+        await watcher._check_staleness()
+        assert hb_nats.publish_to_inbox.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cold_start_grace_suppresses_early_alerts(
+        self, watcher, hb_nats,
+    ):
+        """When no heartbeat has ever been seen AND the orchestrator is
+        younger than grace_multiplier * threshold, do NOT alert.
+        Prevents spurious hub_unreachable at fresh-boot.
+        """
+        # Simulate a fresh boot — boot_time very recent
+        watcher._boot_time = time.time() - 10  # 10s since boot
+        await watcher._check_staleness()
+        hb_nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cold_start_grace_expires_and_alerts(
+        self, watcher, hb_nats,
+    ):
+        """After grace_multiplier * threshold has elapsed with no heartbeat
+        ever seen, the watcher fires a hub_unreachable with
+        last_heartbeat_seen = None.
+        """
+        # Simulate boot time past the grace window: grace = 2.0 * 30s = 60s
+        watcher._boot_time = time.time() - 120  # 2 minutes since boot
+        await watcher._check_staleness()
+        hb_nats.publish_to_inbox.assert_called_once()
+        directive = hb_nats.publish_to_inbox.call_args[0][1]
+        assert directive["last_heartbeat_seen"] is None
+        assert "never since orchestrator boot" in directive["message"]
+
+    @pytest.mark.asyncio
+    async def test_config_overrides_defaults(self, hb_nats):
+        """Config values override all four knobs."""
+        cfg = {
+            "watchdog": {
+                "heartbeat_agents": ["hub", "dgx"],
+                "hub_heartbeat_staleness_seconds": 600,
+                "hub_heartbeat_check_interval_seconds": 120,
+                "hub_heartbeat_grace_multiplier": 3.5,
+            }
+        }
+        w = HeartbeatWatcher(nats_client=hb_nats, config=cfg)
+        assert w._heartbeat_agents == ("hub", "dgx")
+        assert w._staleness_threshold == 600
+        assert w._check_interval == 120
+        assert w._grace_multiplier == 3.5
+
+    @pytest.mark.asyncio
+    async def test_defaults_when_config_missing(self, hb_nats):
+        """Constructor tolerates a fully empty config."""
+        w = HeartbeatWatcher(nats_client=hb_nats, config={})
+        assert w._heartbeat_agents == ("hub",)
+        assert w._staleness_threshold == 180
+        assert w._check_interval == 30
+        assert w._grace_multiplier == 2.0
+
+    @pytest.mark.asyncio
+    async def test_alert_inherits_envelope_via_publish_to_inbox(
+        self, watcher, hb_nats,
+    ):
+        """The watcher calls nats_client.publish_to_inbox directly — it
+        does NOT pre-wrap the envelope. The library is responsible for
+        adding message_id/timestamp/from (per #34 refactor). If a future
+        refactor makes the watcher build its own envelope, this test
+        catches it.
+        """
+        watcher._last_heartbeat_seen["hub"] = time.time() - 35
+        await watcher._check_staleness()
+        directive = hb_nats.publish_to_inbox.call_args[0][1]
+        assert "message_id" not in directive
+        assert "timestamp" not in directive
+        assert "from" not in directive
+
+    @pytest.mark.asyncio
+    async def test_multiple_heartbeat_agents_tracked_independently(
+        self, hb_nats,
+    ):
+        """When `heartbeat_agents` lists multiple agents, each has its
+        own last_seen / bucket state.
+        """
+        cfg = {
+            "watchdog": {
+                "heartbeat_agents": ["hub", "dgx"],
+                "hub_heartbeat_staleness_seconds": 30,
+                "hub_heartbeat_check_interval_seconds": 5,
+                "hub_heartbeat_grace_multiplier": 2.0,
+            }
+        }
+        w = HeartbeatWatcher(nats_client=hb_nats, config=cfg)
+        # hub is fresh, dgx is stale
+        w._last_heartbeat_seen["hub"] = time.time()
+        w._last_heartbeat_seen["dgx"] = time.time() - 35
+        await w._check_staleness()
+        hb_nats.publish_to_inbox.assert_called_once()
+        assert hb_nats.publish_to_inbox.call_args[0][1]["agent"] == "dgx"
