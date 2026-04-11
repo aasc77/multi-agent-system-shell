@@ -23,8 +23,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from orchestrator.watchdog import (
     IdleWatchdog,
     _AUTH_ERROR_PATTERN,
+    _CONTEXT_BEFORE_MAX_CHARS,
     _DEFAULT_AUTH_SCAN_EXCLUDES,
     _DONE_PATTERNS,
+    _MATCHED_LINE_MAX_CHARS,
+    _extract_full_line_and_context,
 )
 
 
@@ -691,3 +694,245 @@ class TestCheckAuthFailures:
         assert "\n" not in matched
         assert "MCP error -32603:" in matched
         assert "Authentication failed" in matched
+
+
+# ---------------------------------------------------------------------------
+# Full Physical Line Extraction Tests (issue #33)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFullLineAndContext:
+    """Unit tests for the `_extract_full_line_and_context` helper.
+
+    These tests drive the #33 behavior directly: they feed synthetic
+    pane captures into the helper and assert on the returned
+    (matched_line, context_before) tuple, without going through the
+    full `_check_agent_auth_failure` async path.
+    """
+
+    def _match(self, pane: str):
+        m = _AUTH_ERROR_PATTERN.search(pane)
+        assert m is not None, f"expected regex to match in pane: {pane!r}"
+        return m
+
+    def test_single_line_preserves_trailing_invalid_token(self):
+        """Default #28 test case — the trailing `: Invalid token`
+        suffix was being dropped by `match.group(0)`. After #33 it
+        must be preserved in `matched_line`.
+        """
+        pane = (
+            "some earlier output\n"
+            "  ⎿  Error: MCP error -32603: Authentication failed: Invalid token\n"
+            "❯ \n"
+        )
+        matched, ctx = _extract_full_line_and_context(pane, self._match(pane))
+        assert "MCP error -32603:" in matched
+        assert "Authentication failed" in matched
+        assert "Invalid token" in matched, (
+            f"trailing `: Invalid token` must survive #33 extraction, "
+            f"got: {matched!r}"
+        )
+
+    def test_single_line_preserves_trailing_expired_jwt_context(self):
+        """Real-world variant — operators might see richer trailing
+        context like `: expired JWT` or `: revoked by admin`. Those
+        must all survive the extraction.
+        """
+        pane = (
+            "  ⎿  Error: MCP error -32603: Authentication failed: "
+            "token expired 2h ago, see https://example/re-auth\n"
+            "❯ \n"
+        )
+        matched, _ = _extract_full_line_and_context(pane, self._match(pane))
+        assert "token expired 2h ago" in matched
+        assert "https://example/re-auth" in matched
+
+    def test_wrapped_line_at_52_cols_returns_full_content(self):
+        """Narrow-pane wrap case — `MCP error -32603: Authentication
+        failed: Invalid token` gets split across two visual lines at
+        ~52 col width. The match span crosses the `\\n`, so extraction
+        must walk backward to the prior `\\n` AND forward to the next
+        `\\n` to capture both visual lines, then collapse the embedded
+        newline into a space.
+        """
+        pane = (
+            "prior line\n"
+            "  ⎿  Error: MCP error -32603:\n"
+            "     Authentication failed: Invalid token\n"
+            "❯ \n"
+        )
+        matched, _ = _extract_full_line_and_context(pane, self._match(pane))
+        assert "\n" not in matched
+        assert "MCP error -32603:" in matched
+        assert "Authentication failed" in matched
+        assert "Invalid token" in matched
+
+    def test_context_before_captured_when_error_on_its_own_line(self):
+        """Claude's tool output sometimes renders `⎿ Error:` on one
+        line and the actual error payload on the next. `context_before`
+        should capture the preceding physical line so operators get
+        the rendering context.
+        """
+        pane = (
+            "  ⎿  Error:\n"
+            "     MCP error -32603: Authentication failed: Invalid token\n"
+            "❯ \n"
+        )
+        matched, ctx = _extract_full_line_and_context(pane, self._match(pane))
+        assert "MCP error -32603" in matched
+        assert "Error:" in ctx, (
+            f"preceding line should be captured as context_before, "
+            f"got ctx={ctx!r}"
+        )
+
+    def test_context_before_empty_when_match_on_first_line(self):
+        """If the match is on the first physical line of the capture,
+        there is no preceding line to capture — context_before must
+        be an empty string, not None or a bogus substring.
+        """
+        pane = "MCP error -32603: Authentication failed: Invalid token\n"
+        matched, ctx = _extract_full_line_and_context(pane, self._match(pane))
+        assert "MCP error -32603" in matched
+        assert ctx == ""
+
+    def test_context_before_empty_when_match_at_pane_start_no_newline(self):
+        """Pane has no newline before the match at all (single-line
+        capture). context_before should be empty.
+        """
+        pane = "MCP error -32603: Authentication failed: Invalid token"
+        matched, ctx = _extract_full_line_and_context(pane, self._match(pane))
+        assert matched == (
+            "MCP error -32603: Authentication failed: Invalid token"
+        )
+        assert ctx == ""
+
+    def test_matched_line_capped_at_max_chars(self):
+        """Defensive: a pathologically long pane line should be
+        truncated to `_MATCHED_LINE_MAX_CHARS` (with an ellipsis
+        suffix) so directive payloads don't balloon on garbage input.
+        """
+        long_suffix = "x" * 2000
+        pane = (
+            f"  ⎿  Error: MCP error -32603: Authentication failed: {long_suffix}\n"
+        )
+        matched, _ = _extract_full_line_and_context(pane, self._match(pane))
+        assert len(matched) <= _MATCHED_LINE_MAX_CHARS
+        assert matched.endswith("...")
+        # The leading MCP prefix must still be present — we truncate
+        # from the tail, not the head.
+        assert matched.startswith("⎿ Error: MCP error -32603") or (
+            "MCP error -32603:" in matched
+        )
+
+    def test_context_before_capped_at_max_chars(self):
+        """Same cap rule for `context_before`."""
+        long_context = "y" * 500
+        pane = (
+            f"  ⎿  {long_context}\n"
+            "     MCP error -32603: Authentication failed: Invalid token\n"
+        )
+        _, ctx = _extract_full_line_and_context(pane, self._match(pane))
+        assert len(ctx) <= _CONTEXT_BEFORE_MAX_CHARS
+        assert ctx.endswith("...")
+
+    def test_collapsed_whitespace_single_spaces(self):
+        """Multiple consecutive spaces within a matched line should
+        collapse to single spaces (same behavior as the original
+        `" ".join(raw.split())` normalization).
+        """
+        pane = (
+            "  ⎿  Error:    MCP error -32603:     Authentication failed\n"
+        )
+        matched, _ = _extract_full_line_and_context(pane, self._match(pane))
+        assert "  " not in matched, (
+            f"consecutive spaces should be collapsed, got: {matched!r}"
+        )
+
+
+class TestCheckAuthFailuresContextBefore:
+    """Integration-style tests that drive #33 through the full
+    `_check_agent_auth_failure` publish path and verify the directive
+    payload carries both `matched_line` (with full trailing context)
+    and `context_before` (when available).
+    """
+
+    @pytest.fixture
+    def auth_tmux(self, mock_tmux):
+        mock_tmux.get_pane_mapping = MagicMock(
+            return_value={"hub": 0, "RTX5090": 4},
+        )
+        mock_tmux.capture_pane = MagicMock(return_value="❯ \n")
+        return mock_tmux
+
+    @pytest.fixture
+    def auth_watchdog(
+        self, mock_lifecycle, mock_state_machine, mock_nats,
+        auth_tmux, mock_task_queue, config,
+    ):
+        return IdleWatchdog(
+            lifecycle=mock_lifecycle,
+            state_machine=mock_state_machine,
+            nats_client=mock_nats,
+            tmux_comm=auth_tmux,
+            config=config,
+            task_queue=mock_task_queue,
+        )
+
+    @pytest.mark.asyncio
+    async def test_directive_carries_full_trailing_context(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """The published directive's matched_line must contain the
+        full trailing context (`: Invalid token`), not the truncated
+        `match.group(0)` form that #28 originally shipped.
+        """
+        pane = (
+            "  ⎿  Error: MCP error -32603: Authentication failed: Invalid token\n"
+            "❯ \n"
+        )
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            pane if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        mock_nats.publish_to_inbox.assert_called_once()
+        directive = mock_nats.publish_to_inbox.call_args[0][1]
+        assert "MCP error -32603:" in directive["matched_line"]
+        assert "Authentication failed" in directive["matched_line"]
+        assert "Invalid token" in directive["matched_line"]
+
+    @pytest.mark.asyncio
+    async def test_directive_populates_context_before(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """When the match is preceded by a physical pane line, the
+        directive must include it in `context_before` so operators
+        can see the surrounding tool-output rendering.
+        """
+        pane = (
+            "  ⎿  Error:\n"
+            "     MCP error -32603: Authentication failed: Invalid token\n"
+            "❯ \n"
+        )
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            pane if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        directive = mock_nats.publish_to_inbox.call_args[0][1]
+        assert "context_before" in directive
+        assert "Error:" in directive["context_before"]
+
+    @pytest.mark.asyncio
+    async def test_directive_context_before_empty_when_no_prior_line(
+        self, auth_watchdog, auth_tmux, mock_nats,
+    ):
+        """When the match is the first line of the pane, context_before
+        is present as an empty string (schema stability for consumers).
+        """
+        pane = "MCP error -32603: Authentication failed: Invalid token\n"
+        auth_tmux.capture_pane.side_effect = lambda agent, lines: (
+            pane if agent == "RTX5090" else "❯ \n"
+        )
+        await auth_watchdog._check_auth_failures()
+        directive = mock_nats.publish_to_inbox.call_args[0][1]
+        assert "context_before" in directive
+        assert directive["context_before"] == ""

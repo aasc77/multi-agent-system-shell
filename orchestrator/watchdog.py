@@ -74,6 +74,76 @@ _AUTH_ERROR_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Field length caps for the directive payload (#33). Prevents an
+# unusually long pane line from ballooning the manager_directive
+# beyond what is reasonable to log and route.
+_MATCHED_LINE_MAX_CHARS = 512
+_CONTEXT_BEFORE_MAX_CHARS = 256
+
+
+def _extract_full_line_and_context(
+    pane: str, match: re.Match,
+) -> tuple[str, str]:
+    """Return ``(matched_line, context_before)`` for a regex match
+    against a tmux pane capture.
+
+    - ``matched_line`` is the full physical line (or lines, if the
+      match span crosses tmux word-wrap boundaries) containing the
+      match. Any embedded newlines within the matched range are
+      collapsed into single spaces so the directive body and log
+      line stay readable on one row. Capped at
+      :data:`_MATCHED_LINE_MAX_CHARS`.
+    - ``context_before`` is the immediately preceding physical line
+      (collapsed the same way), or empty string if the match is on
+      the first line of the capture. Capped at
+      :data:`_CONTEXT_BEFORE_MAX_CHARS`. Useful when claude's tool
+      output renders ``⎿  Error:`` on one line and the actual error
+      payload on the next.
+
+    Replaces the original #28 behavior which used
+    ``match.group(0)`` and therefore truncated at the regex's
+    alternative boundary, losing trailing diagnostic context like
+    ``: Invalid token``, ``: expired JWT``, ``: revoked by admin``.
+    Tracked as issue #33.
+    """
+    start = match.start()
+    end = match.end()
+
+    # Walk backward from `start` to the previous newline (or the
+    # start of the pane) to find the start of the physical line
+    # that contains (or opens) the match span.
+    prev_nl = pane.rfind("\n", 0, start)
+    line_start = 0 if prev_nl == -1 else prev_nl + 1
+
+    # Walk forward from `end` to the next newline (or the end of
+    # the pane) to find the end of the physical line that contains
+    # (or closes) the match span.
+    next_nl = pane.find("\n", end)
+    line_end = len(pane) if next_nl == -1 else next_nl
+
+    raw_match_region = pane[line_start:line_end]
+    matched_line = " ".join(raw_match_region.split())
+    if len(matched_line) > _MATCHED_LINE_MAX_CHARS:
+        matched_line = matched_line[: _MATCHED_LINE_MAX_CHARS - 3] + "..."
+
+    # Find the physical line immediately before `line_start`, if any.
+    context_before = ""
+    if line_start > 0:
+        # `line_start` is the char index right after the previous
+        # newline. Walk back to find the newline that starts the
+        # previous physical line (or treat the start of the pane
+        # as the boundary).
+        prior_end = line_start - 1  # index of the newline at the end of the previous line
+        prior_nl = pane.rfind("\n", 0, prior_end)
+        prior_start = 0 if prior_nl == -1 else prior_nl + 1
+        context_before = " ".join(pane[prior_start:prior_end].split())
+        if len(context_before) > _CONTEXT_BEFORE_MAX_CHARS:
+            context_before = (
+                context_before[: _CONTEXT_BEFORE_MAX_CHARS - 3] + "..."
+            )
+
+    return matched_line, context_before
+
 # Agents excluded by default from auth-failure pane scanning. Manager
 # is already excluded via the role=monitor filter in TmuxComm's pane
 # mapping, but we list it here as well so removing the monitor role
@@ -356,10 +426,13 @@ class IdleWatchdog:
         if match is None:
             return
 
-        # Report the full matched span, collapsing any tmux word-wrap
-        # line breaks that fell inside the match into single spaces so
-        # the directive/log line is readable on one line.
-        matched_line = " ".join(match.group(0).split())
+        # Extract the FULL physical line containing the match, plus the
+        # immediately preceding line for context. Replaces the original
+        # #28 behavior of reporting `match.group(0)` which truncated at
+        # the regex alternative boundary and dropped trailing
+        # diagnostic context (e.g. `: Invalid token`, `: expired JWT`).
+        # See issue #33.
+        matched_line, context_before = _extract_full_line_and_context(pane, match)
         if not matched_line:
             return
 
@@ -392,6 +465,7 @@ class IdleWatchdog:
             "subtype": "auth_failure",
             "agent": agent,
             "matched_line": matched_line,
+            "context_before": context_before,
             "message": (
                 f"Watchdog flag: agent '{agent}' is hitting MCP auth failures "
                 f"({matched_line!r}). Coordinate with dev/user to re-auth the "
