@@ -146,6 +146,13 @@ def build_version_response(info: StartupInfo) -> dict[str, Any]:
     ``jq``. Future fields can be added without breaking callers, but
     existing fields should not be renamed or removed without a
     deprecation cycle.
+
+    Schema stability contract (DO NOT RENAME OR REMOVE without a
+    deprecation cycle): the four fields below are consumed by the
+    bash wrapper with ``jq -r '.<field>'``. Adding a new field is
+    safe. Renaming or removing any of ``startup_sha``,
+    ``startup_sha_full``, ``started_at``, ``pid`` will break
+    operator tooling silently.
     """
     return {
         "startup_sha": info.startup_sha,

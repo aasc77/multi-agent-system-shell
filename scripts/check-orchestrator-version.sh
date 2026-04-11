@@ -91,18 +91,28 @@ if [ "$running_sha_full" = "$disk_sha_full" ]; then
 fi
 
 # Drift detected. Count commits between the two SHAs so operators
-# get a one-line signal of how far the binary is behind (or ahead).
+# get a one-line signal of how far the binary is behind or ahead.
 # Best-effort — if either SHA isn't in the local history, skip the
 # delta and just report the mismatch.
-delta_ahead=""
+#
+# Symmetric check: running could be behind (typical case — orchestrator
+# launched before the new commit) OR ahead (rarer — operator rolled
+# disk back via reset or force-pushed a different branch). Both paths
+# emit a clean delta string.
+delta=""
 if git -C "$REPO_ROOT" merge-base --is-ancestor "$running_sha_full" "$disk_sha_full" 2>/dev/null; then
     commits_behind=$(git -C "$REPO_ROOT" rev-list --count "${running_sha_full}..${disk_sha_full}" 2>/dev/null)
     if [ -n "$commits_behind" ] && [ "$commits_behind" -gt 0 ] 2>/dev/null; then
-        delta_ahead=" (${commits_behind} commits behind)"
+        delta=" (${commits_behind} commits behind)"
+    fi
+elif git -C "$REPO_ROOT" merge-base --is-ancestor "$disk_sha_full" "$running_sha_full" 2>/dev/null; then
+    commits_ahead=$(git -C "$REPO_ROOT" rev-list --count "${disk_sha_full}..${running_sha_full}" 2>/dev/null)
+    if [ -n "$commits_ahead" ] && [ "$commits_ahead" -gt 0 ] 2>/dev/null; then
+        delta=" (${commits_ahead} commits ahead of disk)"
     fi
 fi
 
-echo "✗ DRIFT: orchestrator pid=${running_pid} running ${running_sha}, disk HEAD ${disk_sha}${delta_ahead}"
+echo "✗ DRIFT: orchestrator pid=${running_pid} running ${running_sha}, disk HEAD ${disk_sha}${delta}"
 echo "  running:  ${running_sha_full}"
 echo "  on disk:  ${disk_sha_full}"
 echo "  booted:   ${started_at}"
