@@ -210,6 +210,13 @@ class NatsClient:
         Fields added if missing: ``message_id``, ``timestamp``, ``from``.
         Caller-set values are preserved. The original dict is never
         mutated so callers can safely reuse it across publish calls.
+
+        Shallow-copy caveat: the envelope fields are all top-level scalars
+        (strings), so a shallow ``dict(message)`` is sufficient to keep
+        the caller's dict isolated from our mutations. Do NOT mutate
+        nested containers on *enveloped* — any nested dict/list is still
+        shared with the caller via reference, and in-place edits there
+        would propagate back to the caller and silently break fanout.
         """
         enveloped = dict(message)
         if not enveloped.get("message_id"):

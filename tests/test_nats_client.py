@@ -425,6 +425,51 @@ class TestEnvelopeWrapping:
                 )
 
     @pytest.mark.asyncio
+    async def test_publish_all_done_gives_distinct_message_ids_per_recipient(
+        self, nats_config,
+    ):
+        """publish_all_done reuses the same body dict across recipients
+        (loops `for role in self._agents`). Without the no-mutation
+        guarantee on _envelope_wrap, recipient 2+ would inherit
+        recipient 1's message_id and the bridge dedup would collapse
+        them on delivery. This test directly wires the real fanout
+        caller path and asserts each recipient gets a distinct id.
+        """
+        multi_agent_config = {
+            "hub": {"runtime": "claude_code"},
+            "macmini": {"runtime": "claude_code"},
+            "dgx": {"runtime": "claude_code"},
+            "dgx2": {"runtime": "claude_code"},
+        }
+        client = NatsClient(config=nats_config, agents=multi_agent_config)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            await client.publish_all_done("shutdown summary")
+
+            assert mock_js.publish.call_count == len(multi_agent_config)
+            ids = []
+            subjects = []
+            for call in mock_js.publish.call_args_list:
+                subjects.append(call[0][0])
+                payload = call[0][1]
+                parsed = json.loads(payload)
+                ids.append(parsed["message_id"])
+            # Every recipient got a distinct message_id — no fanout collapse.
+            assert len(set(ids)) == len(ids), (
+                f"fanout produced duplicate message_ids: {ids}"
+            )
+            # Every recipient got their own subject.
+            expected_subjects = {
+                f"agents.{role}.inbox" for role in multi_agent_config
+            }
+            assert set(subjects) == expected_subjects
+
+    @pytest.mark.asyncio
     async def test_envelope_timestamp_is_iso8601_tzaware(
         self, nats_config, agents,
     ):

@@ -377,6 +377,16 @@ class IdleWatchdog:
 
         # Envelope fields (message_id, timestamp, from) are filled in
         # automatically by NatsClient._envelope_wrap(). See #34.
+        #
+        # #28 originally generated a deterministic message_id keyed on
+        # (agent, matched_line) so that identical re-observations
+        # within the bridge cooldown would collapse by id. #34 drops
+        # that: the watchdog's own `_last_auth_alert` / `_last_auth_match`
+        # suppression (15 min keyed on matched_line) is the primary
+        # dedup path and is unit-tested. If a suppression bug ever
+        # produced duplicate publishes, the smoke test's observed-count
+        # check would catch it and we could restore deterministic id
+        # generation as a targeted patch.
         directive = {
             "type": _MSG_TYPE_MANAGER_DIRECTIVE,
             "subtype": "auth_failure",
