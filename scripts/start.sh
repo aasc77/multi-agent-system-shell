@@ -393,6 +393,18 @@ ensure_clean_session() {
         tmux_cmd kill-session -t "$SESSION_NAME"
     fi
 
+    # If tmux-continuum is configured to auto-restore, its "last" symlink
+    # would re-inflate the previous snapshot (ghost panes, stale grouped
+    # sessions) on top of the fresh session we're building. Move the
+    # symlink aside so continuum's restore is a no-op for this run. The
+    # timestamped archive files are untouched so prior snapshots are
+    # still recoverable if needed.
+    for resurrect_last in "$HOME/.local/share/tmux/resurrect/last" "$HOME/.tmux/resurrect/last"; do
+        if [ -L "$resurrect_last" ]; then
+            mv "$resurrect_last" "${resurrect_last}.pre-start-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        fi
+    done
+
     echo "Creating new tmux session '$SESSION_NAME'..."
     tmux_cmd new-session -d -s "$SESSION_NAME" -n "$CONTROL_WINDOW" -x 200 -y 50
     tmux_cmd set-option -g pane-border-status top
@@ -546,12 +558,26 @@ tmux_cmd new-window -t "$SESSION_NAME" -n "$AGENTS_WINDOW"
 
 # Extract per-agent details in a single Python call to avoid N+1 invocations.
 # Output format: one JSON object per line, each containing agent config fields.
+# Agents are emitted in TMUX_PANE_ORDER so the 2x3 agents window grid shows:
+#   row 1: hub (dev)    macmini (qa)
+#   row 2: hassio       RTX5090
+#   row 3: dgx (dgx1)   dgx2
+# Agents not in the priority list are appended at the end in config order.
 AGENT_DETAILS=$(_ROOT_DIR="$ROOT_DIR" python3 -c "
 import json, sys, os
 
+TMUX_PANE_ORDER = ['hub', 'macmini', 'hassio', 'RTX5090', 'dgx', 'dgx2']
+
 root_dir = os.environ.get('_ROOT_DIR', '.')
 agents = json.loads(sys.stdin.read())
-for name, cfg in agents.items():
+
+# Reorder: priority list first (preserving its order), then any remaining
+# agents in their original config order.
+ordered_names = [n for n in TMUX_PANE_ORDER if n in agents]
+ordered_names += [n for n in agents if n not in TMUX_PANE_ORDER]
+
+for name in ordered_names:
+    cfg = agents[name]
     wd = cfg.get('working_dir', '')
     # Resolve relative paths against root_dir
     if wd and not os.path.isabs(wd):
@@ -634,7 +660,16 @@ build_launch_command() {
 setup_agent_panes() {
     # Create one tmux pane per agent in the agents window, set pane
     # titles, and send the appropriate launch command to each pane.
+    #
+    # Layout: 2-column row-major grid (6 agents → 3 rows × 2 cols).
+    # We track pane IDs (e.g. %5) instead of indices because tmux renumbers
+    # indices when you split a non-last pane, and stale indices would land
+    # labels/send-keys on the wrong pane.
     local pane_idx=0
+    local pane_ids=()  # parallel array: pane_ids[N] = tmux pane_id for grid cell N
+
+    # Seed pane_ids[0] with the already-existing first pane of AGENTS_WINDOW.
+    pane_ids[0]=$(tmux display-message -p -t "${SESSION_NAME}:${AGENTS_WINDOW}.0" '#{pane_id}')
 
     while IFS= read -r agent_line; do
         [ -z "$agent_line" ] && continue
@@ -656,10 +691,27 @@ setup_agent_panes() {
         remote_node_path=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['remote_node_path'])")
         label=$(echo "$agent_line" | python3 -c "import json,sys; print(json.load(sys.stdin)['label'])")
 
-        # Create additional panes (first pane already exists with new-window)
-        if [ "$pane_idx" -gt 0 ]; then
-            tmux_cmd split-window -t "${SESSION_NAME}:${AGENTS_WINDOW}"
-            tmux_cmd select-layout -t "${SESSION_NAME}:${AGENTS_WINDOW}" tiled
+        # Create additional panes in a 2-column row-major grid:
+        #   cell 0: already exists (from new-window)                  → top-left
+        #   cell 1: split cell 0 horizontally                         → top-right
+        #   cell N ≥ 2: split cell (N-2) vertically                  → next row, same column
+        # Result for 6 agents:
+        #   row 1: 0 | 1
+        #   row 2: 2 | 3
+        #   row 3: 4 | 5
+        # Each split captures the new pane's id via `-P -F '#{pane_id}'`
+        # and stores it in pane_ids[N], so subsequent label/send-keys
+        # target the right pane regardless of tmux index renumbering.
+        local target_id=""
+        if [ "$pane_idx" -eq 1 ]; then
+            target_id=$(tmux_cmd split-window -h -P -F '#{pane_id}' -t "${pane_ids[0]}")
+            pane_ids[1]="$target_id"
+        elif [ "$pane_idx" -ge 2 ]; then
+            local parent_idx=$((pane_idx - 2))
+            target_id=$(tmux_cmd split-window -v -P -F '#{pane_id}' -t "${pane_ids[$parent_idx]}")
+            pane_ids[$pane_idx]="$target_id"
+        else
+            target_id="${pane_ids[0]}"
         fi
 
         local launch_cmd
@@ -675,13 +727,13 @@ setup_agent_panes() {
         else
             pane_title="$name (local)"
         fi
-        tmux_cmd set-option -p -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" @label "$pane_title"
+        tmux_cmd set-option -p -t "${target_id}" @label "$pane_title"
 
         # Pre-check connectivity for remote agents
         if [ -n "$ssh_host" ] && [ "$DRY_RUN" != "true" ]; then
             if ! ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -n "$ssh_host" "echo ok" &>/dev/null; then
                 echo "WARNING: Agent '${name}' -- cannot reach ${ssh_host} (connection timed out or refused)" >&2
-                tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" \
+                tmux_cmd send-keys -t "${target_id}" \
                     "echo 'ERROR: Cannot reach ${ssh_host} -- check IP address and network connectivity'" Enter
                 pane_idx=$((pane_idx + 1))
                 continue
@@ -692,17 +744,18 @@ setup_agent_panes() {
         if [ -n "$ssh_host" ]; then
             local launch_script="/tmp/mas-launch-${name}.sh"
             echo "$launch_cmd" > "$launch_script"
-            tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" \
+            tmux_cmd send-keys -t "${target_id}" \
                 "bash ${SCRIPT_DIR}/ssh-reconnect.sh ${name}" Enter
         else
-            tmux_cmd send-keys -t "${SESSION_NAME}:${AGENTS_WINDOW}.${pane_idx}" "$launch_cmd" Enter
+            tmux_cmd send-keys -t "${target_id}" "$launch_cmd" Enter
         fi
 
         pane_idx=$((pane_idx + 1))
     done <<< "$AGENT_DETAILS"
 
-    # Final tiled layout pass for even distribution
-    tmux_cmd select-layout -t "${SESSION_NAME}:${AGENTS_WINDOW}" tiled
+    # Equalize row heights and column widths in the 2x3 grid without
+    # collapsing it into tiled (which would flip us back to 3x2 for 6 panes).
+    tmux_cmd select-layout -t "${SESSION_NAME}:${AGENTS_WINDOW}" -E
 }
 
 setup_agent_panes
@@ -731,6 +784,14 @@ fi
 # -t <group>: join the group so windows are shared with the primary
 # -----------------------------------------------------------------------
 TMUX_BIN="$(command -v tmux)"
+
+# Kill stale grouped sessions that tmux-resurrect/continuum may have restored.
+# Without this, `new-session -A` below would attach to the restored (empty)
+# session instead of creating a fresh one grouped with ${SESSION_NAME},
+# producing ghost windows with bare zsh panes instead of the real workload.
+"${TMUX_BIN}" kill-session -t "${SESSION_NAME}-control" 2>/dev/null || true
+"${TMUX_BIN}" kill-session -t "${SESSION_NAME}-agents"  2>/dev/null || true
+
 TMUX_CMD_CONTROL="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-control -t ${SESSION_NAME} \; select-window -t ${CONTROL_WINDOW}"
 TMUX_CMD_AGENTS="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-agents -t ${SESSION_NAME} \; select-window -t ${AGENTS_WINDOW}"
 
