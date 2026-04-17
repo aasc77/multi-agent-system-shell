@@ -118,6 +118,10 @@ You have the same MCP bridge as other agents:
 - **Speaker service**: `send_to_agent(target_agent="speaker", message="text")` -- speaks text on home speakers in the sender's assigned voice.
 - **Voice call service**: `send_to_agent(target_agent="voicecall", message="text")` -- calls the user's phone and speaks the text via Twilio TTS.
 
+## Shutdown
+
+When the user says they want to reboot, shut down, or otherwise bring everything to a clean stop, invoke the `shutdown-mas` skill. It stops every active MAS tmux session via `stop.sh --kill-nats`, kills the tmux server, and reaps straggler processes (knowledge indexer, speaker, thermostat, ssh-reconnect loops, local claude). Remote agents on macmini / dgx / dgx2 / RTX5090 / hassio don't need any action — SSH disconnect drops their sessions automatically.
+
 ## Starting Up
 
 When you first launch:
