@@ -31,6 +31,7 @@ from orchestrator.session_report import SessionReport
 from orchestrator.watchdog import IdleWatchdog, InactivityAnnouncer
 from orchestrator.delivery import DeliveryProtocol
 from orchestrator.activity_tracker import ActivityTracker
+from orchestrator.pane_state_cache import PaneStateCache
 from orchestrator.version import (
     capture_startup_info,
     make_version_request_handler,
@@ -188,10 +189,17 @@ nats_client = NatsClient(config=nats_config, agents=agents_dict)
 # tmux communicator
 tmux_comm = TmuxComm(component_config)
 
+# Shared per-agent pane-state cache (#9). Watchdog writes each
+# cycle (same place it populates its own local cache for the
+# #56 cycle log); DeliveryProtocol reads to gate retransmits
+# away from agents that are actively WORKING.
+pane_state_cache = PaneStateCache()
+
 # Delivery protocol (reliable nudge with ACK + retransmit)
 delivery = DeliveryProtocol(
     tmux_comm=tmux_comm,
     config=component_config,
+    pane_state_cache=pane_state_cache,
 )
 
 # Per-agent MCP activity tracker (#55). Wired to MessageRouter so
@@ -234,6 +242,7 @@ watchdog = IdleWatchdog(
     config=component_config,
     task_queue=task_queue,
     activity_tracker=activity_tracker,
+    pane_state_cache=pane_state_cache,
 )
 
 # Message router

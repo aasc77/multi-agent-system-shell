@@ -128,8 +128,16 @@ class DeliveryProtocol:
         self,
         tmux_comm: Any,
         config: dict[str, Any],
+        pane_state_cache: Any = None,
     ) -> None:
         self._tmux_comm = tmux_comm
+        # #9: optional shared pane-state cache. When present, a
+        # retransmit whose target is currently WORKING is deferred
+        # (without incrementing the attempt counter) so we don't
+        # interrupt an agent that is actively consuming the
+        # previous input. ``None`` preserves the pre-#9 behavior:
+        # nudge unconditionally.
+        self._pane_state_cache = pane_state_cache
 
         routing_cfg = config.get("routing", {})
         self._probe_interval: int = routing_cfg.get(
@@ -420,6 +428,32 @@ class DeliveryProtocol:
                 neighbor.last_state_change + _STARTUP_GRACE_PERIOD - now,
             )
             return
+
+        # #9: if the shared pane-state cache reports the recipient
+        # is actively rendering (WORKING), defer WITHOUT incrementing
+        # the attempt counter. This is not a missed nudge — the agent
+        # is mid-turn consuming the prior input. The retransmit clock
+        # keeps ticking; we'll recheck on the next process cycle.
+        #
+        # Other states pass through to the normal nudge path:
+        #   - IDLE           → nudge (❯ prompt visible, ready)
+        #   - UNKNOWN        → nudge (#42 directive already fired;
+        #                       may genuinely need wake-up)
+        #   - CAPTURE_FAILED → nudge (can't tell state; fall back
+        #                       to existing behavior)
+        #   - None           → nudge (cache hasn't seen this agent
+        #                       yet; fall back to existing behavior)
+        if self._pane_state_cache is not None:
+            try:
+                pane_state = self._pane_state_cache.get(neighbor.agent)
+            except Exception:
+                pane_state = None
+            if pane_state == "working":
+                logger.info(
+                    "NUDGE %s DEFER (pane WORKING) attempt=%d/%d",
+                    neighbor.agent, mb.attempt, self._max_attempts,
+                )
+                return
 
         # Send nudge
         try:
