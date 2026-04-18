@@ -468,6 +468,17 @@ class TmuxComm:
             return AgentPaneState.UNKNOWN
         return AgentPaneState.WORKING
 
+    def get_stale_cycle_count(self, agent: str) -> int:
+        """Return the number of consecutive stale cycles recorded for
+        *agent* by :meth:`get_pane_state`.
+
+        Used by the watchdog cycle log (#56) to show how long an
+        agent has been stuck. Pure read — does not mutate the
+        counter. Returns 0 for agents that have never gone stale or
+        that were most recently WORKING / IDLE.
+        """
+        return self._consecutive_stale_cycles.get(agent, 0)
+
     def is_agent_idle(self, agent: str) -> bool:
         """Return ``True`` if the agent's pane appears idle (at prompt).
 

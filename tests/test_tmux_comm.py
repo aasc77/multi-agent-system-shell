@@ -1434,6 +1434,48 @@ class TestIsAgentIdleBackcompat:
         )
 
 
+class TestGetStaleCycleCount:
+    """#56: `get_stale_cycle_count(agent)` exposes the debounce
+    counter used by `get_pane_state` without mutating it, so the
+    watchdog cycle log can show ``pane-stuck: dgx(N cycles)``
+    without re-computing any pane hashes.
+    """
+
+    def test_returns_zero_for_unknown_agent(self, comm):
+        assert comm.get_stale_cycle_count("never-seen") == 0
+
+    def test_returns_zero_after_working_reset(self, comm):
+        """Advancing through WORKING clears the counter."""
+        with patch.object(comm, "capture_pane",
+                          side_effect=["frame-a\n", "frame-b\n"]):
+            comm.get_pane_state("hub")  # first capture → WORKING (no prior)
+            comm.get_pane_state("hub")  # hash changed → WORKING
+        assert comm.get_stale_cycle_count("hub") == 0
+
+    def test_increments_as_pane_stays_stale(self, comm):
+        """The counter increments once per consecutive stale cycle."""
+        # No-prompt frame, repeated.
+        stale_frame = "Running a tool call...\n"
+        with patch.object(comm, "capture_pane", return_value=stale_frame):
+            comm.get_pane_state("hub")  # first capture → WORKING, counter 0
+            comm.get_pane_state("hub")  # stale 1 → WORKING, counter 1
+            comm.get_pane_state("hub")  # stale 2 → UNKNOWN, counter 2
+        assert comm.get_stale_cycle_count("hub") == 2
+
+    def test_read_is_non_mutating(self, comm):
+        """Reading via get_stale_cycle_count must NOT advance the
+        counter — otherwise the watchdog's log-format read path
+        would corrupt the #42 state machine."""
+        stale_frame = "Running a tool call...\n"
+        with patch.object(comm, "capture_pane", return_value=stale_frame):
+            comm.get_pane_state("hub")
+            comm.get_pane_state("hub")
+        before = comm.get_stale_cycle_count("hub")
+        comm.get_stale_cycle_count("hub")
+        comm.get_stale_cycle_count("hub")
+        assert comm.get_stale_cycle_count("hub") == before
+
+
 class TestStateTransitionTable:
     """Table-driven test covering a full state-machine walk:
     WORKING → IDLE → WORKING → stale×2 → UNKNOWN → recover → WORKING.

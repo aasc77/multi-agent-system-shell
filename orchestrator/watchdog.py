@@ -247,6 +247,16 @@ class IdleWatchdog:
         else:
             self._auth_scan_excludes = frozenset(configured_excludes)
 
+        # #56: last known pane-state per agent, populated during
+        # `_check_unknown_agents` so the next cycle's log line can
+        # surface the pane-active / pane-stuck signal without ever
+        # re-running the hash computation (#42 owns that). Keys are
+        # ``AgentPaneState.value`` strings (``working`` / ``idle`` /
+        # ``unknown`` / ``capture_failed``); empty dict == no signal
+        # yet, which preserves backward-compat on first cycle and
+        # on configs that never wire TmuxComm.
+        self._last_pane_state_by_agent: dict[str, str] = {}
+
         # Track last alert time per agent to avoid spam
         self._last_alert: dict[str, float] = {}
 
@@ -321,13 +331,56 @@ class IdleWatchdog:
             )
             parts.append(f"MCP-active: {mcp_active_str}")
 
-        # Idle = regular agents not in either block above.
+        # #56: pane-diff signals. The #42 machinery populates
+        # `_last_pane_state_by_agent` earlier in the cycle so we
+        # read it without re-computing. Agents in WORKING are
+        # pane-active (pane rendered something this cycle); agents
+        # in UNKNOWN are pane-stuck (hash unchanged for debounce
+        # cycles without an idle prompt); IDLE / CAPTURE_FAILED
+        # fall through to the residual idle block.
+        #
+        # Dual-reporting is intentional and matches the #72
+        # composite-log philosophy: an agent can be in the
+        # task-queue block AND pane-active. Per #44, an agent
+        # that is pane-stuck but ALSO has recent MCP activity is
+        # likely running a long blocking tool call — we surface
+        # both signals so the operator sees the context instead of
+        # silently suppressing one.
+        pane_active_agents: list[str] = []
+        pane_stuck_pairs: list[tuple[str, int]] = []
+        get_stale = getattr(self._tmux_comm, "get_stale_cycle_count", None)
+        for name in self._monitored_agents:
+            state = self._last_pane_state_by_agent.get(name)
+            if state == "working":
+                pane_active_agents.append(name)
+            elif state == "unknown":
+                cycles = 0
+                if callable(get_stale):
+                    try:
+                        cycles = int(get_stale(name)) or 0
+                    except Exception:
+                        cycles = 0
+                pane_stuck_pairs.append((name, cycles))
+        if pane_active_agents:
+            parts.append(f"pane-active: {' '.join(pane_active_agents)}")
+        if pane_stuck_pairs:
+            pane_stuck_str = " ".join(
+                f"{name}({cycles} cycles)" if cycles > 0 else name
+                for name, cycles in pane_stuck_pairs
+            )
+            parts.append(f"pane-stuck: {pane_stuck_str}")
+
+        # Idle = regular agents not in any active block above.
         assigned_names = {name for name, _ in active}
         mcp_active_names = {name for name, _ in mcp_active_pairs}
+        pane_active_names = set(pane_active_agents)
+        pane_stuck_names = {name for name, _ in pane_stuck_pairs}
         idle_agents = [
             name for name in self._monitored_agents
             if name not in assigned_names
             and name not in mcp_active_names
+            and name not in pane_active_names
+            and name not in pane_stuck_names
         ]
         if idle_agents:
             parts.append(f"idle: {' '.join(idle_agents)}")
@@ -341,6 +394,15 @@ class IdleWatchdog:
             await asyncio.sleep(self._check_interval)
             cycle += 1
             active = self._get_active_agents()
+            # #56: `_check_unknown_agents` owns the pane-hash
+            # computation (#42). Run it BEFORE the cycle log so
+            # `_format_cycle_log` can read the freshly-populated
+            # `_last_pane_state_by_agent` cache. Idle / auth
+            # checks stay after because they don't feed the log.
+            try:
+                await self._check_unknown_agents()
+            except Exception:
+                logger.exception("Unknown-state check failed")
             logger.info(self._format_cycle_log(cycle, active))
             try:
                 await self._check_idle_agents()
@@ -350,10 +412,6 @@ class IdleWatchdog:
                 await self._check_auth_failures()
             except Exception:
                 logger.exception("Auth-failure check failed")
-            try:
-                await self._check_unknown_agents()
-            except Exception:
-                logger.exception("Unknown-state check failed")
 
     async def handle_manager_response(self, message: dict[str, Any]) -> None:
         """Process a response from the manager about an idle alert.
@@ -649,6 +707,13 @@ class IdleWatchdog:
         # other sentinel objects without importing the enum. Real
         # code paths always receive `AgentPaneState` instances.
         state_value = getattr(state, "value", state)
+
+        # #56: cache the per-agent pane-state so the next cycle's
+        # log line can surface pane-active / pane-stuck without
+        # re-invoking `get_pane_state` (which mutates debounce
+        # counters and is the single-owner per #42's review fix).
+        if isinstance(state_value, str):
+            self._last_pane_state_by_agent[agent] = state_value
 
         if state_value == "unknown":
             await self._alert_unknown_state(agent)
