@@ -100,14 +100,17 @@ def _format_nudge_prefix(source: str) -> str:
     """Return the ``[<ISO-8601 UTC> <source>] `` prefix prepended
     to every nudge / send-msg payload (#66).
 
-    Format: ``[YYYY-MM-DDTHH:MM:SS.mmmZ <source>]`` with a trailing
-    space so the caller's text appends cleanly. Millisecond
-    resolution keeps correlation tight enough to distinguish
-    retries that land back-to-back. UTC ``Z`` suffix so operators
-    grepping logs don't have to think about local timezones.
+    Format: ``[YYYY-MM-DDTHH:MM:SS<Z> <source>]`` with a trailing
+    space so the caller's text appends cleanly. Second resolution
+    (#82) — millisecond precision was nice in principle but pushed
+    the line width every operator reads noticeably longer, and
+    NUDGE retries on the same agent are spaced at least one
+    second apart by cooldown, so ms never disambiguated anything
+    in practice. UTC ``Z`` suffix so operators grepping logs do
+    not have to think about local timezones.
     """
-    now = datetime.now(timezone.utc)
-    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     return f"[{ts} {source}] "
 
 

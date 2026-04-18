@@ -294,31 +294,29 @@ class IdleWatchdog:
         cycle: int,
         active: list[tuple[str, str]],
     ) -> str:
-        """Build the per-cycle composite log line (#27 + #55).
+        """Build the per-cycle composite log line (#27 + #55 + #56).
 
-        Three sections, separated by `` | `` when present:
+        Condensed per #82 — the line prints every ~15s so compact
+        wording wins. Five possible sections, ``|``-delimited, in
+        order, each omitted when empty:
 
-        1. **Task-queue block** (#27):
-           ``Watchdog cycle N — <M> agents assigned to in_progress tasks: [...]``
-           OR ``Watchdog cycle N — pipeline idle (no task-queue work)``.
-        2. **MCP-active block** (#55): ``MCP-active: agent(Ns) agent(Ns)``,
-           sorted by recency (freshest first). Omitted entirely when
-           no agents are active within the configured window.
-        3. **Idle block** (#55): ``idle: a b c`` — every regular agent
-           not in the task-queue block and not MCP-active. Omitted
-           when empty.
+        1. ``Cycle N`` — always present.
+        2. ``queue: M [agent, ...]`` or ``queue: 0`` — task-queue
+           block (#27), never omitted so operators can always see
+           the pipeline count at a glance.
+        3. ``mcp: agent(Ns) ...`` — MCP-active (#55), freshest first.
+        4. ``active: agent ...`` — pane-WORKING (#56).
+        5. ``stuck: agent(Nc) ...`` — pane-UNKNOWN (#56). ``Nc`` is
+           the stale-cycle count (``c`` reads as \"cycles\").
+        6. ``idle: agent ...`` — residual (regular agents not in
+           any above block).
         """
         if active:
-            prefix = (
-                f"Watchdog cycle {cycle} — "
-                f"{len(active)} agents assigned to in_progress tasks: "
-                f"{[a for a, _ in active]}"
-            )
+            names = [a for a, _ in active]
+            queue_str = f"queue: {len(active)} {names}"
         else:
-            prefix = (
-                f"Watchdog cycle {cycle} — pipeline idle "
-                f"(no task-queue work)"
-            )
+            queue_str = "queue: 0"
+        prefix = f"Cycle {cycle} | {queue_str}"
         mcp_active_pairs: list[tuple[str, float]] = []
         if self._activity_tracker is not None:
             try:
@@ -336,22 +334,22 @@ class IdleWatchdog:
                 f"{agent}({int(age)}s)"
                 for agent, age in mcp_active_pairs
             )
-            parts.append(f"MCP-active: {mcp_active_str}")
+            parts.append(f"mcp: {mcp_active_str}")
 
         # #56: pane-diff signals. The #42 machinery populates
         # `_last_pane_state_by_agent` earlier in the cycle so we
         # read it without re-computing. Agents in WORKING are
-        # pane-active (pane rendered something this cycle); agents
-        # in UNKNOWN are pane-stuck (hash unchanged for debounce
+        # "active" (pane rendered something this cycle); agents
+        # in UNKNOWN are "stuck" (hash unchanged for debounce
         # cycles without an idle prompt); IDLE / CAPTURE_FAILED
         # fall through to the residual idle block.
         #
         # Dual-reporting is intentional and matches the #72
         # composite-log philosophy: an agent can be in the
-        # task-queue block AND pane-active. Per #44, an agent
-        # that is pane-stuck but ALSO has recent MCP activity is
-        # likely running a long blocking tool call — we surface
-        # both signals so the operator sees the context instead of
+        # task-queue block AND the active block. Per #44, an agent
+        # that is stuck but ALSO has recent MCP activity is likely
+        # running a long blocking tool call — we surface both
+        # signals so the operator sees the context instead of
         # silently suppressing one.
         pane_active_agents: list[str] = []
         pane_stuck_pairs: list[tuple[str, int]] = []
@@ -369,13 +367,13 @@ class IdleWatchdog:
                         cycles = 0
                 pane_stuck_pairs.append((name, cycles))
         if pane_active_agents:
-            parts.append(f"pane-active: {' '.join(pane_active_agents)}")
+            parts.append(f"active: {' '.join(pane_active_agents)}")
         if pane_stuck_pairs:
             pane_stuck_str = " ".join(
-                f"{name}({cycles} cycles)" if cycles > 0 else name
+                f"{name}({cycles}c)" if cycles > 0 else name
                 for name, cycles in pane_stuck_pairs
             )
-            parts.append(f"pane-stuck: {pane_stuck_str}")
+            parts.append(f"stuck: {pane_stuck_str}")
 
         # Idle = regular agents not in any active block above.
         assigned_names = {name for name, _ in active}

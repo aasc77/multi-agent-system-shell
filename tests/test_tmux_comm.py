@@ -490,8 +490,12 @@ class TestNudgeTraceabilityPrefix:
     so operators can correlate a pane event to the exact caller.
     """
 
+    # #82: timestamp resolution is now seconds-only. NUDGE retries on
+    # the same agent are spaced ≥ 1 second apart by cooldown, so ms
+    # precision never disambiguated anything in practice and made
+    # each pane line ~4 characters longer.
     _PREFIX_RE = (
-        r"^\[20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z "
+        r"^\[20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z "
         r"[a-z0-9._-]+\] "
     )
 
@@ -572,18 +576,33 @@ class TestNudgeTraceabilityPrefix:
             "orch.console" in t and "note" in t for t in texts
         ), f"send_msg source must appear in the pane text; got {texts!r}"
 
-    def test_format_nudge_prefix_is_iso8601_ms_utc(self):
-        """``_format_nudge_prefix`` must produce the exact format
-        documented on #66: ``[YYYY-MM-DDTHH:MM:SS.mmmZ <source>] ``.
-        """
+    def test_format_nudge_prefix_is_iso8601_seconds_utc(self):
+        """``_format_nudge_prefix`` must produce the exact #82
+        format: ``[YYYY-MM-DDTHH:MM:SSZ <source>] `` (seconds-only,
+        no millisecond component)."""
         import re
         from orchestrator.tmux_comm import _format_nudge_prefix
         prefix = _format_nudge_prefix("orch.delivery")
         assert re.match(
-            r"^\[20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z "
+            r"^\[20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z "
             r"orch\.delivery\] $",
             prefix,
         ), f"prefix shape wrong: {prefix!r}"
+
+    def test_format_nudge_prefix_has_no_millisecond_component(self):
+        """#82 regression guard: the prefix must NOT contain a
+        ``.mmm`` decimal component before the ``Z``. Pre-#82 the
+        format was ``HH:MM:SS.mmmZ`` — this test pins the rollback
+        so a well-meaning future change can't silently re-introduce
+        the ms component (which bloated every operator-facing log
+        line by ~4 characters)."""
+        import re
+        from orchestrator.tmux_comm import _format_nudge_prefix
+        prefix = _format_nudge_prefix("orch.watchdog")
+        # No `.<digits>Z` fragment allowed anywhere in the prefix.
+        assert not re.search(r"\.\d+Z", prefix), (
+            f"prefix must not carry ms precision; got {prefix!r}"
+        )
 
     @patch("subprocess.run")
     def test_send_keys_logs_composed_message(self, mock_run, comm, caplog):
