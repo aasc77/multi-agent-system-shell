@@ -447,6 +447,74 @@ class TestCycleLogMcpActive:
 # Composite Cycle Log with Pane-Diff Block (#56)
 # ---------------------------------------------------------------------------
 
+class TestPaneStateCacheMirroring:
+    """#9: when a shared ``PaneStateCache`` is wired through to the
+    watchdog, every ``_check_single_agent_pane_state`` call must
+    also mirror the observed state into that cache so
+    ``DeliveryProtocol`` (a separate reader) sees the freshest
+    value without re-invoking the hash computation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_check_unknown_agents_mirrors_state_into_shared_cache(self):
+        from orchestrator.watchdog import IdleWatchdog
+        from orchestrator.pane_state_cache import PaneStateCache
+        from orchestrator.tmux_comm import AgentPaneState
+        cache = PaneStateCache()
+        tmux = MagicMock()
+        tmux.get_pane_mapping.return_value = {"hub": 0, "macmini": 1}
+        tmux.get_pane_state.side_effect = lambda a: (
+            AgentPaneState.WORKING if a == "hub" else AgentPaneState.IDLE
+        )
+        cfg = {
+            "agents": {
+                "hub": {"runtime": "claude_code"},
+                "macmini": {"runtime": "claude_code"},
+            },
+            "watchdog": {"check_interval": 60, "idle_cooldown": 300},
+        }
+        wd = IdleWatchdog(
+            lifecycle=MagicMock(current_task=None),
+            state_machine=MagicMock(current_state="idle", initial_state="idle"),
+            nats_client=AsyncMock(),
+            tmux_comm=tmux,
+            config=cfg,
+            task_queue=None,
+            activity_tracker=None,
+            pane_state_cache=cache,
+        )
+        await wd._check_unknown_agents()
+        # Both agents' states must land in the shared cache.
+        assert cache.get("hub") == "working"
+        assert cache.get("macmini") == "idle"
+
+    @pytest.mark.asyncio
+    async def test_none_cache_no_crash_in_check_unknown_agents(self):
+        """Without a shared cache wired up the watchdog must still
+        populate its own ``_last_pane_state_by_agent`` map (used
+        by the #56 cycle log) and not crash."""
+        from orchestrator.watchdog import IdleWatchdog
+        from orchestrator.tmux_comm import AgentPaneState
+        tmux = MagicMock()
+        tmux.get_pane_mapping.return_value = {"hub": 0}
+        tmux.get_pane_state.return_value = AgentPaneState.WORKING
+        cfg = {
+            "agents": {"hub": {"runtime": "claude_code"}},
+            "watchdog": {"check_interval": 60, "idle_cooldown": 300},
+        }
+        wd = IdleWatchdog(
+            lifecycle=MagicMock(current_task=None),
+            state_machine=MagicMock(current_state="idle", initial_state="idle"),
+            nats_client=AsyncMock(),
+            tmux_comm=tmux,
+            config=cfg,
+            task_queue=None,
+            pane_state_cache=None,
+        )
+        await wd._check_unknown_agents()
+        assert wd._last_pane_state_by_agent["hub"] == "working"
+
+
 class TestCycleLogPaneDiff:
     """#56: surfaces the #42 pane-state signal in the cycle log as
     ``pane-active: ...`` (WORKING) and ``pane-stuck: ...(N cycles)``

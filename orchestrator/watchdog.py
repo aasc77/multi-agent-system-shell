@@ -206,6 +206,7 @@ class IdleWatchdog:
         config: dict[str, Any],
         task_queue: Any = None,
         activity_tracker: Any = None,
+        pane_state_cache: Any = None,
     ) -> None:
         self._lifecycle = lifecycle
         self._state_machine = state_machine
@@ -213,6 +214,12 @@ class IdleWatchdog:
         self._tmux_comm = tmux_comm
         self._task_queue = task_queue
         self._activity_tracker = activity_tracker
+        # #9: shared pane-state cache read by DeliveryProtocol so it
+        # can skip a retransmit while the recipient is WORKING. Same
+        # value flows into the local ``_last_pane_state_by_agent``
+        # map that powers the #56 cycle-log formatter; the shared
+        # cache is additive, not a replacement.
+        self._pane_state_cache = pane_state_cache
 
         # The list of non-monitor agent names is used in every per-cycle
         # log line to compute the "idle" block in the #55 composite
@@ -714,6 +721,17 @@ class IdleWatchdog:
         # counters and is the single-owner per #42's review fix).
         if isinstance(state_value, str):
             self._last_pane_state_by_agent[agent] = state_value
+            # #9: additionally mirror into the shared cache that
+            # DeliveryProtocol reads to gate retransmits.
+            if self._pane_state_cache is not None:
+                try:
+                    self._pane_state_cache.set(agent, state_value)
+                except Exception:
+                    logger.debug(
+                        "pane_state_cache.set failed for %s",
+                        agent,
+                        exc_info=True,
+                    )
 
         if state_value == "unknown":
             await self._alert_unknown_state(agent)

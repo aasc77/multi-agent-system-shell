@@ -548,3 +548,195 @@ class TestReDeliveryAfterAck:
         dp.deliver("hub", reason="second")
         assert dp._neighbors["hub"].mailbox.pending is True
         assert tmux.nudge.call_count == 2
+
+
+class TestPaneStateGate:
+    """#9: ``DeliveryProtocol._attempt_nudge`` must consult the
+    shared pane-state cache and DEFER (without incrementing the
+    attempt counter) when the recipient is ``WORKING``. Other
+    states fall through to the normal nudge path.
+
+    These tests hit ``_attempt_nudge`` directly by calling
+    ``deliver`` and ``_process_retransmits`` so we exercise both
+    the first-send path and the retransmit path.
+    """
+
+    def _make_dp(self, cache, *, idle=None, reachable=None):
+        from orchestrator.delivery import DeliveryProtocol
+        tmux = _make_tmux(
+            idle_agents=idle or ["hub"],
+            reachable_agents=reachable or ["hub"],
+        )
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config(),
+            pane_state_cache=cache,
+        )
+        _age_neighbors(dp)
+        return dp, tmux
+
+    @pytest.mark.asyncio
+    async def test_working_state_defers_without_incrementing_attempt(self):
+        """WORKING state → the nudge is skipped AND the attempt
+        counter stays put. This is the load-bearing invariant: we
+        must not falsely escalate to dead-letter after 6 deferrals
+        while the agent is just consuming a long turn."""
+        from orchestrator.pane_state_cache import PaneStateCache
+        cache = PaneStateCache()
+        cache.set("hub", "working")
+        dp, tmux = self._make_dp(cache)
+
+        dp.deliver("hub", reason="first")
+
+        assert tmux.nudge.call_count == 0, (
+            "WORKING state must not produce a real tmux nudge"
+        )
+        assert dp._neighbors["hub"].mailbox.pending is True, (
+            "mail stays pending — we didn't actually deliver"
+        )
+        assert dp._neighbors["hub"].mailbox.attempt == 0, (
+            "WORKING-defer must not increment the attempt counter "
+            "(otherwise repeated WORKING cycles would falsely escalate)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_working_deferral_across_many_cycles_does_not_escalate(self):
+        """Regression guard for the attempt-counter invariant:
+        even after 10 consecutive WORKING-deferrals, ``attempt``
+        stays at 0 and no dead-letter escalation fires.
+        """
+        from orchestrator.pane_state_cache import PaneStateCache
+        cache = PaneStateCache()
+        cache.set("hub", "working")
+        dp, tmux = self._make_dp(cache)
+
+        # First deliver → pending=True, attempt stays 0 (deferred).
+        dp.deliver("hub", reason="first")
+        # Simulate 9 more retransmit cycles while still WORKING.
+        for _ in range(9):
+            dp._attempt_nudge(dp._neighbors["hub"])
+
+        assert tmux.nudge.call_count == 0
+        assert dp._neighbors["hub"].mailbox.attempt == 0
+        assert dp._neighbors["hub"].mailbox.escalated is False
+
+    @pytest.mark.asyncio
+    async def test_idle_state_nudges_normally(self):
+        """IDLE (❯ prompt visible) → nudge as usual."""
+        from orchestrator.pane_state_cache import PaneStateCache
+        cache = PaneStateCache()
+        cache.set("hub", "idle")
+        dp, tmux = self._make_dp(cache)
+
+        dp.deliver("hub", reason="first")
+
+        assert tmux.nudge.call_count == 1
+        assert dp._neighbors["hub"].mailbox.attempt == 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_state_still_nudges(self):
+        """UNKNOWN (#42 stuck) → still nudge. The #42 directive
+        already fires separately; delivery's job here is to keep
+        trying in case the agent is a hung process that needs a
+        wake-up."""
+        from orchestrator.pane_state_cache import PaneStateCache
+        cache = PaneStateCache()
+        cache.set("hub", "unknown")
+        dp, tmux = self._make_dp(cache)
+
+        dp.deliver("hub", reason="first")
+
+        assert tmux.nudge.call_count == 1
+        assert dp._neighbors["hub"].mailbox.attempt == 1
+
+    @pytest.mark.asyncio
+    async def test_capture_failed_state_still_nudges(self):
+        """CAPTURE_FAILED → fall back to existing behavior (can't
+        tell the real state, so send)."""
+        from orchestrator.pane_state_cache import PaneStateCache
+        cache = PaneStateCache()
+        cache.set("hub", "capture_failed")
+        dp, tmux = self._make_dp(cache)
+
+        dp.deliver("hub", reason="first")
+
+        assert tmux.nudge.call_count == 1
+        assert dp._neighbors["hub"].mailbox.attempt == 1
+
+    @pytest.mark.asyncio
+    async def test_none_cache_preserves_pre_pr_behavior(self):
+        """``pane_state_cache=None`` → nudge unconditionally, same
+        as pre-#9 behavior. Ensures we haven't silently broken
+        orchestrator setups that don't wire the cache through."""
+        from orchestrator.delivery import DeliveryProtocol
+        tmux = _make_tmux(idle_agents=["hub"], reachable_agents=["hub"])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config(),
+            pane_state_cache=None,
+        )
+        _age_neighbors(dp)
+
+        dp.deliver("hub", reason="first")
+
+        assert tmux.nudge.call_count == 1
+        assert dp._neighbors["hub"].mailbox.attempt == 1
+
+    @pytest.mark.asyncio
+    async def test_unseen_agent_in_cache_falls_through(self):
+        """Cache wired but recipient never observed by watchdog
+        (e.g. first cycle, no pane-state yet) → fall back to
+        existing nudge behavior. Otherwise the first delivery
+        after orchestrator boot would falsely defer indefinitely.
+        """
+        from orchestrator.pane_state_cache import PaneStateCache
+        cache = PaneStateCache()
+        # Cache is empty — no entry for hub.
+        dp, tmux = self._make_dp(cache)
+
+        dp.deliver("hub", reason="first")
+
+        assert tmux.nudge.call_count == 1
+        assert dp._neighbors["hub"].mailbox.attempt == 1
+
+    @pytest.mark.asyncio
+    async def test_working_then_idle_transition_delivers_on_cycle_two(self):
+        """Integration-shaped: cycle 1 DEFER (WORKING), cycle 2
+        SEND (IDLE). Simulates the real transition pattern the
+        gate is designed for."""
+        from orchestrator.pane_state_cache import PaneStateCache
+        cache = PaneStateCache()
+        cache.set("hub", "working")
+        dp, tmux = self._make_dp(cache)
+
+        # Cycle 1: WORKING → defer
+        dp.deliver("hub", reason="first")
+        assert tmux.nudge.call_count == 0
+        assert dp._neighbors["hub"].mailbox.attempt == 0
+
+        # Cycle 2: agent transitions to IDLE; retransmit fires.
+        cache.set("hub", "idle")
+        dp._attempt_nudge(dp._neighbors["hub"])
+        assert tmux.nudge.call_count == 1
+        assert dp._neighbors["hub"].mailbox.attempt == 1
+
+    @pytest.mark.asyncio
+    async def test_working_defer_does_not_prevent_escalation_when_agent_recovers(self):
+        """Belt-and-suspenders: after a WORKING-defer burst, if
+        the agent transitions to DOWN the normal DOWN-escalation
+        path must still fire. Guards against \"we deferred so long
+        the agent died silently\" regressions."""
+        from orchestrator.pane_state_cache import PaneStateCache
+        from orchestrator.delivery import NeighborState
+        cache = PaneStateCache()
+        cache.set("hub", "working")
+        dp, tmux = self._make_dp(cache)
+
+        dp.deliver("hub", reason="first")  # deferred, attempt=0
+        # Agent goes DOWN — simulate probe result.
+        dp._neighbors["hub"].state = NeighborState.DOWN
+        dp._attempt_nudge(dp._neighbors["hub"])
+        assert dp._neighbors["hub"].mailbox.attempt == 1, (
+            "DOWN path must still increment attempt even if WORKING "
+            "gate was previously exercised"
+        )
