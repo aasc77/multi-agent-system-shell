@@ -197,7 +197,7 @@ class DeliveryProtocol:
         if agent in self._monitor_agents:
             logger.info("DELIVER one-shot to %s monitor (%s)", agent, reason)
             try:
-                self._tmux_comm.nudge(agent, force=True)
+                self._tmux_comm.nudge(agent, force=True, source="orch.delivery")
             except Exception:
                 logger.exception("monitor nudge failed for %s", agent)
             return
@@ -423,7 +423,9 @@ class DeliveryProtocol:
 
         # Send nudge
         try:
-            sent = self._tmux_comm.nudge(neighbor.agent, force=True)
+            sent = self._tmux_comm.nudge(
+                neighbor.agent, force=True, source="orch.delivery",
+            )
         except Exception:
             sent = False
 

@@ -29,6 +29,7 @@ import logging
 import os
 import subprocess
 import time
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,27 @@ def _tmux_cmd() -> list[str]:
 
 _AGENT_STATE_CAPTURE_LINES = 30
 _STALE_DEBOUNCE_CYCLES = 2
+
+# #66: default source tag when a caller doesn't supply one. Real
+# orchestrator code paths always pass their own tag (delivery,
+# watchdog, announcer, taskqueue, console); "unknown" is a
+# backwards-compat fallback for tests and external integrations.
+_NUDGE_SOURCE_UNKNOWN = "unknown"
+
+
+def _format_nudge_prefix(source: str) -> str:
+    """Return the ``[<ISO-8601 UTC> <source>] `` prefix prepended
+    to every nudge / send-msg payload (#66).
+
+    Format: ``[YYYY-MM-DDTHH:MM:SS.mmmZ <source>]`` with a trailing
+    space so the caller's text appends cleanly. Millisecond
+    resolution keeps correlation tight enough to distinguish
+    retries that land back-to-back. UTC ``Z`` suffix so operators
+    grepping logs don't have to think about local timezones.
+    """
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    return f"[{ts} {source}] "
 
 
 class AgentPaneState(enum.Enum):
@@ -337,14 +359,41 @@ class TmuxComm:
             return self._control_pane_mapping[agent]
         raise TmuxCommError(f"Unknown agent: {agent}")
 
-    def send_keys(self, agent: str, text: str) -> None:
-        """Send *text* to an agent's tmux pane via ``tmux send-keys`` with Enter."""
+    def send_keys(
+        self,
+        agent: str,
+        text: str,
+        source: str = _NUDGE_SOURCE_UNKNOWN,
+    ) -> None:
+        """Send *text* to an agent's tmux pane via ``tmux send-keys`` with Enter.
+
+        #66: a trace prefix ``[<ISO-8601 UTC> <source>] `` is
+        prepended to *text* before the pane receives it, so the
+        rendered line in the pane carries its own origin and
+        operators can ``grep`` ``orchestrator.log`` by the same
+        timestamp. Each orchestrator call site passes its own
+        ``source`` tag (``orch.delivery``, ``orch.watchdog``,
+        ``orch.announcer``, ``orch.taskqueue``, ``orch.console``).
+        Callers that omit the tag get ``"unknown"`` for
+        backwards-compat; no production call site should hit that
+        default.
+
+        The composed message (prefix + text) is logged at INFO so
+        ``grep <timestamp>`` in the orchestrator log finds the
+        exact nudge that fired — the forensics payoff documented
+        on #66.
+        """
         target = self.get_target(agent)
+        composed = _format_nudge_prefix(source) + text
+        logger.info(
+            "send_keys agent=%s source=%s text=%r",
+            agent, source, composed,
+        )
         # Claude Code agents: skip verify-retry (it causes false negatives
         # and Escape retries that sabotage delivery). The delivery protocol
         # ACK provides real confirmation.
         skip_verify = agent in self._claude_code_agents
-        self._tmux_send_keys(target, text, skip_verify=skip_verify)
+        self._tmux_send_keys(target, composed, skip_verify=skip_verify)
 
     def capture_pane(self, agent: str, lines: int = 20) -> str | None:
         """Capture the last *lines* of an agent's tmux pane.
@@ -531,16 +580,29 @@ class TmuxComm:
             return False
         return self._has_idle_prompt(pane_text)
 
-    def nudge(self, agent: str, force: bool = False) -> bool:
+    def nudge(
+        self,
+        agent: str,
+        force: bool = False,
+        source: str = _NUDGE_SOURCE_UNKNOWN,
+    ) -> bool:
         """Nudge an agent pane with the configured nudge prompt.
 
         Respects per-agent cooldown and safe-nudge checks.  Tracks
         consecutive skips and escalates after ``max_nudge_retries``.
         Claude Code agents skip the busy-check (they queue input).
 
+        #66: the outgoing pane text carries a ``[<ISO-8601 UTC>
+        <source>]`` prefix so operators can correlate a pane event
+        to the exact orchestrator caller. Each call site supplies
+        its own tag; see ``send_keys`` for the taxonomy.
+
         Args:
             agent: Agent name.
             force: If ``True``, skip cooldown check (used for task assignments).
+            source: Origin tag (``orch.delivery`` / ``orch.watchdog``
+                / …). Defaults to ``"unknown"`` for backwards-compat;
+                real call sites should always pass their own.
 
         Returns:
             ``True`` if the nudge was sent, ``False`` if skipped.
@@ -563,16 +625,25 @@ class TmuxComm:
             if agent in self._control_pane_mapping
             else self._nudge_prompt
         )
-        self.send_keys(agent, prompt)
+        self.send_keys(agent, prompt, source=source)
         self._last_nudge_time[agent] = time.time()
         self._reset_skip_tracking(agent)
         return True
 
-    def send_msg(self, agent: str, text: str) -> bool:
+    def send_msg(
+        self,
+        agent: str,
+        text: str,
+        source: str = _NUDGE_SOURCE_UNKNOWN,
+    ) -> bool:
         """Send a custom message to an agent pane (``msg`` console command).
 
         Performs the same safe-nudge check as :meth:`nudge` but does
         **not** update the nudge cooldown timestamp.
+
+        #66: see :meth:`send_keys` for the traceability-prefix
+        semantics; ``source`` defaults to ``"unknown"`` for
+        backwards-compat with tests / external callers.
 
         Returns:
             ``True`` if the message was sent, ``False`` if the agent is busy.
@@ -586,7 +657,7 @@ class TmuxComm:
             )
             return False
 
-        self.send_keys(agent, text)
+        self.send_keys(agent, text, source=source)
         return True
 
     def get_consecutive_skips(self, agent: str) -> int:

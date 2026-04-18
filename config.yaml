@@ -4,6 +4,13 @@ nats:
   subjects_prefix: agents
 
 tmux:
+  # `nudge_prompt` is the base text. At runtime the orchestrator
+  # auto-prepends a `[<ISO-8601 UTC ts> <source>] ` traceability
+  # prefix (see #66 / orchestrator/tmux_comm.py::_format_nudge_prefix).
+  # No config key controls the prefix itself — it is always on, and
+  # each orchestrator call site passes its own `<source>` tag
+  # (`orch.delivery`, `orch.watchdog`, `orch.announcer`,
+  # `orch.taskqueue`, `orch.console`, `orch.router`, `orch.lifecycle`).
   nudge_prompt: "You have new messages in your inbox. Use the check_messages MCP tool to read them."
   nudge_cooldown_seconds: 30
   max_nudge_retries: 20

@@ -302,7 +302,9 @@ class TaskLifecycleManager:
                         target_agent, reason="task_assignment",
                     )
                 else:
-                    self._tmux_comm.nudge(target_agent, force=True)
+                    self._tmux_comm.nudge(
+                        target_agent, force=True, source="orch.lifecycle",
+                    )
 
     def _build_task_assignment_message(
         self, action_args: dict[str, Any],
