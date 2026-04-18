@@ -226,7 +226,9 @@ class Console:
         agent_name = args[0]
         return self._safe_tmux_call(
             operation="nudge",
-            call=lambda: self._tmux_comm.nudge(agent_name),
+            call=lambda: self._tmux_comm.nudge(
+                agent_name, source="orch.console",
+            ),
             success_msg=_MSG_NUDGE_OK.format(agent_name),
             skipped_msg=_MSG_NUDGE_SKIP.format(agent_name),
         )
@@ -243,7 +245,9 @@ class Console:
 
         return self._safe_tmux_call(
             operation="message",
-            call=lambda: self._tmux_comm.send_msg(agent_name, text),
+            call=lambda: self._tmux_comm.send_msg(
+                agent_name, text, source="orch.console",
+            ),
             success_msg=_MSG_MSG_OK.format(agent_name),
             skipped_msg=_MSG_MSG_BUSY.format(agent_name),
         )
@@ -257,7 +261,9 @@ class Console:
         sent = []
         for agent in self._agent_names:
             try:
-                if self._tmux_comm.send_msg(agent, text):
+                if self._tmux_comm.send_msg(
+                    agent, text, source="orch.console",
+                ):
                     sent.append(agent)
             except Exception:
                 pass  # skip agents not in pane mapping (e.g. monitor)
@@ -302,7 +308,9 @@ class Console:
         msg = f"Look at the image at shared/{filename} using your Read tool"
         self._safe_tmux_call(
             operation="message",
-            call=lambda: self._tmux_comm.send_msg(agent, msg),
+            call=lambda: self._tmux_comm.send_msg(
+                agent, msg, source="orch.console",
+            ),
             success_msg=_MSG_MSG_OK.format(agent),
             skipped_msg=_MSG_MSG_BUSY.format(agent),
         )

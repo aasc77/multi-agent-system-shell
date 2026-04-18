@@ -328,12 +328,12 @@ class TestNudgeCommand:
     def test_nudge_calls_tmux_comm_nudge(self, console, deps):
         """nudge must call tmux_comm.nudge with the agent name."""
         console.handle_command("nudge qa")
-        deps["tmux_comm"].nudge.assert_called_once_with("qa")
+        deps["tmux_comm"].nudge.assert_called_once_with("qa", source="orch.console")
 
     def test_nudge_for_different_agents(self, console, deps):
         """nudge must work for any configured agent."""
         console.handle_command("nudge dev")
-        deps["tmux_comm"].nudge.assert_called_with("dev")
+        deps["tmux_comm"].nudge.assert_called_with("dev", source="orch.console")
 
     def test_nudge_confirmation_on_success(self, console, deps):
         """nudge must confirm when nudge was sent."""
@@ -377,12 +377,12 @@ class TestMsgCommand:
     def test_msg_calls_tmux_comm_send_msg(self, console, deps):
         """msg must call tmux_comm.send_msg with agent and text."""
         console.handle_command("msg qa fix the tests")
-        deps["tmux_comm"].send_msg.assert_called_once_with("qa", "fix the tests")
+        deps["tmux_comm"].send_msg.assert_called_once_with("qa", "fix the tests", source="orch.console")
 
     def test_msg_for_different_agent(self, console, deps):
         """msg must work for any configured agent."""
         console.handle_command("msg dev check this")
-        deps["tmux_comm"].send_msg.assert_called_with("dev", "check this")
+        deps["tmux_comm"].send_msg.assert_called_with("dev", "check this", source="orch.console")
 
     def test_msg_confirmation_on_success(self, console, deps):
         """msg must confirm when message was sent."""
@@ -400,7 +400,7 @@ class TestMsgCommand:
         """msg must preserve multi-word text as a single string."""
         console.handle_command("msg qa please fix the failing tests now")
         deps["tmux_comm"].send_msg.assert_called_once_with(
-            "qa", "please fix the failing tests now"
+            "qa", "please fix the failing tests now", source="orch.console",
         )
 
     def test_msg_unknown_agent(self, console, deps):
@@ -628,13 +628,13 @@ class TestCommandParsing:
     def test_command_with_extra_whitespace(self, console, deps):
         """Commands with extra whitespace should be parsed correctly."""
         console.handle_command("  nudge   qa  ")
-        deps["tmux_comm"].nudge.assert_called_once_with("qa")
+        deps["tmux_comm"].nudge.assert_called_once_with("qa", source="orch.console")
 
     def test_msg_command_text_extraction(self, console, deps):
         """msg command should correctly extract text after agent name."""
         console.handle_command("msg dev please run the tests now")
         deps["tmux_comm"].send_msg.assert_called_once_with(
-            "dev", "please run the tests now"
+            "dev", "please run the tests now", source="orch.console",
         )
 
     def test_handle_command_returns_string_always(self, console):

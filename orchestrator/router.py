@@ -313,7 +313,9 @@ class MessageRouter:
             )
         elif self._tmux_comm is not None:
             try:
-                self._tmux_comm.nudge(target_role, force=True)
+                self._tmux_comm.nudge(
+                    target_role, force=True, source="orch.router",
+                )
             except Exception:
                 logger.debug("Skipping tmux nudge for %s (no pane)", target_role)
         await msg.ack()

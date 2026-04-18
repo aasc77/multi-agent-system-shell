@@ -724,7 +724,9 @@ class TestHandleManagerResponse:
             "agent": "macmini",
             "action": "nudge",
         })
-        mock_tmux.nudge.assert_called_with("macmini", force=True)
+        mock_tmux.nudge.assert_called_with(
+            "macmini", force=True, source="orch.watchdog",
+        )
         assert watchdog._awaiting_response["macmini"] is False
 
     @pytest.mark.asyncio
@@ -770,7 +772,9 @@ class TestAlertManager:
     async def test_alert_nudges_manager_tmux(self, watchdog, mock_nats, mock_tmux):
         """Alert should nudge manager's tmux pane."""
         await watchdog._alert_manager("macmini")
-        mock_tmux.nudge.assert_called_with("manager", force=True)
+        mock_tmux.nudge.assert_called_with(
+            "manager", force=True, source="orch.watchdog",
+        )
 
 
 # ---------------------------------------------------------------------------

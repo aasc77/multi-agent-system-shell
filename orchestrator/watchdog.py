@@ -430,7 +430,7 @@ class IdleWatchdog:
 
         if action == "nudge":
             logger.info("Manager requested nudge for idle agent %s", agent)
-            self._tmux_comm.nudge(agent, force=True)
+            self._tmux_comm.nudge(agent, force=True, source="orch.watchdog")
         elif action == "expected":
             logger.info("Manager confirmed idle state for %s is expected", agent)
             # Extend cooldown so we don't re-alert soon
@@ -831,7 +831,7 @@ class IdleWatchdog:
         await self._nats_client.publish_to_inbox("manager", alert)
 
         # Nudge manager's tmux pane so it checks messages
-        self._tmux_comm.nudge("manager", force=True)
+        self._tmux_comm.nudge("manager", force=True, source="orch.watchdog")
 
         self._last_alert[agent] = time.time()
         self._awaiting_response[agent] = True

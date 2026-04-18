@@ -132,7 +132,9 @@ class TestDeliver:
 
         assert dp._neighbors["hub"].mailbox.pending is True
         assert dp._neighbors["hub"].mailbox.attempt == 1
-        tmux.nudge.assert_called_once_with("hub", force=True)
+        tmux.nudge.assert_called_once_with(
+            "hub", force=True, source="orch.delivery",
+        )
 
     @pytest.mark.asyncio
     async def test_deliver_while_pending_still_nudges(self):
@@ -184,7 +186,9 @@ class TestDeliver:
         dp.deliver("manager", reason="agent_message from hassio")
 
         # Nudge was sent exactly once
-        tmux.nudge.assert_called_once_with("manager", force=True)
+        tmux.nudge.assert_called_once_with(
+            "manager", force=True, source="orch.delivery",
+        )
         # But no pending state or attempt tracking
         assert dp._neighbors["manager"].mailbox.pending is False
         assert dp._neighbors["manager"].mailbox.attempt == 0

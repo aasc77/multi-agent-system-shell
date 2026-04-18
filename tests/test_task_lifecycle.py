@@ -322,7 +322,9 @@ class TestAssignToAgent:
     ):
         """Must nudge the target agent's tmux pane after publishing."""
         await lifecycle.process_next_task()
-        mock_tmux_comm.nudge.assert_called_with("writer", force=True)
+        mock_tmux_comm.nudge.assert_called_with(
+            "writer", force=True, source="orch.lifecycle",
+        )
 
     @pytest.mark.asyncio
     async def test_nudge_happens_after_nats_publish(

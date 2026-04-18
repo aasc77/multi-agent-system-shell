@@ -480,6 +480,128 @@ class TestSendKeys:
 
 
 # ===========================================================================
+# 3b. NUDGE TRACEABILITY PREFIX (#66)
+# ===========================================================================
+
+
+class TestNudgeTraceabilityPrefix:
+    """#66: every outbound pane nudge must prepend
+    ``[<ISO-8601 UTC> <source>] `` to the text tmux actually sees,
+    so operators can correlate a pane event to the exact caller.
+    """
+
+    _PREFIX_RE = (
+        r"^\[20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z "
+        r"[a-z0-9._-]+\] "
+    )
+
+    @patch("subprocess.run")
+    def test_send_keys_prepends_timestamp_and_source(self, mock_run, comm):
+        import re
+        mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
+        comm.send_keys("qa", "hello", source="orch.delivery")
+        # Extract the text argument passed to subprocess.run for
+        # the send-keys call (tmux args = [tmux, send-keys, -t,
+        # target, <text>]).
+        send_calls = [
+            c for c in mock_run.call_args_list
+            if any("send-keys" in str(a) for a in c[0])
+        ]
+        assert send_calls, "no send-keys call observed"
+        # Find the first call whose argv includes our expected text
+        # prefix form.
+        texts = []
+        for call in send_calls:
+            argv = call[0][0]
+            if "send-keys" in argv and len(argv) >= 5:
+                texts.append(argv[-1])
+        assert any(
+            re.match(self._PREFIX_RE, t) and "hello" in t
+            for t in texts
+        ), (
+            "expected a send-keys text matching "
+            f"{self._PREFIX_RE!r} + 'hello'; got {texts!r}"
+        )
+        assert any("orch.delivery" in t for t in texts), (
+            f"source tag not in outgoing text; got {texts!r}"
+        )
+
+    @patch("subprocess.run")
+    def test_send_keys_default_source_is_unknown(self, mock_run, comm):
+        """Backwards-compat: callers that don't pass ``source``
+        get ``[<ts> unknown]`` so the prefix is always present
+        without breaking legacy tests that call
+        ``send_keys(agent, text)`` positionally."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
+        comm.send_keys("qa", "legacy")
+        texts = [
+            call[0][0][-1]
+            for call in mock_run.call_args_list
+            if "send-keys" in str(call) and len(call[0][0]) >= 5
+        ]
+        assert any("unknown" in t and "legacy" in t for t in texts), (
+            f"default source must be 'unknown'; got {texts!r}"
+        )
+
+    @patch("subprocess.run")
+    def test_nudge_forwards_source_to_send_keys(self, mock_run, comm):
+        """``nudge(source=...)`` must thread the tag all the way
+        through to the composed pane text."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
+        comm.nudge("qa", force=True, source="orch.watchdog")
+        texts = [
+            call[0][0][-1]
+            for call in mock_run.call_args_list
+            if "send-keys" in str(call) and len(call[0][0]) >= 5
+        ]
+        assert any("orch.watchdog" in t for t in texts), (
+            f"nudge source must appear in the pane text; got {texts!r}"
+        )
+
+    @patch("subprocess.run")
+    def test_send_msg_forwards_source_to_send_keys(self, mock_run, comm):
+        """Same wiring for ``send_msg``."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
+        comm.send_msg("qa", "note", source="orch.console")
+        texts = [
+            call[0][0][-1]
+            for call in mock_run.call_args_list
+            if "send-keys" in str(call) and len(call[0][0]) >= 5
+        ]
+        assert any(
+            "orch.console" in t and "note" in t for t in texts
+        ), f"send_msg source must appear in the pane text; got {texts!r}"
+
+    def test_format_nudge_prefix_is_iso8601_ms_utc(self):
+        """``_format_nudge_prefix`` must produce the exact format
+        documented on #66: ``[YYYY-MM-DDTHH:MM:SS.mmmZ <source>] ``.
+        """
+        import re
+        from orchestrator.tmux_comm import _format_nudge_prefix
+        prefix = _format_nudge_prefix("orch.delivery")
+        assert re.match(
+            r"^\[20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z "
+            r"orch\.delivery\] $",
+            prefix,
+        ), f"prefix shape wrong: {prefix!r}"
+
+    @patch("subprocess.run")
+    def test_send_keys_logs_composed_message(self, mock_run, comm, caplog):
+        """#66 debuggability payoff: the composed pane text must
+        be logged alongside the nudge so ``grep <timestamp>`` in
+        ``orchestrator.log`` surfaces the exact outgoing message.
+        """
+        import logging as _logging
+        mock_run.return_value = MagicMock(returncode=0, stdout="claude\n")
+        with caplog.at_level(_logging.INFO, logger="orchestrator.tmux_comm"):
+            comm.send_keys("qa", "hello", source="orch.delivery")
+        logged = " ".join(r.getMessage() for r in caplog.records)
+        assert "orch.delivery" in logged
+        assert "hello" in logged
+        assert "source=orch.delivery" in logged
+
+
+# ===========================================================================
 # 4. SAFE NUDGING -- CHECK #{pane_current_command}
 # ===========================================================================
 
