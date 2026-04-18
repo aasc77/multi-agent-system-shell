@@ -261,6 +261,12 @@ class NatsClient:
             k: v for k, v in message.items()
             if k not in ("message_id", "timestamp", "from")
         }
+        # `default=str` stringifies any value JSON can't encode natively.
+        # Every semantic payload in-tree today is plain dicts of scalars
+        # (type, agent, message, subtype, priority) — not a live risk.
+        # Future risk (#63): if a caller ever passes a datetime or custom
+        # object whose `str()` repr matches a different object's, the
+        # hash could collapse messages that should deliver independently.
         canonical = json.dumps(semantic, sort_keys=True, default=str)
         short_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
         epoch = int(time.time())
