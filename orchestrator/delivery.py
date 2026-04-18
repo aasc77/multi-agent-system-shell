@@ -30,6 +30,7 @@ import asyncio
 import enum
 import json
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -53,8 +54,39 @@ _DEFAULT_TABLE_LOG_INTERVAL = 60    # log route table every N seconds
 _STARTUP_GRACE_PERIOD = 5           # seconds to wait after agent comes UP
 _ESCALATION_BACKOFF = 3600          # push notify when backoff reaches 1hr
 
+# #80: heartbeat gate defaults.
+#
+# Each MCP bridge publishes on ``agents.<role>.heartbeat`` every
+# ``MAS_HEARTBEAT_INTERVAL_SEC`` seconds (default 30 — matches the
+# bridge default). The orchestrator gates UP/BUSY/DOWN on the last
+# observed heartbeat being within ``2 * interval`` so one missed
+# publish (packet loss, GC pause) does not flap the agent to DOWN
+# on its own.
+_DEFAULT_HEARTBEAT_INTERVAL_SEC = 30
+# Demotion grace: if we have never seen a heartbeat AND the
+# orchestrator has been up for less than this many seconds, do NOT
+# force DOWN. A fresh orchestrator may be watching an agent whose
+# bridge is still booting. The heartbeat publisher emits its first
+# beat on-connect; this window covers the connect-to-first-publish
+# lag (typically sub-second, but SSH / remote bridges can take a
+# few seconds).
+_DEFAULT_HEARTBEAT_STARTUP_GRACE_SEC = 60
+
+# #80: proactive UP→DOWN alert defaults.
+_DEFAULT_NEIGHBOR_DOWN_ALERT_COOLDOWN = 600  # 10 min burst suppression
+# Env kill-switch so ``scripts/stop.sh`` and cognate paths can
+# silence the alert spray during orderly shutdowns.
+_ENV_SUPPRESS_DOWN_ALERTS = "MAS_SUPPRESS_DOWN_ALERTS"
+
 # ACK message type published by MCP bridge
 ACK_MESSAGE_TYPE = "delivery_ack"
+
+# Heartbeat message type published by MCP bridge (#80).
+HEARTBEAT_MESSAGE_TYPE = "heartbeat"
+
+# Manager directive subtype for UP→DOWN transitions (#80).
+DOWN_ALERT_SUBTYPE = "agent_logout"
+_MSG_TYPE_MANAGER_DIRECTIVE = "manager_directive"
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +161,8 @@ class DeliveryProtocol:
         tmux_comm: Any,
         config: dict[str, Any],
         pane_state_cache: Any = None,
+        heartbeat_tracker: Any = None,
+        nats_client: Any = None,
     ) -> None:
         self._tmux_comm = tmux_comm
         # #9: optional shared pane-state cache. When present, a
@@ -138,6 +172,12 @@ class DeliveryProtocol:
         # previous input. ``None`` preserves the pre-#9 behavior:
         # nudge unconditionally.
         self._pane_state_cache = pane_state_cache
+        # #80: optional heartbeat tracker + nats_client for the
+        # UP→DOWN alerting path. ``None`` preserves the pre-#80
+        # behavior: UP/DOWN determined by pane content alone, no
+        # proactive alerts on transitions.
+        self._heartbeat_tracker = heartbeat_tracker
+        self._nats_client = nats_client
 
         routing_cfg = config.get("routing", {})
         self._probe_interval: int = routing_cfg.get(
@@ -155,6 +195,30 @@ class DeliveryProtocol:
         self._table_log_interval: int = routing_cfg.get(
             "table_log_interval", _DEFAULT_TABLE_LOG_INTERVAL,
         )
+
+        # #80: heartbeat / alert config
+        heartbeat_cfg = config.get("heartbeat", {}) or {}
+        self._heartbeat_interval_sec: int = int(heartbeat_cfg.get(
+            "interval_seconds", _DEFAULT_HEARTBEAT_INTERVAL_SEC,
+        ))
+        # Max age = 2 × interval gives one missed beat of slack
+        # before DOWN demotion.
+        self._heartbeat_max_age_sec: int = int(heartbeat_cfg.get(
+            "max_age_seconds", 2 * self._heartbeat_interval_sec,
+        ))
+        self._heartbeat_startup_grace_sec: int = int(heartbeat_cfg.get(
+            "startup_grace_seconds", _DEFAULT_HEARTBEAT_STARTUP_GRACE_SEC,
+        ))
+        self._orchestrator_started_at: float = time.time()
+
+        self._alert_on_neighbor_down: bool = bool(heartbeat_cfg.get(
+            "alert_on_neighbor_down", True,
+        ))
+        self._down_alert_cooldown: int = int(heartbeat_cfg.get(
+            "neighbor_down_alert_cooldown_seconds",
+            _DEFAULT_NEIGHBOR_DOWN_ALERT_COOLDOWN,
+        ))
+        self._last_down_alert: dict[str, float] = {}
 
         # Build neighbor table — ALL agents, including monitors.
         # Track which agents are monitors so we can skip delivery for them
@@ -217,6 +281,29 @@ class DeliveryProtocol:
 
         # Always nudge immediately
         self._attempt_nudge(neighbor)
+
+    async def handle_heartbeat_message(self, msg: Any) -> None:
+        """Handle a heartbeat publish from an agent's MCP bridge (#80).
+
+        Records the ``agent`` field's timestamp in the
+        ``HeartbeatTracker`` so the next ``_probe_neighbors`` cycle
+        can gate UP/DOWN on it. Silently drops malformed payloads
+        — one missing beat is absorbed by the ``2 × interval`` max-
+        age window, a burst of malformed payloads still only misses
+        heartbeats, not panics the loop.
+        """
+        if self._heartbeat_tracker is None:
+            return
+        try:
+            payload = json.loads(msg.data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if payload.get("type") != HEARTBEAT_MESSAGE_TYPE:
+            return
+        agent = payload.get("agent", "")
+        if not agent:
+            return
+        self._heartbeat_tracker.touch(agent)
 
     async def handle_ack_message(self, msg: Any) -> None:
         """Handle a delivery ACK from the NATS ACK subscription."""
@@ -337,35 +424,146 @@ class DeliveryProtocol:
 
         Includes soft ACK: if agent transitions BUSY -> UP while mail
         is pending, clear the flag (agent was active, likely read mail).
+
+        #80: when a ``HeartbeatTracker`` is wired up, the heartbeat
+        is the authoritative liveness signal. An agent whose MCP
+        bridge has not published within ``2 × heartbeat_interval``
+        is forced to DOWN regardless of pane content — this closes
+        the ssh-reconnect-keeps-pane-alive false-positive.
+        Monitors are exempt (they don't run an MCP bridge that
+        publishes heartbeats the same way; pane state is the
+        only signal we have). Startup grace suppresses DOWN
+        demotion while the orchestrator is freshly booted and
+        bridges are still coming up.
         """
         for name, neighbor in self._neighbors.items():
+            old_state = neighbor.state
             try:
-                idle = await asyncio.to_thread(
-                    self._tmux_comm.is_agent_idle, name,
-                )
-                if idle:
-                    old_state = neighbor.state
-                    changed = neighbor.transition(NeighborState.UP)
-                    # Soft ACK: BUSY -> UP means agent completed a work cycle
-                    if changed and old_state == NeighborState.BUSY:
-                        if neighbor.mailbox.pending:
-                            logger.info(
-                                "SOFT_ACK %s — was BUSY, now UP. Clearing pending.",
-                                name,
-                            )
-                            self._clear_mailbox(neighbor)
+                if self._should_force_down_by_heartbeat(name):
+                    neighbor.transition(NeighborState.DOWN)
                 else:
-                    pane = await asyncio.to_thread(
-                        self._tmux_comm.capture_pane, name, 1,
+                    idle = await asyncio.to_thread(
+                        self._tmux_comm.is_agent_idle, name,
                     )
-                    if pane is None:
-                        neighbor.transition(NeighborState.DOWN)
+                    if idle:
+                        changed = neighbor.transition(NeighborState.UP)
+                        # Soft ACK: BUSY -> UP means agent completed
+                        # a work cycle.
+                        if changed and old_state == NeighborState.BUSY:
+                            if neighbor.mailbox.pending:
+                                logger.info(
+                                    "SOFT_ACK %s — was BUSY, now UP. "
+                                    "Clearing pending.",
+                                    name,
+                                )
+                                self._clear_mailbox(neighbor)
                     else:
-                        neighbor.transition(NeighborState.BUSY)
+                        pane = await asyncio.to_thread(
+                            self._tmux_comm.capture_pane, name, 1,
+                        )
+                        if pane is None:
+                            neighbor.transition(NeighborState.DOWN)
+                        else:
+                            neighbor.transition(NeighborState.BUSY)
             except Exception:
                 neighbor.transition(NeighborState.DOWN)
 
+            # #80: proactive alert on any transition INTO DOWN from
+            # a reachable state (UP or BUSY). UNKNOWN→DOWN is the
+            # boot path and doesn't alert. DOWN→DOWN (already
+            # down) also doesn't alert.
+            if (
+                old_state in (NeighborState.UP, NeighborState.BUSY)
+                and neighbor.state == NeighborState.DOWN
+            ):
+                await self._maybe_alert_neighbor_down(neighbor, old_state)
+
             neighbor.last_probe = time.time()
+
+    def _should_force_down_by_heartbeat(self, agent: str) -> bool:
+        """Return True when the heartbeat gate says *agent* is DOWN
+        regardless of pane content.
+
+        Conditions:
+        - Tracker wired AND
+        - agent is NOT a monitor (monitors don't publish heartbeats
+          via the bridge pathway; pane signal is their only cue) AND
+        - EITHER a previously-observed heartbeat is now older than
+          ``max_age``, OR we have never seen a heartbeat AND the
+          orchestrator has been running long enough that it should
+          have arrived by now.
+        """
+        if self._heartbeat_tracker is None:
+            return False
+        if agent in self._monitor_agents:
+            return False
+        now = time.time()
+        age = self._heartbeat_tracker.age_seconds(agent, now=now)
+        if age is None:
+            # Never seen a heartbeat. During startup grace, give the
+            # bridge time to boot; afterwards, no heartbeat means
+            # DOWN.
+            elapsed = now - self._orchestrator_started_at
+            return elapsed >= self._heartbeat_startup_grace_sec
+        return age > self._heartbeat_max_age_sec
+
+    async def _maybe_alert_neighbor_down(
+        self,
+        neighbor: NeighborEntry,
+        from_state: NeighborState,
+    ) -> None:
+        """Publish a ``manager_directive`` when a neighbor drops from
+        UP/BUSY → DOWN. Cooldown-suppressed + env-kill-switchable.
+        """
+        if not self._alert_on_neighbor_down:
+            return
+        if self._nats_client is None:
+            return
+        if os.environ.get(_ENV_SUPPRESS_DOWN_ALERTS):
+            return
+        # Startup grace: don't spam alerts during bounce (the
+        # grace window covers the orchestrator-start → first-probe
+        # window when agents haven't had time to publish).
+        now = time.time()
+        elapsed = now - self._orchestrator_started_at
+        if elapsed < self._heartbeat_startup_grace_sec:
+            return
+        # Cooldown
+        last = self._last_down_alert.get(neighbor.agent, 0.0)
+        if last > 0 and (now - last) < self._down_alert_cooldown:
+            return
+
+        logger.warning(
+            "flag_human: neighbor %s transitioned %s → DOWN",
+            neighbor.agent, from_state.value,
+        )
+        directive = {
+            "type": _MSG_TYPE_MANAGER_DIRECTIVE,
+            "subtype": DOWN_ALERT_SUBTYPE,
+            "agent": neighbor.agent,
+            "from_state": from_state.value,
+            "message": (
+                f"Neighbor '{neighbor.agent}' transitioned "
+                f"{from_state.value} → DOWN. The agent's MCP bridge "
+                f"has stopped heartbeating (no publish on "
+                f"agents.{neighbor.agent}.heartbeat within "
+                f"{self._heartbeat_max_age_sec}s). The tmux pane "
+                f"may still appear alive because ssh-reconnect.sh "
+                f"keeps it open past real tunnel death — the "
+                f"heartbeat gap is authoritative. Check the agent "
+                f"host and its bridge process."
+            ),
+            "priority": "high",
+        }
+        try:
+            await self._nats_client.publish_to_inbox("manager", directive)
+        except Exception:
+            logger.exception(
+                "Failed to publish agent_logout directive for %s",
+                neighbor.agent,
+            )
+            return
+        self._last_down_alert[neighbor.agent] = now
 
     # ------------------------------------------------------------------
     # Mailbox processing

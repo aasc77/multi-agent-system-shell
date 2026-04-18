@@ -19,6 +19,25 @@ tmux:
 tasks:
   max_attempts_per_task: 5
 
+# #80: heartbeat-gated NEIGHBOR UP/DOWN + proactive alert.
+# Each MCP bridge publishes on `agents.<role>.heartbeat` every
+# `interval_seconds`. The orchestrator forces an agent to DOWN
+# when no heartbeat has been seen within `max_age_seconds`
+# (2 × interval is the default — one missed publish absorbed).
+# `startup_grace_seconds` suppresses DOWN demotion while the
+# orchestrator is freshly booted so bridges still coming up
+# don't trigger false logouts. `alert_on_neighbor_down` +
+# `neighbor_down_alert_cooldown_seconds` control the proactive
+# `manager_directive` (subtype `agent_logout`). The env
+# `MAS_SUPPRESS_DOWN_ALERTS=1` overrides all of this for orderly
+# shutdowns.
+heartbeat:
+  interval_seconds: 30
+  max_age_seconds: 60
+  startup_grace_seconds: 60
+  alert_on_neighbor_down: true
+  neighbor_down_alert_cooldown_seconds: 600
+
 providers:
   stt:
     backend: whisper
