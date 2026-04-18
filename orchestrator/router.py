@@ -84,6 +84,7 @@ class MessageRouter:
         tmux_comm: Any = None,
         watchdog: Any = None,
         delivery: Any = None,
+        activity_tracker: Any = None,
     ) -> None:
         self._nats_client = nats_client
         self._state_machine = state_machine
@@ -91,6 +92,7 @@ class MessageRouter:
         self._tmux_comm = tmux_comm
         self._watchdog = watchdog
         self._delivery = delivery
+        self._activity_tracker = activity_tracker
         self._agents = agents
         self._paused = False
         self._last_activity_time: float = time.time()
@@ -142,6 +144,20 @@ class MessageRouter:
     # Message handling
     # ------------------------------------------------------------------
 
+    def _touch_activity_tracker(self, agent: str) -> None:
+        """Record MCP activity for *agent* if the tracker is wired up.
+
+        #55: ad-hoc traffic (send_to_agent, check_messages, send_message)
+        goes through NATS outbox/inbox subjects this router already
+        watches. We forward the participating agent name so the
+        watchdog can report ad-hoc activity per cycle.
+        """
+        if self._activity_tracker is not None and agent:
+            try:
+                self._activity_tracker.touch(agent)
+            except Exception:
+                logger.debug("activity_tracker.touch failed", exc_info=True)
+
     async def handle_message(self, msg: Any) -> None:
         """Handle an incoming NATS outbox message.
 
@@ -168,6 +184,10 @@ class MessageRouter:
                 return
 
             role = self._extract_role(msg.subject)
+            # #55: any outbox publish means the agent is actively
+            # working via MCP — capture the recency regardless of
+            # whether the payload matches a known trigger.
+            self._touch_activity_tracker(role)
             msg_type = payload.get(_MSG_KEY_TYPE)
             status = payload.get(_MSG_KEY_STATUS)
 
@@ -282,6 +302,11 @@ class MessageRouter:
         # (e.g. inactivity alerts) to prevent loopback resetting the counter.
         if sender != "orchestrator":
             self._touch_activity()
+            # #55: record MCP activity for the sender. The inbox relay
+            # fires on every ``send_to_agent``, which is the most common
+            # form of ad-hoc traffic. Skipping orchestrator-originated
+            # messages keeps the tracker free of housekeeping noise.
+            self._touch_activity_tracker(sender)
         if self._delivery is not None:
             self._delivery.deliver(
                 target_role, reason=f"agent_message from {sender}",

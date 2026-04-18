@@ -1267,3 +1267,105 @@ class TestEdgeCases:
         assert any(
             "unrecognized" in msg.lower() for msg in warning_messages
         )
+
+
+# ===========================================================================
+# 11. MCP ACTIVITY TRACKER INTEGRATION (#55)
+# ===========================================================================
+
+class TestActivityTrackerIntegration:
+    """#55: MessageRouter must forward every outbox publish and every
+    agent-sender inbox publish to the activity_tracker so the
+    watchdog can report ad-hoc MCP activity in its cycle log.
+    """
+
+    @pytest.mark.asyncio
+    async def test_outbox_publish_touches_tracker(
+        self, mock_nats_client, mock_state_machine, mock_lifecycle_manager,
+    ):
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        router = MessageRouter(
+            nats_client=mock_nats_client,
+            state_machine=mock_state_machine,
+            lifecycle_manager=mock_lifecycle_manager,
+            agents=SAMPLE_AGENTS,
+            activity_tracker=tracker,
+        )
+        msg = MagicMock()
+        msg.subject = "agents.writer.outbox"
+        msg.data = json.dumps({
+            "type": "agent_complete", "status": "pass",
+        }).encode()
+        msg.ack = AsyncMock()
+        await router.handle_message(msg)
+        snap = tracker.snapshot()
+        assert "writer" in snap, (
+            "outbox publish from writer must touch the activity tracker; "
+            f"snapshot={snap}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_message_inbox_touches_sender(
+        self, mock_nats_client, mock_state_machine, mock_lifecycle_manager,
+    ):
+        """send_to_agent publishes on the recipient inbox with the
+        sender in ``from``. MessageRouter's inbox relay must forward
+        the sender to the tracker (not the recipient — recipient
+        activity is captured separately when THEY later publish to
+        their own outbox)."""
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        tmux = MagicMock()
+        router = MessageRouter(
+            nats_client=mock_nats_client,
+            state_machine=mock_state_machine,
+            lifecycle_manager=mock_lifecycle_manager,
+            agents=SAMPLE_AGENTS,
+            tmux_comm=tmux,
+            activity_tracker=tracker,
+        )
+        msg = MagicMock()
+        msg.subject = "agents.executor.inbox"
+        msg.data = json.dumps({
+            "type": "agent_message", "from": "writer",
+            "message": "hi",
+        }).encode()
+        msg.ack = AsyncMock()
+        await router._handle_inbox_relay(msg)
+        snap = tracker.snapshot()
+        assert "writer" in snap, (
+            "inbox relay must touch the sender (writer), got: " + str(snap)
+        )
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_sender_not_counted_as_activity(
+        self, mock_nats_client, mock_state_machine, mock_lifecycle_manager,
+    ):
+        """Orchestrator-generated messages (inactivity alerts,
+        manager directives) MUST NOT show up as agent activity —
+        otherwise every cycle log would falsely show activity from
+        orchestrator housekeeping.
+        """
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        tmux = MagicMock()
+        router = MessageRouter(
+            nats_client=mock_nats_client,
+            state_machine=mock_state_machine,
+            lifecycle_manager=mock_lifecycle_manager,
+            agents=SAMPLE_AGENTS,
+            tmux_comm=tmux,
+            activity_tracker=tracker,
+        )
+        msg = MagicMock()
+        msg.subject = "agents.executor.inbox"
+        msg.data = json.dumps({
+            "type": "agent_message", "from": "orchestrator",
+            "message": "Inactivity alert",
+        }).encode()
+        msg.ack = AsyncMock()
+        await router._handle_inbox_relay(msg)
+        assert tracker.snapshot() == {}, (
+            "orchestrator sender must not be recorded as agent activity"
+        )
