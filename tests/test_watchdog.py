@@ -239,7 +239,8 @@ class TestCycleLogLine:
                 with pytest.raises(asyncio.CancelledError):
                     await watchdog.run()
         messages = [r.getMessage() for r in caplog.records]
-        assert any("agents assigned to in_progress tasks" in m for m in messages)
+        # #82 condensed form: ``Cycle N | queue: M ['X']``.
+        assert any("queue: " in m and "Cycle " in m for m in messages)
         assert not any("active agents" in m for m in messages)
         assert not any("fallback to state machine" in m for m in messages)
 
@@ -255,7 +256,8 @@ class TestCycleLogLine:
                 with pytest.raises(asyncio.CancelledError):
                     await watchdog_no_tq.run()
         messages = [r.getMessage() for r in caplog.records]
-        assert any("pipeline idle (no task-queue work)" in m for m in messages)
+        # #82 condensed form: ``Cycle N | queue: 0``.
+        assert any("queue: 0" in m and "Cycle " in m for m in messages)
         assert not any("active agents" in m for m in messages)
         assert not any("fallback to state machine" in m for m in messages)
 
@@ -300,25 +302,26 @@ class TestCycleLogMcpActive:
             activity_tracker=tracker,
         )
 
-    def test_no_tracker_emits_original_pipeline_idle_line(self):
+    def test_no_tracker_emits_queue_zero_line(self):
         """Backwards-compat: without a tracker we still emit the
-        #27 phrasing. #55's MCP-active block is opt-in via tracker."""
+        queue block. #55's ``mcp:`` block is opt-in via tracker.
+        (#82: condensed phrasing locks ``queue: 0``.)"""
         wd = self._make_watchdog(tracker=None)
         msg = wd._format_cycle_log(cycle=5, active=[])
-        assert "pipeline idle (no task-queue work)" in msg
-        assert "MCP-active" not in msg
+        assert "queue: 0" in msg
+        assert "mcp:" not in msg
 
-    def test_empty_tracker_omits_mcp_active_block(self):
-        """Tracker wired but empty → no MCP-active block, full idle
+    def test_empty_tracker_omits_mcp_block(self):
+        """Tracker wired but empty → no ``mcp:`` block, full idle
         list of every monitored agent."""
         from orchestrator.activity_tracker import ActivityTracker
         wd = self._make_watchdog(tracker=ActivityTracker())
         msg = wd._format_cycle_log(cycle=1, active=[])
-        assert "MCP-active" not in msg
+        assert "mcp:" not in msg
         # Every monitored agent should be in the idle list.
         assert "idle: hub macmini hassio RTX5090 dgx dgx2" in msg
 
-    def test_single_agent_activity_populates_mcp_active(self):
+    def test_single_agent_activity_populates_mcp_block(self):
         from orchestrator.activity_tracker import ActivityTracker
         tracker = ActivityTracker()
         now = 1000.0
@@ -326,8 +329,8 @@ class TestCycleLogMcpActive:
         wd = self._make_watchdog(tracker=tracker)
         with patch("orchestrator.activity_tracker.time.time", return_value=now):
             msg = wd._format_cycle_log(cycle=2, active=[])
-        assert "MCP-active: dev(3s)" in msg
-        # Idle list excludes dev (because it's MCP-active).
+        assert "mcp: dev(3s)" in msg
+        # Idle list excludes dev (because it's in the mcp block).
         assert "idle: " in msg
         assert " dev" not in msg.split("idle:")[1]
 
@@ -342,8 +345,9 @@ class TestCycleLogMcpActive:
         with patch("orchestrator.activity_tracker.time.time", return_value=now):
             msg = wd._format_cycle_log(cycle=3, active=[])
         # Freshest first.
-        assert "MCP-active: dev(3s) RTX5090(8s) macmini(45s)" in msg
-        # Idle list only has agents not in MCP-active: hassio, dgx, dgx2.
+        assert "mcp: dev(3s) RTX5090(8s) macmini(45s)" in msg
+        # Idle list only has agents not in the mcp block:
+        # hassio, dgx, dgx2.
         idle_part = msg.split("idle:")[1]
         assert "hassio" in idle_part
         assert "dgx" in idle_part
@@ -353,7 +357,7 @@ class TestCycleLogMcpActive:
 
     def test_activity_older_than_window_ages_out(self):
         """An agent last active longer ago than the window is in the
-        idle list, not the MCP-active list. Tests the aging-out
+        idle list, not the ``mcp:`` list. Tests the aging-out
         behavior at the log-formatter level (the tracker's own
         active_within is unit-tested separately)."""
         from orchestrator.activity_tracker import ActivityTracker
@@ -368,22 +372,23 @@ class TestCycleLogMcpActive:
         )
         with patch("orchestrator.activity_tracker.time.time", return_value=now):
             msg = wd._format_cycle_log(cycle=4, active=[])
-        assert "MCP-active: macmini(10s)" in msg
-        assert "stale" not in msg.split("MCP-active:")[1].split("|")[0]
+        assert "mcp: macmini(10s)" in msg
+        assert "stale" not in msg.split("mcp:")[1].split("|")[0]
         idle_part = msg.split("idle:")[1]
         assert "stale" in idle_part
         assert "hub" in idle_part
 
     def test_assigned_agent_not_reported_as_idle_even_with_mcp_activity(self):
         """An agent listed in tasks.json assigned_agents appears in
-        the task-queue block and must NOT also appear in the idle
+        the ``queue:`` block and must NOT also appear in the idle
         block — even when it also has fresh MCP activity within the
-        window. Dual-reporting with MCP-active is intentional (same
-        composite-log philosophy documented on other tests in this
-        class), so this test only pins the idle-exclusion invariant.
-        The old name ``takes_priority_over_mcp_active`` implied the
-        test asserted a priority that the assertions don't actually
-        enforce — see #73.
+        window. Dual-reporting with the ``mcp:`` block is intentional
+        (same composite-log philosophy documented on other tests in
+        this class), so this test only pins the idle-exclusion
+        invariant. The old name ``takes_priority_over_mcp_active``
+        implied the test asserted a priority that the assertions
+        don't actually enforce — see #73. #82 condensed phrasing
+        locks ``queue: M ['X']``.
         """
         from orchestrator.activity_tracker import ActivityTracker
         tracker = ActivityTracker()
@@ -393,17 +398,13 @@ class TestCycleLogMcpActive:
         active = [("dev", "coding")]
         with patch("orchestrator.activity_tracker.time.time", return_value=now):
             msg = wd._format_cycle_log(cycle=6, active=active)
-        # Task-queue block names dev.
-        assert "agents assigned to in_progress tasks" in msg
-        assert "['dev']" in msg
-        # Not reported in MCP-active even though tracker is fresh.
-        mcp_section = (
-            msg.split("MCP-active:")[1].split("|")[0]
-            if "MCP-active:" in msg else ""
-        )
-        # (Acceptable: dev may or may not show up in MCP-active. The
-        # critical invariant is that it does NOT appear in the idle
-        # block — because the operator already knows it's working.)
+        # Queue block names dev.
+        assert "queue: 1 ['dev']" in msg
+        # Not reported in the mcp block even though tracker is fresh
+        # (acceptable: dev may or may not show up in mcp — the
+        # critical invariant is that it does NOT appear in the
+        # idle block, since the operator already knows it's
+        # working).
         idle_section = msg.split("idle:")[1] if "idle:" in msg else ""
         assert " dev" not in idle_section, (
             "dev must not appear in the idle block while assigned: " + msg
@@ -564,30 +565,32 @@ class TestCycleLogPaneDiff:
 
     def test_no_pane_state_cache_emits_no_pane_blocks(self):
         """Backward-compat: without pane-state data, the log omits
-        both pane-active and pane-stuck sections."""
+        both ``active:`` and ``stuck:`` sections (#82 condensed
+        labels)."""
         wd = self._make_watchdog(pane_states=None)
         msg = wd._format_cycle_log(cycle=1, active=[])
-        assert "pane-active" not in msg
-        assert "pane-stuck" not in msg
+        assert "active:" not in msg
+        assert "stuck:" not in msg
 
-    def test_working_state_populates_pane_active(self):
+    def test_working_state_populates_active(self):
         wd = self._make_watchdog(pane_states={"hub": "working", "macmini": "working"})
         msg = wd._format_cycle_log(cycle=2, active=[])
-        assert "pane-active: " in msg
-        pane_active_section = msg.split("pane-active:")[1].split("|")[0]
-        assert "hub" in pane_active_section
-        assert "macmini" in pane_active_section
+        assert "active: " in msg
+        active_section = msg.split("active:")[1].split("|")[0]
+        assert "hub" in active_section
+        assert "macmini" in active_section
         idle_part = msg.split("idle:")[1] if "idle:" in msg else ""
         assert "hub" not in idle_part
         assert "macmini" not in idle_part
 
-    def test_unknown_state_populates_pane_stuck_with_cycle_count(self):
+    def test_unknown_state_populates_stuck_with_cycle_count(self):
         wd = self._make_watchdog(
             pane_states={"dgx": "unknown"},
             stale_counts={"dgx": 5},
         )
         msg = wd._format_cycle_log(cycle=3, active=[])
-        assert "pane-stuck: dgx(5 cycles)" in msg
+        # #82: `Nc` suffix, not `N cycles`.
+        assert "stuck: dgx(5c)" in msg
         idle_part = msg.split("idle:")[1] if "idle:" in msg else ""
         idle_names = idle_part.split()
         assert "dgx" not in idle_names, (
@@ -597,13 +600,13 @@ class TestCycleLogPaneDiff:
 
     def test_idle_state_falls_through_to_idle_block(self):
         """#42 IDLE (hash unchanged + prompt visible) must NOT be
-        counted as pane-stuck — that would misreport a happy
+        counted as stuck — that would misreport a happy
         waiting-at-prompt agent as a frozen process. Preserves the
         #42 positive-signal distinction."""
         wd = self._make_watchdog(pane_states={"hub": "idle"})
         msg = wd._format_cycle_log(cycle=4, active=[])
-        assert "pane-active" not in msg
-        assert "pane-stuck" not in msg
+        assert "active:" not in msg
+        assert "stuck:" not in msg
         assert "idle:" in msg
         assert "hub" in msg.split("idle:")[1]
 
@@ -611,48 +614,47 @@ class TestCycleLogPaneDiff:
         """CAPTURE_FAILED is a tmux-session health issue, not an
         agent-pane signal. The #42 machinery emits a separate
         directive for it; the cycle log shouldn't misreport it as
-        pane-stuck.
+        stuck.
         """
         wd = self._make_watchdog(pane_states={"hassio": "capture_failed"})
         msg = wd._format_cycle_log(cycle=5, active=[])
-        assert "pane-active" not in msg
-        assert "pane-stuck" not in msg
+        assert "active:" not in msg
+        assert "stuck:" not in msg
         assert "hassio" in msg.split("idle:")[1]
 
     def test_pre_debounce_counts_as_working_not_stuck(self):
         """Per-#42 semantics: an agent that's been stale for less
         than `_STALE_DEBOUNCE_CYCLES` still returns `WORKING` from
         `get_pane_state`. That flows through to our cache as
-        `"working"` so the cycle log calls it pane-active, NOT
-        pane-stuck. This test locks the 2-cycle debounce boundary
+        ``"working"`` so the cycle log labels it ``active:``, NOT
+        ``stuck:``. This test locks the 2-cycle debounce boundary
         at the log-formatter level.
         """
         wd = self._make_watchdog(pane_states={"RTX5090": "working"})
         msg = wd._format_cycle_log(cycle=6, active=[])
-        assert "pane-active: " in msg
-        assert "RTX5090" in msg.split("pane-active:")[1].split("|")[0]
-        assert "pane-stuck" not in msg
+        assert "active: " in msg
+        assert "RTX5090" in msg.split("active:")[1].split("|")[0]
+        assert "stuck:" not in msg
 
-    def test_dual_report_task_queue_and_pane_active(self):
+    def test_dual_report_queue_and_active(self):
         """An agent listed in tasks.json AND whose pane is currently
-        WORKING should appear in BOTH the task-queue block and the
-        pane-active block. Same dual-reporting philosophy as #72.
+        WORKING should appear in BOTH the queue block and the
+        active block. Same dual-reporting philosophy as #72.
         """
         wd = self._make_watchdog(pane_states={"hub": "working"})
         msg = wd._format_cycle_log(cycle=7, active=[("hub", "writing code")])
-        # Task-queue block names hub.
-        assert "agents assigned to in_progress tasks" in msg
-        assert "['hub']" in msg
-        # Pane-active block also names hub.
-        assert "pane-active: hub" in msg
+        # #82: Queue block names hub.
+        assert "queue: 1 ['hub']" in msg
+        # Active block also names hub.
+        assert "active: hub" in msg
         # Idle block does NOT.
         idle_part = msg.split("idle:")[1] if "idle:" in msg else ""
         assert " hub" not in idle_part
 
-    def test_pane_stuck_with_mcp_activity_dual_reports(self):
-        """#44 guidance: a pane-stuck agent that also has recent
-        MCP activity is likely running a long blocking tool call.
-        The log should surface BOTH signals so the operator has the
+    def test_stuck_with_mcp_activity_dual_reports(self):
+        """#44 guidance: a stuck agent that also has recent MCP
+        activity is likely running a long blocking tool call. The
+        log should surface BOTH signals so the operator has the
         context — do not auto-suppress either.
         """
         from orchestrator.activity_tracker import ActivityTracker
@@ -666,9 +668,9 @@ class TestCycleLogPaneDiff:
         )
         with patch("orchestrator.activity_tracker.time.time", return_value=now):
             msg = wd._format_cycle_log(cycle=8, active=[])
-        # Both signals surface for dgx.
-        assert "MCP-active: dgx(2s)" in msg
-        assert "pane-stuck: dgx(3 cycles)" in msg
+        # Both signals surface for dgx (#82 condensed labels).
+        assert "mcp: dgx(2s)" in msg
+        assert "stuck: dgx(3c)" in msg
         idle_part = msg.split("idle:")[1] if "idle:" in msg else ""
         idle_names = idle_part.split()
         assert "dgx" not in idle_names, (
@@ -676,11 +678,44 @@ class TestCycleLogPaneDiff:
             "idle: " + repr(idle_names)
         )
 
+    def test_full_composite_line_exact_shape(self):
+        """#82 snapshot lock: with every section populated, the line
+        must read verbatim
+
+            Cycle N | queue: M [X] | mcp: ... | active: ... | stuck: ... | idle: ...
+
+        (ordering, label words, and ``Nc`` suffix). Guards against
+        a future reformat silently moving sections around or
+        dropping the ``c`` suffix on stuck counts.
+        """
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        now = 1000.0
+        tracker.touch("dev", now=now - 3)
+        wd = self._make_watchdog(
+            pane_states={"hub": "working", "dgx": "unknown"},
+            stale_counts={"dgx": 5},
+            tracker=tracker,
+            monitored_agents=("dev", "hub", "macmini", "dgx", "dgx2"),
+        )
+        with patch("orchestrator.activity_tracker.time.time", return_value=now):
+            msg = wd._format_cycle_log(
+                cycle=42, active=[("dev", "coding")],
+            )
+        expected = (
+            "Cycle 42 | queue: 1 ['dev'] | mcp: dev(3s) | "
+            "active: hub | stuck: dgx(5c) | idle: macmini dgx2"
+        )
+        assert msg == expected, (
+            f"#82 composite format drifted.\nexpected: {expected!r}\n"
+            f"got:      {msg!r}"
+        )
+
     def test_missing_get_stale_cycle_count_gracefully_degrades(self):
         """Older TmuxComm implementations (tests with bare MagicMock)
         don't expose `get_stale_cycle_count`. The log must still
-        render the pane-stuck block — just without the cycle count
-        suffix — instead of crashing or emitting a 0-cycles line.
+        render the ``stuck:`` block — just without the cycle count
+        suffix — instead of crashing or emitting a 0c line.
         """
         from orchestrator.watchdog import IdleWatchdog
         cfg = {
@@ -702,8 +737,8 @@ class TestCycleLogPaneDiff:
         )
         wd._last_pane_state_by_agent = {"dgx": "unknown"}
         msg = wd._format_cycle_log(cycle=9, active=[])
-        # Bare "pane-stuck: dgx" (no cycle count suffix) is fine.
-        assert "pane-stuck: dgx" in msg
+        # Bare ``stuck: dgx`` (no cycle count suffix) is fine.
+        assert "stuck: dgx" in msg
 
 
 # ---------------------------------------------------------------------------
