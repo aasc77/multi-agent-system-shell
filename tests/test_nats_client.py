@@ -365,12 +365,15 @@ class TestEnvelopeWrapping:
             assert set(body.keys()) == {"type", "summary"}
 
     @pytest.mark.asyncio
-    async def test_envelope_generates_fresh_ids_across_publishes(
+    async def test_envelope_dedups_identical_content_within_same_second(
         self, nats_config, agents,
     ):
-        """Successive publishes of the same body must produce distinct
-        message_ids. Equal ids across publishes would cause mas-bridge to
-        suppress one of two legitimately distinct messages on the receiver.
+        """Two publishes of the same content within the same second
+        must produce the SAME message_id so mas-bridge's dedup
+        collapses accidental/intentional repeats of the same event.
+
+        This is the #34 invariant that #28's narrow per-call-site
+        patch is now generalized into every publish_to_inbox caller.
         """
         client = NatsClient(config=nats_config, agents=agents)
         with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
@@ -381,8 +384,14 @@ class TestEnvelopeWrapping:
             await client.connect()
 
             body = {"type": "idle_alert", "agent": "macmini"}
-            await client.publish_to_inbox("manager", body)
-            await client.publish_to_inbox("manager", body)
+            # Pin time.time() inside nats_client to the same second
+            # for both publishes so the epoch portion of the id is
+            # stable across the two calls. Without this pin the test
+            # is racy — a second boundary between the two publishes
+            # produces different epochs and the dedup wouldn't apply.
+            with patch("orchestrator.nats_client.time.time", return_value=1000.0):
+                await client.publish_to_inbox("manager", body)
+                await client.publish_to_inbox("manager", body)
 
             ids = []
             for call in mock_js.publish.call_args_list:
@@ -390,6 +399,123 @@ class TestEnvelopeWrapping:
                 parsed = json.loads(payload)
                 ids.append(parsed["message_id"])
             assert len(ids) == 2
+            assert ids[0] == ids[1], (
+                f"Identical content within the same second must produce "
+                f"the same message_id for bridge dedup; got {ids}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_envelope_ids_differ_across_seconds_for_same_content(
+        self, nats_config, agents,
+    ):
+        """Same content, different seconds → different ids (the epoch
+        component changes). Ensures legitimate re-occurrences of the
+        same event across time are NOT collapsed by the bridge.
+        """
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            body = {"type": "idle_alert", "agent": "macmini"}
+            with patch("orchestrator.nats_client.time.time", return_value=1000.0):
+                await client.publish_to_inbox("manager", body)
+            with patch("orchestrator.nats_client.time.time", return_value=1005.0):
+                await client.publish_to_inbox("manager", body)
+
+            ids = []
+            for call in mock_js.publish.call_args_list:
+                payload = call[0][1] if len(call[0]) > 1 else call[1].get("payload", b"")
+                parsed = json.loads(payload)
+                ids.append(parsed["message_id"])
+            assert ids[0] != ids[1], (
+                f"Different epochs with same content must produce "
+                f"distinct message_ids; got {ids}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_envelope_ignores_caller_from_in_id_hash(
+        self, nats_config, agents,
+    ):
+        """The id hash must depend only on the *semantic* payload.
+        Two publishes with identical semantic content but different
+        caller-set ``from`` / ``timestamp`` / ``message_id`` fields
+        must still produce the same ``(type, hash, epoch)`` — after
+        ignoring those caller fields — so bridge dedup stays robust
+        against accidental envelope carry-over.
+
+        Carries a regression guard against "hash the full dict" bugs
+        where a caller's re-used dict silently carries forward a prior
+        ``from`` and changes the hash out from under same-content
+        dedup.
+        """
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            with patch("orchestrator.nats_client.time.time", return_value=1000.0):
+                await client.publish_to_inbox(
+                    "manager",
+                    {"type": "idle_alert", "agent": "macmini", "from": "hub"},
+                )
+                await client.publish_to_inbox(
+                    "manager",
+                    {
+                        "type": "idle_alert",
+                        "agent": "macmini",
+                        "from": "manager",
+                    },
+                )
+
+            payloads = [
+                json.loads(c[0][1])
+                for c in mock_js.publish.call_args_list
+            ]
+            assert payloads[0]["message_id"] == payloads[1]["message_id"], (
+                "ids must match: the semantic payload is identical; "
+                "the caller `from` field is envelope, not content."
+            )
+            # The two ``from`` values must still survive on the
+            # envelope — we ignore them in the HASH, not in the body.
+            assert payloads[0]["from"] == "hub"
+            assert payloads[1]["from"] == "manager"
+
+    @pytest.mark.asyncio
+    async def test_envelope_ids_differ_for_different_content_same_second(
+        self, nats_config, agents,
+    ):
+        """Different semantic content at the same epoch → different ids
+        (the hash component changes). No bridge-level collapse across
+        genuinely distinct events.
+        """
+        client = NatsClient(config=nats_config, agents=agents)
+        with patch("orchestrator.nats_client.nats.connect", new_callable=AsyncMock) as mock_connect:
+            mock_conn = AsyncMock()
+            mock_js = AsyncMock()
+            mock_conn.jetstream.return_value = mock_js
+            mock_connect.return_value = mock_conn
+            await client.connect()
+
+            with patch("orchestrator.nats_client.time.time", return_value=1000.0):
+                await client.publish_to_inbox(
+                    "manager", {"type": "idle_alert", "agent": "macmini"},
+                )
+                await client.publish_to_inbox(
+                    "manager", {"type": "idle_alert", "agent": "hub"},
+                )
+
+            ids = []
+            for call in mock_js.publish.call_args_list:
+                payload = call[0][1]
+                parsed = json.loads(payload)
+                ids.append(parsed["message_id"])
             assert ids[0] != ids[1]
 
     @pytest.mark.asyncio
@@ -425,15 +551,22 @@ class TestEnvelopeWrapping:
                 )
 
     @pytest.mark.asyncio
-    async def test_publish_all_done_gives_distinct_message_ids_per_recipient(
+    async def test_publish_all_done_fanout_reaches_every_recipient(
         self, nats_config,
     ):
         """publish_all_done reuses the same body dict across recipients
-        (loops `for role in self._agents`). Without the no-mutation
-        guarantee on _envelope_wrap, recipient 2+ would inherit
-        recipient 1's message_id and the bridge dedup would collapse
-        them on delivery. This test directly wires the real fanout
-        caller path and asserts each recipient gets a distinct id.
+        (loops ``for role in self._agents``). Post-#34, the deterministic
+        id is content-derived, so every recipient getting the SAME
+        ``all_done`` body within the same second receives the SAME
+        message_id — which is fine because mas-bridge's dedup is per
+        recipient inbox (each agent sees that one id exactly once).
+
+        What we assert here is the fanout structural invariant: every
+        agent still gets the message on their own subject, the caller's
+        dict is not mutated by the envelope, and every envelope is
+        well-formed. The pre-#34 "distinct ids across recipients"
+        invariant was based on a misreading of bridge-side dedup and
+        is intentionally removed — see #34 for the rationale.
         """
         multi_agent_config = {
             "hub": {"runtime": "claude_code"},
@@ -452,17 +585,16 @@ class TestEnvelopeWrapping:
             await client.publish_all_done("shutdown summary")
 
             assert mock_js.publish.call_count == len(multi_agent_config)
-            ids = []
             subjects = []
             for call in mock_js.publish.call_args_list:
                 subjects.append(call[0][0])
                 payload = call[0][1]
                 parsed = json.loads(payload)
-                ids.append(parsed["message_id"])
-            # Every recipient got a distinct message_id — no fanout collapse.
-            assert len(set(ids)) == len(ids), (
-                f"fanout produced duplicate message_ids: {ids}"
-            )
+                assert parsed.get("message_id"), (
+                    "every envelope in fanout must include message_id"
+                )
+                assert parsed.get("timestamp")
+                assert parsed.get("from") == "orchestrator"
             # Every recipient got their own subject.
             expected_subjects = {
                 f"agents.{role}.inbox" for role in multi_agent_config

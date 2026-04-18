@@ -18,10 +18,10 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
 
@@ -231,19 +231,40 @@ class NatsClient:
 
     @staticmethod
     def _generate_message_id(message: dict[str, Any]) -> str:
-        """Generate a unique ``message_id`` for *message*.
+        """Generate a content-deterministic ``message_id`` for *message*.
 
-        Format: ``<type>-<epoch>-<short-uuid>``. Uses the message's
-        ``type`` field (falling back to ``orchestrator``) as the
-        prefix so each publisher namespace stays distinct in traces
-        and the mas-bridge dedup cache has a wider hash space across
-        concurrent senders.
+        Format: ``<type>-<short-hash>-<epoch>`` where:
+
+        - ``<type>``: ``message.get("type", "orchestrator")`` with
+          whitespace replaced by ``_``. Keeps each publisher's ids
+          namespaced in traces and widens mas-bridge's dedup hash
+          space across concurrent senders.
+        - ``<short-hash>``: first 8 hex chars of SHA-256 over a
+          canonical JSON serialization of the *semantic* payload —
+          i.e. the message with any caller-supplied envelope fields
+          (``message_id``, ``timestamp``, ``from``) stripped out
+          first. Two publishes of the same content hash the same,
+          regardless of envelope-field carry-over.
+        - ``<epoch>``: ``int(time.time())``. Two publishes of the
+          same content within the same second produce the same id
+          so the bridge can collapse accidental/intentional repeats;
+          two publishes in different seconds produce different ids
+          so legitimate re-occurrences are still delivered.
+
+        This is the #34 generalization of the #28 deterministic-id
+        patch: every caller of ``publish_to_inbox`` automatically
+        gets the dedup-friendly id, not just ``_check_agent_auth_failure``.
         """
         raw_type = str(message.get("type") or "orchestrator")
         msg_type = raw_type.replace(" ", "_")
+        semantic = {
+            k: v for k, v in message.items()
+            if k not in ("message_id", "timestamp", "from")
+        }
+        canonical = json.dumps(semantic, sort_keys=True, default=str)
+        short_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
         epoch = int(time.time())
-        short_uuid = uuid.uuid4().hex[:8]
-        return f"{msg_type}-{epoch}-{short_uuid}"
+        return f"{msg_type}-{short_hash}-{epoch}"
 
     async def publish_raw(self, subject: str, payload: bytes) -> None:
         """Publish raw bytes to an arbitrary NATS subject.
