@@ -438,6 +438,201 @@ class TestCycleLogMcpActive:
 
 
 # ---------------------------------------------------------------------------
+# Composite Cycle Log with Pane-Diff Block (#56)
+# ---------------------------------------------------------------------------
+
+class TestCycleLogPaneDiff:
+    """#56: surfaces the #42 pane-state signal in the cycle log as
+    ``pane-active: ...`` (WORKING) and ``pane-stuck: ...(N cycles)``
+    (UNKNOWN), without duplicating the hash computation. The
+    watchdog populates ``_last_pane_state_by_agent`` during
+    ``_check_unknown_agents`` (which runs BEFORE the log in the #56
+    reordered run loop), and the log formatter reads it.
+
+    Dual-reporting with the task-queue and MCP-active blocks is
+    intentional per the issue body — same philosophy as #72.
+    """
+
+    def _make_watchdog(
+        self,
+        pane_states: dict[str, str] | None = None,
+        stale_counts: dict[str, int] | None = None,
+        tracker=None,
+        monitored_agents=("hub", "macmini", "hassio", "RTX5090", "dgx", "dgx2"),
+    ):
+        """Construct an IdleWatchdog pre-populated with a given
+        pane-state cache + stale-cycle-count map (as TmuxComm
+        would have exposed them via `get_stale_cycle_count`).
+        """
+        from orchestrator.watchdog import IdleWatchdog
+        cfg = {
+            "agents": {
+                name: {"runtime": "claude_code"}
+                for name in monitored_agents
+            },
+            "watchdog": {"check_interval": 60, "idle_cooldown": 300},
+        }
+        stale_counts = stale_counts or {}
+        tmux = MagicMock()
+        tmux.get_stale_cycle_count = lambda a: stale_counts.get(a, 0)
+        wd = IdleWatchdog(
+            lifecycle=MagicMock(current_task=None),
+            state_machine=MagicMock(current_state="idle", initial_state="idle"),
+            nats_client=AsyncMock(),
+            tmux_comm=tmux,
+            config=cfg,
+            task_queue=None,
+            activity_tracker=tracker,
+        )
+        if pane_states is not None:
+            wd._last_pane_state_by_agent = dict(pane_states)
+        return wd
+
+    def test_no_pane_state_cache_emits_no_pane_blocks(self):
+        """Backward-compat: without pane-state data, the log omits
+        both pane-active and pane-stuck sections."""
+        wd = self._make_watchdog(pane_states=None)
+        msg = wd._format_cycle_log(cycle=1, active=[])
+        assert "pane-active" not in msg
+        assert "pane-stuck" not in msg
+
+    def test_working_state_populates_pane_active(self):
+        wd = self._make_watchdog(pane_states={"hub": "working", "macmini": "working"})
+        msg = wd._format_cycle_log(cycle=2, active=[])
+        assert "pane-active: " in msg
+        pane_active_section = msg.split("pane-active:")[1].split("|")[0]
+        assert "hub" in pane_active_section
+        assert "macmini" in pane_active_section
+        idle_part = msg.split("idle:")[1] if "idle:" in msg else ""
+        assert "hub" not in idle_part
+        assert "macmini" not in idle_part
+
+    def test_unknown_state_populates_pane_stuck_with_cycle_count(self):
+        wd = self._make_watchdog(
+            pane_states={"dgx": "unknown"},
+            stale_counts={"dgx": 5},
+        )
+        msg = wd._format_cycle_log(cycle=3, active=[])
+        assert "pane-stuck: dgx(5 cycles)" in msg
+        idle_part = msg.split("idle:")[1] if "idle:" in msg else ""
+        idle_names = idle_part.split()
+        assert "dgx" not in idle_names, (
+            "dgx (stuck) must not also appear in idle list; idle: "
+            + repr(idle_names)
+        )
+
+    def test_idle_state_falls_through_to_idle_block(self):
+        """#42 IDLE (hash unchanged + prompt visible) must NOT be
+        counted as pane-stuck — that would misreport a happy
+        waiting-at-prompt agent as a frozen process. Preserves the
+        #42 positive-signal distinction."""
+        wd = self._make_watchdog(pane_states={"hub": "idle"})
+        msg = wd._format_cycle_log(cycle=4, active=[])
+        assert "pane-active" not in msg
+        assert "pane-stuck" not in msg
+        assert "idle:" in msg
+        assert "hub" in msg.split("idle:")[1]
+
+    def test_capture_failed_falls_through_to_idle_block(self):
+        """CAPTURE_FAILED is a tmux-session health issue, not an
+        agent-pane signal. The #42 machinery emits a separate
+        directive for it; the cycle log shouldn't misreport it as
+        pane-stuck.
+        """
+        wd = self._make_watchdog(pane_states={"hassio": "capture_failed"})
+        msg = wd._format_cycle_log(cycle=5, active=[])
+        assert "pane-active" not in msg
+        assert "pane-stuck" not in msg
+        assert "hassio" in msg.split("idle:")[1]
+
+    def test_pre_debounce_counts_as_working_not_stuck(self):
+        """Per-#42 semantics: an agent that's been stale for less
+        than `_STALE_DEBOUNCE_CYCLES` still returns `WORKING` from
+        `get_pane_state`. That flows through to our cache as
+        `"working"` so the cycle log calls it pane-active, NOT
+        pane-stuck. This test locks the 2-cycle debounce boundary
+        at the log-formatter level.
+        """
+        wd = self._make_watchdog(pane_states={"RTX5090": "working"})
+        msg = wd._format_cycle_log(cycle=6, active=[])
+        assert "pane-active: " in msg
+        assert "RTX5090" in msg.split("pane-active:")[1].split("|")[0]
+        assert "pane-stuck" not in msg
+
+    def test_dual_report_task_queue_and_pane_active(self):
+        """An agent listed in tasks.json AND whose pane is currently
+        WORKING should appear in BOTH the task-queue block and the
+        pane-active block. Same dual-reporting philosophy as #72.
+        """
+        wd = self._make_watchdog(pane_states={"hub": "working"})
+        msg = wd._format_cycle_log(cycle=7, active=[("hub", "writing code")])
+        # Task-queue block names hub.
+        assert "agents assigned to in_progress tasks" in msg
+        assert "['hub']" in msg
+        # Pane-active block also names hub.
+        assert "pane-active: hub" in msg
+        # Idle block does NOT.
+        idle_part = msg.split("idle:")[1] if "idle:" in msg else ""
+        assert " hub" not in idle_part
+
+    def test_pane_stuck_with_mcp_activity_dual_reports(self):
+        """#44 guidance: a pane-stuck agent that also has recent
+        MCP activity is likely running a long blocking tool call.
+        The log should surface BOTH signals so the operator has the
+        context — do not auto-suppress either.
+        """
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        now = 1000.0
+        tracker.touch("dgx", now=now - 2)
+        wd = self._make_watchdog(
+            pane_states={"dgx": "unknown"},
+            stale_counts={"dgx": 3},
+            tracker=tracker,
+        )
+        with patch("orchestrator.activity_tracker.time.time", return_value=now):
+            msg = wd._format_cycle_log(cycle=8, active=[])
+        # Both signals surface for dgx.
+        assert "MCP-active: dgx(2s)" in msg
+        assert "pane-stuck: dgx(3 cycles)" in msg
+        idle_part = msg.split("idle:")[1] if "idle:" in msg else ""
+        idle_names = idle_part.split()
+        assert "dgx" not in idle_names, (
+            "dgx (stuck + mcp-active) must not appear in idle list; "
+            "idle: " + repr(idle_names)
+        )
+
+    def test_missing_get_stale_cycle_count_gracefully_degrades(self):
+        """Older TmuxComm implementations (tests with bare MagicMock)
+        don't expose `get_stale_cycle_count`. The log must still
+        render the pane-stuck block — just without the cycle count
+        suffix — instead of crashing or emitting a 0-cycles line.
+        """
+        from orchestrator.watchdog import IdleWatchdog
+        cfg = {
+            "agents": {
+                "hub": {"runtime": "claude_code"},
+                "dgx": {"runtime": "claude_code"},
+            },
+            "watchdog": {"check_interval": 60, "idle_cooldown": 300},
+        }
+        tmux = MagicMock(spec=[])  # strict: no attributes surface
+        wd = IdleWatchdog(
+            lifecycle=MagicMock(current_task=None),
+            state_machine=MagicMock(current_state="idle", initial_state="idle"),
+            nats_client=AsyncMock(),
+            tmux_comm=tmux,
+            config=cfg,
+            task_queue=None,
+            activity_tracker=None,
+        )
+        wd._last_pane_state_by_agent = {"dgx": "unknown"}
+        msg = wd._format_cycle_log(cycle=9, active=[])
+        # Bare "pane-stuck: dgx" (no cycle count suffix) is fine.
+        assert "pane-stuck: dgx" in msg
+
+
+# ---------------------------------------------------------------------------
 # Check Idle Agents Tests
 # ---------------------------------------------------------------------------
 
