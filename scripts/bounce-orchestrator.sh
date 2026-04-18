@@ -12,7 +12,7 @@
 #   2. Sends SIGTERM, waits up to 5s, then SIGKILL if still alive
 #   3. Removes the lock file
 #   4. Finds the orchestrator pane by @label lookup (same pattern as
-#      orchestrator/tmux_comm.py::_scan_control_pane_labels) and sends
+#      orchestrator/tmux_comm.py::_scan_pane_labels) and sends
 #      the launch command there. Falls back to control.0 ONLY when no
 #      pane labelled "orchestrator" is found — important because the
 #      Fix 5 layout puts orch at control.1, not control.0.

@@ -162,16 +162,29 @@ class TmuxComm:
             _CFG_NUDGE_SEND_RETRIES, _DEFAULT_SEND_RETRIES,
         )
 
-        # Build pane mapping: agent_name -> 0-based pane index (config order).
+        # Build pane mapping: agent_name -> 0-based pane index.
         # Skip agents with role=monitor -- they launch in the control window,
         # not the agents window (mirrors start.sh behaviour).
+        #
+        # Prefer live tmux @label lookup (robust to start.sh's
+        # TMUX_PANE_ORDER + tmux's spatial-split renumbering). Fall back
+        # to config order if tmux isn't reachable (e.g. unit tests).
+        # start.sh sets @label to one of: the configured label field,
+        # ``<name> (<host>)`` for remote SSH agents, or ``<name> (local)``
+        # for local agents -- all three variants are handled by
+        # ``_match_agent_to_label``. See issue #51.
         pane_agents = [
-            name for name, cfg in config[_CFG_AGENTS].items()
+            (name, cfg.get("label", name) if isinstance(cfg, dict) else name)
+            for name, cfg in config[_CFG_AGENTS].items()
             if not (isinstance(cfg, dict) and cfg.get("role") == "monitor")
         ]
-        self._pane_mapping: dict[str, int] = {
-            name: idx for idx, name in enumerate(pane_agents)
-        }
+        agents_label_to_index = self._scan_pane_labels(_AGENTS_WINDOW)
+        self._pane_mapping: dict[str, int] = {}
+        for fallback_idx, (name, label) in enumerate(pane_agents):
+            idx = self._match_agent_to_label(name, label, agents_label_to_index)
+            if idx is None:
+                idx = fallback_idx
+            self._pane_mapping[name] = idx
 
         # Monitor agents live in the control window.  Rather than hardcode
         # pane indices (which break if the user rearranges the layout),
@@ -186,11 +199,11 @@ class TmuxComm:
             if isinstance(cfg, dict) and cfg.get("role") == "monitor"
         ]
         if monitors:
-            label_to_index = self._scan_control_pane_labels()
+            control_label_to_index = self._scan_pane_labels("control")
             for fallback_idx, (name, label) in enumerate(monitors, start=1):
-                idx = label_to_index.get(label)
-                if idx is None:
-                    idx = label_to_index.get(name)
+                idx = self._match_agent_to_label(
+                    name, label, control_label_to_index,
+                )
                 if idx is None:
                     idx = fallback_idx
                 self._control_pane_mapping[name] = (
@@ -219,8 +232,8 @@ class TmuxComm:
         # Escalation callback
         self._flag_human_callback: Optional[FlagHumanCallback] = None
 
-    def _scan_control_pane_labels(self) -> dict[str, int]:
-        """Scan the control window for pane @labels and return a
+    def _scan_pane_labels(self, window: str) -> dict[str, int]:
+        """Scan a tmux window for pane @labels and return a
         ``{label: pane_index}`` mapping.
 
         Returns an empty dict on any failure (tmux not running, session
@@ -230,7 +243,7 @@ class TmuxComm:
             result = subprocess.run(
                 [
                     "tmux", "list-panes",
-                    "-t", f"{self._session_name}:control",
+                    "-t", f"{self._session_name}:{window}",
                     "-F", "#{pane_index}\t#{@label}",
                 ],
                 capture_output=True,
@@ -254,6 +267,33 @@ class TmuxComm:
             except ValueError:
                 continue
         return mapping
+
+    @staticmethod
+    def _match_agent_to_label(
+        name: str, configured_label: str, label_to_index: dict[str, int],
+    ) -> Optional[int]:
+        """Resolve an agent to its pane index by matching @label variants.
+
+        start.sh (setup_agent_panes) sets @label to one of three forms:
+          1. The agent's configured ``label`` field (e.g. "dev", "qa")
+          2. ``<name> (<host>)`` for remote SSH agents
+          3. ``<name> (local)`` for local agents
+        Control-window monitors use form 1. This helper tries the
+        configured-label exact match first, then bare name, then the
+        parenthesised "<name> (...)" variant.
+
+        Returns None if no match is found, letting the caller fall back
+        to a positional default (safe for unit tests with no tmux).
+        """
+        if configured_label and configured_label in label_to_index:
+            return label_to_index[configured_label]
+        if name in label_to_index:
+            return label_to_index[name]
+        name_prefix = f"{name} ("
+        for lbl, idx in label_to_index.items():
+            if lbl.startswith(name_prefix):
+                return idx
+        return None
 
     # ------------------------------------------------------------------
     # Public API
