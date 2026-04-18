@@ -55,6 +55,20 @@ from orchestrator.tmux_comm import (  # noqa: E402
 _TEST_AGENT = "smoke"
 
 
+def _tmux_for_test() -> list[str]:
+    """Return the ``tmux`` argv prefix honoring ``MAS_TMUX_SOCKET``.
+
+    Conftest sets this env var for the whole pytest session (see #46)
+    so every direct ``subprocess.run(["tmux", ...])`` in this module
+    rides the isolated socket instead of the default one.
+    """
+    import os as _os
+    socket = _os.environ.get("MAS_TMUX_SOCKET")
+    if socket:
+        return ["tmux", "-L", socket]
+    return ["tmux"]
+
+
 def _build_comm(session_name: str) -> TmuxComm:
     """Build a minimal TmuxComm instance wired to *session_name*.
 
@@ -78,7 +92,7 @@ def _build_comm(session_name: str) -> TmuxComm:
 
 def _kill_session(session_name: str) -> None:
     subprocess.run(
-        ["tmux", "kill-session", "-t", session_name],
+        [*_tmux_for_test(), "kill-session", "-t", session_name],
         capture_output=True,
         check=False,
     )
@@ -87,7 +101,7 @@ def _kill_session(session_name: str) -> None:
 def _send_line(session_name: str, pane_target: str, text: str) -> None:
     """Write *text* into the target pane as a literal, no Enter."""
     subprocess.run(
-        ["tmux", "send-keys", "-t", pane_target, text],
+        [*_tmux_for_test(), "send-keys", "-t", pane_target, text],
         capture_output=True,
         check=False,
     )
@@ -97,7 +111,7 @@ def _send_keys_with_enter(
     session_name: str, pane_target: str, text: str,
 ) -> None:
     subprocess.run(
-        ["tmux", "send-keys", "-t", pane_target, text, "Enter"],
+        [*_tmux_for_test(), "send-keys", "-t", pane_target, text, "Enter"],
         capture_output=True,
         check=False,
     )
@@ -106,7 +120,7 @@ def _send_keys_with_enter(
 def _clear_pane(session_name: str, pane_target: str) -> None:
     """Clear the terminal in the pane so state is predictable."""
     subprocess.run(
-        ["tmux", "send-keys", "-t", pane_target, "clear", "Enter"],
+        [*_tmux_for_test(), "send-keys", "-t", pane_target, "clear", "Enter"],
         capture_output=True,
         check=False,
     )
@@ -129,7 +143,7 @@ def smoke_session():
     # hardcoded window name TmuxComm targets).
     result = subprocess.run(
         [
-            "tmux", "new-session", "-d", "-s", session_name,
+            *_tmux_for_test(), "new-session", "-d", "-s", session_name,
             "-n", "agents",
             "-x", "100", "-y", "40",
         ],

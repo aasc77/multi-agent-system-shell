@@ -26,6 +26,18 @@ readonly FLAG_KILL_NATS="--kill-nats"
 
 DRY_RUN="${_TEST_DRY_RUN:-false}"
 
+# If MAS_TMUX_SOCKET is set, route every tmux invocation through
+# `tmux -L <socket>` — dedicated socket = dedicated server = full
+# namespace isolation from default-socket user sessions. Used by
+# pytest (see tests/conftest.py). See #46.
+_tmux() {
+    if [ -n "${MAS_TMUX_SOCKET:-}" ]; then
+        command tmux -L "$MAS_TMUX_SOCKET" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
 # -----------------------------------------------------------------------
 # Argument validation
 # -----------------------------------------------------------------------
@@ -70,7 +82,7 @@ session_exists() {
         [ "$_TEST_SESSION_EXISTS" = "true" ]
         return
     fi
-    tmux has-session -t "$SESSION_NAME" 2>/dev/null
+    _tmux has-session -t "$SESSION_NAME" 2>/dev/null
 }
 
 # -----------------------------------------------------------------------
@@ -148,7 +160,7 @@ kill_tmux_session() {
     if [ "$DRY_RUN" = "true" ]; then
         echo "[DRY-RUN] tmux kill-session -t $target"
     else
-        tmux kill-session -t "$target" 2>/dev/null || true
+        _tmux kill-session -t "$target" 2>/dev/null || true
     fi
 }
 
@@ -161,7 +173,7 @@ if session_exists; then
         if [ "$DRY_RUN" = "true" ]; then
             kill_tmux_session "$target"
         else
-            if tmux has-session -t "$target" 2>/dev/null; then
+            if _tmux has-session -t "$target" 2>/dev/null; then
                 kill_tmux_session "$target"
             fi
         fi
@@ -170,12 +182,16 @@ if session_exists; then
     # Belt-and-suspenders: any other sessions in the same group (e.g.
     # auto-numbered cruft created before the -A -s fix landed).
     if [ "$DRY_RUN" != "true" ]; then
-        tmux list-sessions -F '#{session_name}|#{session_group}' 2>/dev/null \
+        # `|| true` on the list: when no tmux server is running on
+        # the active socket (MAS_TMUX_SOCKET case during pytest, or
+        # default socket with no sessions), `list-sessions` exits
+        # non-zero and pipefail would kill stop.sh. Swallow it.
+        { _tmux list-sessions -F '#{session_name}|#{session_group}' 2>/dev/null || true; } \
             | awk -F'|' -v g="${SESSION_NAME}" '$2==g {print $1}' \
             | while read -r stray; do
                 [ -z "$stray" ] && continue
                 echo "Killing stray grouped session: $stray"
-                tmux kill-session -t "$stray" 2>/dev/null || true
+                _tmux kill-session -t "$stray" 2>/dev/null || true
             done
     fi
 

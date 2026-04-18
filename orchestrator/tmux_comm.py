@@ -26,11 +26,26 @@ from __future__ import annotations
 import enum
 import hashlib
 import logging
+import os
 import subprocess
 import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _tmux_cmd() -> list[str]:
+    """Return the ``tmux`` argv prefix, honoring ``MAS_TMUX_SOCKET``.
+
+    When the env var is set, every ``subprocess.run`` dispatched from
+    this module prepends ``-L <socket>``, routing ops to a dedicated
+    tmux server. Used by pytest (see ``tests/conftest.py``) to isolate
+    test tmux operations from default-socket user sessions. See #46.
+    """
+    socket = os.environ.get("MAS_TMUX_SOCKET")
+    if socket:
+        return ["tmux", "-L", socket]
+    return ["tmux"]
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +244,7 @@ class TmuxComm:
         try:
             result = subprocess.run(
                 [
-                    "tmux", "list-panes",
+                    *_tmux_cmd(), "list-panes",
                     "-t", f"{self._session_name}:control",
                     "-F", "#{pane_index}\t#{@label}",
                 ],
@@ -295,7 +310,7 @@ class TmuxComm:
         """
         target = self.get_target(agent)
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+            [*_tmux_cmd(), "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
             capture_output=True,
             text=True,
         )
@@ -581,7 +596,7 @@ class TmuxComm:
         """
         result = subprocess.run(
             [
-                "tmux", "display-message", "-p", "-t", target,
+                *_tmux_cmd(), "display-message", "-p", "-t", target,
                 "#{pane_current_command}",
             ],
             capture_output=True,
@@ -595,7 +610,7 @@ class TmuxComm:
     def _tmux_send_keys_once(target: str, text: str) -> bool:
         """Send text + Enter to a tmux pane. Returns True if tmux commands succeeded."""
         result = subprocess.run(
-            ["tmux", "send-keys", "-t", target, text],
+            [*_tmux_cmd(), "send-keys", "-t", target, text],
             capture_output=True,
             text=True,
         )
@@ -604,7 +619,7 @@ class TmuxComm:
             return False
         time.sleep(_SEND_KEYS_DELAY)
         result = subprocess.run(
-            ["tmux", "send-keys", "-t", target, "Enter"],
+            [*_tmux_cmd(), "send-keys", "-t", target, "Enter"],
             capture_output=True,
             text=True,
         )
@@ -617,7 +632,7 @@ class TmuxComm:
     def _tmux_clear_input(target: str) -> None:
         """Send Escape to clear any partial TUI input state."""
         subprocess.run(
-            ["tmux", "send-keys", "-t", target, "Escape"],
+            [*_tmux_cmd(), "send-keys", "-t", target, "Escape"],
             capture_output=True,
             text=True,
         )
@@ -627,7 +642,7 @@ class TmuxComm:
     def _capture_pane_text(target: str, lines: int = 5) -> str:
         """Capture recent pane text for delivery verification."""
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+            [*_tmux_cmd(), "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
             capture_output=True,
             text=True,
         )
