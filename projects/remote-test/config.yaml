@@ -26,7 +26,12 @@ watchdog:
 agents:
   manager:
     runtime: claude_code
-    working_dir: .
+    # Manager runs in a dedicated git worktree so fun-mode and
+    # operational-script writes don't cross-contaminate whichever
+    # branch hub has checked out in the primary working directory.
+    # Created on first start via scripts/setup-manager-worktree.sh
+    # (idempotent). See #45.
+    working_dir: ../multi-agent-system-shell-manager
     role: monitor
     label: manager
     system_prompt: "You are the manager agent. Follow the instructions in manager/CLAUDE.md exactly. Start your monitoring loop immediately. Be silent when things work."
