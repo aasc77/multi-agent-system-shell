@@ -30,6 +30,7 @@ from orchestrator.logging_setup import setup_logging
 from orchestrator.session_report import SessionReport
 from orchestrator.watchdog import IdleWatchdog, InactivityAnnouncer
 from orchestrator.delivery import DeliveryProtocol
+from orchestrator.activity_tracker import ActivityTracker
 from orchestrator.version import (
     capture_startup_info,
     make_version_request_handler,
@@ -193,6 +194,11 @@ delivery = DeliveryProtocol(
     config=component_config,
 )
 
+# Per-agent MCP activity tracker (#55). Wired to MessageRouter so
+# every NATS outbox/inbox event updates the recency map; watchdog
+# reads it each cycle for the composite log line.
+activity_tracker = ActivityTracker()
+
 # Lifecycle manager
 lifecycle = TaskLifecycleManager(
     task_queue=task_queue,
@@ -227,6 +233,7 @@ watchdog = IdleWatchdog(
     tmux_comm=tmux_comm,
     config=component_config,
     task_queue=task_queue,
+    activity_tracker=activity_tracker,
 )
 
 # Message router
@@ -238,6 +245,7 @@ router = MessageRouter(
     tmux_comm=tmux_comm,
     watchdog=watchdog,
     delivery=delivery,
+    activity_tracker=activity_tracker,
 )
 
 # --- Interactive command reader ---

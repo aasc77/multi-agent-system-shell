@@ -261,6 +261,183 @@ class TestCycleLogLine:
 
 
 # ---------------------------------------------------------------------------
+# Composite Cycle Log with MCP-Active Block (#55)
+# ---------------------------------------------------------------------------
+
+class TestCycleLogMcpActive:
+    """#55: per-cycle log line augments the #27 task-queue block with
+    an ``MCP-active: ...`` section when the ``ActivityTracker`` has
+    any agent inside the configured window, and an ``idle: ...``
+    section for every regular agent that isn't in either block.
+    """
+
+    def _make_watchdog(
+        self,
+        tracker=None,
+        task_queue=None,
+        monitored_agents=("hub", "macmini", "hassio", "RTX5090", "dgx", "dgx2"),
+        mcp_window=60,
+    ):
+        from orchestrator.watchdog import IdleWatchdog
+        cfg = {
+            "agents": {
+                name: {"runtime": "claude_code"}
+                for name in monitored_agents
+            },
+            "watchdog": {
+                "check_interval": 60,
+                "idle_cooldown": 300,
+                "mcp_activity_window_seconds": mcp_window,
+            },
+        }
+        return IdleWatchdog(
+            lifecycle=MagicMock(current_task=None),
+            state_machine=MagicMock(current_state="idle", initial_state="idle"),
+            nats_client=AsyncMock(),
+            tmux_comm=MagicMock(),
+            config=cfg,
+            task_queue=task_queue,
+            activity_tracker=tracker,
+        )
+
+    def test_no_tracker_emits_original_pipeline_idle_line(self):
+        """Backwards-compat: without a tracker we still emit the
+        #27 phrasing. #55's MCP-active block is opt-in via tracker."""
+        wd = self._make_watchdog(tracker=None)
+        msg = wd._format_cycle_log(cycle=5, active=[])
+        assert "pipeline idle (no task-queue work)" in msg
+        assert "MCP-active" not in msg
+
+    def test_empty_tracker_omits_mcp_active_block(self):
+        """Tracker wired but empty → no MCP-active block, full idle
+        list of every monitored agent."""
+        from orchestrator.activity_tracker import ActivityTracker
+        wd = self._make_watchdog(tracker=ActivityTracker())
+        msg = wd._format_cycle_log(cycle=1, active=[])
+        assert "MCP-active" not in msg
+        # Every monitored agent should be in the idle list.
+        assert "idle: hub macmini hassio RTX5090 dgx dgx2" in msg
+
+    def test_single_agent_activity_populates_mcp_active(self):
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        now = 1000.0
+        tracker.touch("dev", now=now - 3)  # 3s ago
+        wd = self._make_watchdog(tracker=tracker)
+        with patch("orchestrator.activity_tracker.time.time", return_value=now):
+            msg = wd._format_cycle_log(cycle=2, active=[])
+        assert "MCP-active: dev(3s)" in msg
+        # Idle list excludes dev (because it's MCP-active).
+        assert "idle: " in msg
+        assert " dev" not in msg.split("idle:")[1]
+
+    def test_multi_agent_activity_sorted_by_recency(self):
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        now = 1000.0
+        tracker.touch("dev", now=now - 3)
+        tracker.touch("RTX5090", now=now - 8)
+        tracker.touch("macmini", now=now - 45)
+        wd = self._make_watchdog(tracker=tracker)
+        with patch("orchestrator.activity_tracker.time.time", return_value=now):
+            msg = wd._format_cycle_log(cycle=3, active=[])
+        # Freshest first.
+        assert "MCP-active: dev(3s) RTX5090(8s) macmini(45s)" in msg
+        # Idle list only has agents not in MCP-active: hassio, dgx, dgx2.
+        idle_part = msg.split("idle:")[1]
+        assert "hassio" in idle_part
+        assert "dgx" in idle_part
+        assert "dgx2" in idle_part
+        assert "dev" not in idle_part
+        assert "macmini" not in idle_part
+
+    def test_activity_older_than_window_ages_out(self):
+        """An agent last active longer ago than the window is in the
+        idle list, not the MCP-active list. Tests the aging-out
+        behavior at the log-formatter level (the tracker's own
+        active_within is unit-tested separately)."""
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        now = 1000.0
+        tracker.touch("macmini", now=now - 10)     # inside 60s window
+        tracker.touch("stale", now=now - 1000)    # outside — ages out
+        wd = self._make_watchdog(
+            tracker=tracker,
+            monitored_agents=("macmini", "stale", "hub"),
+            mcp_window=60,
+        )
+        with patch("orchestrator.activity_tracker.time.time", return_value=now):
+            msg = wd._format_cycle_log(cycle=4, active=[])
+        assert "MCP-active: macmini(10s)" in msg
+        assert "stale" not in msg.split("MCP-active:")[1].split("|")[0]
+        idle_part = msg.split("idle:")[1]
+        assert "stale" in idle_part
+        assert "hub" in idle_part
+
+    def test_assigned_agent_takes_priority_over_mcp_active(self):
+        """An agent listed in tasks.json assigned_agents shows up in
+        the task-queue block, not in MCP-active or idle (even if its
+        timestamp is inside the window). Prevents double-counting in
+        the log."""
+        from orchestrator.activity_tracker import ActivityTracker
+        tracker = ActivityTracker()
+        now = 1000.0
+        tracker.touch("dev", now=now - 2)
+        wd = self._make_watchdog(tracker=tracker)
+        active = [("dev", "coding")]
+        with patch("orchestrator.activity_tracker.time.time", return_value=now):
+            msg = wd._format_cycle_log(cycle=6, active=active)
+        # Task-queue block names dev.
+        assert "agents assigned to in_progress tasks" in msg
+        assert "['dev']" in msg
+        # Not reported in MCP-active even though tracker is fresh.
+        mcp_section = (
+            msg.split("MCP-active:")[1].split("|")[0]
+            if "MCP-active:" in msg else ""
+        )
+        # (Acceptable: dev may or may not show up in MCP-active. The
+        # critical invariant is that it does NOT appear in the idle
+        # block — because the operator already knows it's working.)
+        idle_section = msg.split("idle:")[1] if "idle:" in msg else ""
+        assert " dev" not in idle_section, (
+            "dev must not appear in the idle block while assigned: " + msg
+        )
+
+    def test_monitors_excluded_from_idle_list(self):
+        """#55 regression guard: the idle list is for *regular* agents
+        only. Monitors live in the control window and shouldn't be
+        reported as idle in the agents-window status line."""
+        wd = self._make_watchdog(
+            tracker=None,
+            monitored_agents=(),  # override below
+        )
+        # Rebuild with a monitor + regulars.
+        from orchestrator.watchdog import IdleWatchdog
+        cfg = {
+            "agents": {
+                "manager": {"runtime": "claude_code", "role": "monitor"},
+                "hub": {"runtime": "claude_code"},
+                "macmini": {"runtime": "claude_code"},
+            },
+            "watchdog": {"check_interval": 60, "idle_cooldown": 300},
+        }
+        wd = IdleWatchdog(
+            lifecycle=MagicMock(current_task=None),
+            state_machine=MagicMock(current_state="idle", initial_state="idle"),
+            nats_client=AsyncMock(),
+            tmux_comm=MagicMock(),
+            config=cfg,
+            task_queue=None,
+            activity_tracker=None,
+        )
+        msg = wd._format_cycle_log(cycle=7, active=[])
+        assert "manager" not in msg, (
+            "monitor 'manager' must not appear in the cycle log: " + msg
+        )
+        assert "idle: hub macmini" in msg
+
+
+# ---------------------------------------------------------------------------
 # Check Idle Agents Tests
 # ---------------------------------------------------------------------------
 

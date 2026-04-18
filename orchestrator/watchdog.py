@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CHECK_INTERVAL = 60  # seconds between checks
 _DEFAULT_IDLE_COOLDOWN = 300  # don't re-alert same agent within this window
+# #55: agents with MCP activity inside this window show up in the
+# per-cycle log's "MCP-active" block; older activity is treated as
+# idle. Kept short so the log only surfaces genuinely recent traffic.
+_DEFAULT_MCP_ACTIVITY_WINDOW = 60
 _CAPTURE_LINES = 20  # lines to capture from pane
 
 # Auth-failure detection (issue #28).
@@ -201,12 +205,24 @@ class IdleWatchdog:
         tmux_comm: Any,
         config: dict[str, Any],
         task_queue: Any = None,
+        activity_tracker: Any = None,
     ) -> None:
         self._lifecycle = lifecycle
         self._state_machine = state_machine
         self._nats_client = nats_client
         self._tmux_comm = tmux_comm
         self._task_queue = task_queue
+        self._activity_tracker = activity_tracker
+
+        # The list of non-monitor agent names is used in every per-cycle
+        # log line to compute the "idle" block in the #55 composite
+        # format. Snapshot at init so the log-line code stays constant
+        # time regardless of config size.
+        agents_cfg = config.get("agents", {})
+        self._monitored_agents: list[str] = [
+            name for name, cfg in agents_cfg.items()
+            if not (isinstance(cfg, dict) and cfg.get("role") == "monitor")
+        ]
 
         watchdog_cfg = config.get("watchdog", {})
         self._check_interval: int = watchdog_cfg.get(
@@ -215,6 +231,9 @@ class IdleWatchdog:
         self._idle_cooldown: int = watchdog_cfg.get(
             "idle_cooldown", _DEFAULT_IDLE_COOLDOWN,
         )
+        self._mcp_activity_window: float = float(watchdog_cfg.get(
+            "mcp_activity_window_seconds", _DEFAULT_MCP_ACTIVITY_WINDOW,
+        ))
         self._auth_alert_cooldown: int = watchdog_cfg.get(
             "auth_alert_cooldown", _DEFAULT_AUTH_ALERT_COOLDOWN,
         )
@@ -253,6 +272,67 @@ class IdleWatchdog:
     # Public API
     # ------------------------------------------------------------------
 
+    def _format_cycle_log(
+        self,
+        cycle: int,
+        active: list[tuple[str, str]],
+    ) -> str:
+        """Build the per-cycle composite log line (#27 + #55).
+
+        Three sections, separated by `` | `` when present:
+
+        1. **Task-queue block** (#27):
+           ``Watchdog cycle N — <M> agents assigned to in_progress tasks: [...]``
+           OR ``Watchdog cycle N — pipeline idle (no task-queue work)``.
+        2. **MCP-active block** (#55): ``MCP-active: agent(Ns) agent(Ns)``,
+           sorted by recency (freshest first). Omitted entirely when
+           no agents are active within the configured window.
+        3. **Idle block** (#55): ``idle: a b c`` — every regular agent
+           not in the task-queue block and not MCP-active. Omitted
+           when empty.
+        """
+        if active:
+            prefix = (
+                f"Watchdog cycle {cycle} — "
+                f"{len(active)} agents assigned to in_progress tasks: "
+                f"{[a for a, _ in active]}"
+            )
+        else:
+            prefix = (
+                f"Watchdog cycle {cycle} — pipeline idle "
+                f"(no task-queue work)"
+            )
+        mcp_active_pairs: list[tuple[str, float]] = []
+        if self._activity_tracker is not None:
+            try:
+                mcp_active_pairs = self._activity_tracker.active_within(
+                    self._mcp_activity_window,
+                )
+            except Exception:
+                logger.debug(
+                    "activity_tracker.active_within failed",
+                    exc_info=True,
+                )
+        parts: list[str] = [prefix]
+        if mcp_active_pairs:
+            mcp_active_str = " ".join(
+                f"{agent}({int(age)}s)"
+                for agent, age in mcp_active_pairs
+            )
+            parts.append(f"MCP-active: {mcp_active_str}")
+
+        # Idle = regular agents not in either block above.
+        assigned_names = {name for name, _ in active}
+        mcp_active_names = {name for name, _ in mcp_active_pairs}
+        idle_agents = [
+            name for name in self._monitored_agents
+            if name not in assigned_names
+            and name not in mcp_active_names
+        ]
+        if idle_agents:
+            parts.append(f"idle: {' '.join(idle_agents)}")
+        return " | ".join(parts)
+
     async def run(self) -> None:
         """Main watchdog loop. Call as an asyncio task."""
         logger.info("Idle watchdog started (interval=%ds)", self._check_interval)
@@ -261,16 +341,7 @@ class IdleWatchdog:
             await asyncio.sleep(self._check_interval)
             cycle += 1
             active = self._get_active_agents()
-            if active:
-                logger.info(
-                    "Watchdog cycle %d — %d agents assigned to in_progress tasks: %s",
-                    cycle, len(active), [a for a, _ in active],
-                )
-            else:
-                logger.info(
-                    "Watchdog cycle %d — pipeline idle (no task-queue work)",
-                    cycle,
-                )
+            logger.info(self._format_cycle_log(cycle, active))
             try:
                 await self._check_idle_agents()
             except Exception:
