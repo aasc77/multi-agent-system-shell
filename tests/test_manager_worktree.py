@@ -697,6 +697,99 @@ class TestBaseBranchPriority:
             f"expected {seed_sha}, got {head_here}"
         )
 
+    def _build_ahead_repo(self, tmp_path, ahead_count: int) -> tuple[Path, Path]:
+        """Helper: build a repo with local feat/manager-agent exactly
+        ``ahead_count`` commits ahead of origin/feat/manager-agent.
+        Returns (repo_dir, worktree_path).
+        """
+        repo_dir = tmp_path / "repo"
+        subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.email", "t@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.name", "T"],
+            check=True,
+        )
+        (repo_dir / "README.md").write_text("seed\n")
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "add", "README.md"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "-q", "-m", "seed"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "branch", "-m", "feat/manager-agent"],
+            check=True,
+        )
+        seed_sha = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        # Pin remote at the seed commit.
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "update-ref",
+             "refs/remotes/origin/feat/manager-agent", seed_sha],
+            check=True,
+        )
+        for i in range(ahead_count):
+            (repo_dir / f"local{i}.txt").write_text(f"ahead-{i}\n")
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "add", f"local{i}.txt"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "commit",
+                 "-q", "-m", f"LOCAL ahead {i}"],
+                check=True,
+            )
+        self._install_setup_script(repo_dir)
+        return repo_dir, tmp_path / "mgr-wt"
+
+    def test_log_text_no_duplicate_local_prefix(self, tmp_path):
+        """#71: the log wrapper says \"(local '<branch>' is ${state})\",
+        so the state string must NOT start with another \"local \" —
+        otherwise operators see \"(local 'feat/manager-agent' is local
+        11 commits behind)\" with the word duplicated.
+        """
+        repo_dir, worktree_path = self._build_ahead_repo(tmp_path, ahead_count=3)
+        result = subprocess.run(
+            ["bash", str(repo_dir / "scripts" / "setup-manager-worktree.sh")],
+            capture_output=True, text=True,
+            env={**os.environ, "MAS_MANAGER_WORKTREE": str(worktree_path)},
+        )
+        assert result.returncode == 0, result.stderr
+        combined = result.stdout + result.stderr
+        assert "is local " not in combined, (
+            "state string must not re-introduce the 'local' prefix "
+            "that the surrounding log already provides; got:\n"
+            + combined
+        )
+        # The correct phrasing is still present.
+        assert "is 3 commits ahead" in combined, combined
+
+    def test_log_text_singular_commit_when_ahead_by_one(self, tmp_path):
+        """#71: N=1 must render as ``1 commit`` (singular), not
+        ``1 commits`` (plural-s).
+        """
+        repo_dir, worktree_path = self._build_ahead_repo(tmp_path, ahead_count=1)
+        result = subprocess.run(
+            ["bash", str(repo_dir / "scripts" / "setup-manager-worktree.sh")],
+            capture_output=True, text=True,
+            env={**os.environ, "MAS_MANAGER_WORKTREE": str(worktree_path)},
+        )
+        assert result.returncode == 0, result.stderr
+        combined = result.stdout + result.stderr
+        assert "is 1 commit ahead" in combined, (
+            "N=1 must render as singular 'commit' without plural-s; "
+            "got:\n" + combined
+        )
+        assert "1 commits" not in combined, (
+            "plural-s at N=1 is the exact bug this test is pinning"
+        )
+
 
 class TestStartShInvokesSetup:
     def test_start_sh_source_calls_setup_script(self):
