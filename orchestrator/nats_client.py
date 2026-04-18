@@ -406,6 +406,21 @@ class NatsClient:
         await self._conn.subscribe(subject, cb=callback)
         logger.info("Subscribed to delivery ACKs: %s", subject)
 
+    async def subscribe_heartbeat(self, callback: MessageCallback) -> None:
+        """Subscribe to heartbeat subjects via core NATS (#80).
+
+        Listens on ``<prefix>.*.heartbeat`` for the fire-and-forget
+        liveness signal each MCP bridge publishes every
+        ``MAS_HEARTBEAT_INTERVAL_SEC`` seconds. Core NATS (not
+        JetStream) because we want the freshest observation, not
+        a replay of historical heartbeats when the orchestrator
+        (re)connects.
+        """
+        self._require_connected()
+        subject = f"{self._prefix}.*.heartbeat"
+        await self._conn.subscribe(subject, cb=callback)
+        logger.info("Subscribed to heartbeats: %s", subject)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

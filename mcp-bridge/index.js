@@ -27,8 +27,23 @@ const nats = require('nats');
 const SUBJECT_PREFIX = 'agents';
 const CHANNEL_INBOX = 'inbox';
 const CHANNEL_OUTBOX = 'outbox';
+const CHANNEL_HEARTBEAT = 'heartbeat';
 const STREAM_NAME = 'AGENTS';
 const OUTBOX_MESSAGE_TYPE = 'agent_complete';
+const HEARTBEAT_MESSAGE_TYPE = 'heartbeat';
+
+// #80: heartbeat publisher interval, seconds. The orchestrator
+// gates NEIGHBOR UP/DOWN on a heartbeat seen within 2×
+// HEARTBEAT_INTERVAL_MS, so too-short an interval floods NATS
+// and too-long an interval delays DOWN detection. 30s matches
+// the existing _STARTUP_GRACE_PERIOD so a fresh boot has one
+// grace window to publish its first heartbeat before delivery
+// can demote it.
+const HEARTBEAT_DEFAULT_INTERVAL_SEC = 30;
+const HEARTBEAT_INTERVAL_SEC = parseInt(
+  process.env.MAS_HEARTBEAT_INTERVAL_SEC || HEARTBEAT_DEFAULT_INTERVAL_SEC,
+  10,
+);
 
 const TOOL_CHECK_MESSAGES = 'check_messages';
 const TOOL_SEND_MESSAGE = 'send_message';
@@ -71,10 +86,14 @@ if (!natsUrl) {
 
 const inboxSubject = buildSubject(agentRole, CHANNEL_INBOX);
 const outboxSubject = buildSubject(agentRole, CHANNEL_OUTBOX);
+const heartbeatSubject = buildSubject(agentRole, CHANNEL_HEARTBEAT);
 const sc = nats.StringCodec();
 
 let nc = null;
 let js = null;
+// #80: handle from setInterval so we can stop publishing on
+// shutdown / disconnect.
+let heartbeatTimer = null;
 
 // ---------------------------------------------------------------------------
 // Reconnection settings
@@ -141,6 +160,55 @@ async function connectNats() {
       }
     }
   })();
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat publisher (#80)
+// ---------------------------------------------------------------------------
+//
+// Publishes `{type: "heartbeat", agent: <role>, timestamp, interval_seconds}`
+// on `agents.<role>.heartbeat` at HEARTBEAT_INTERVAL_SEC intervals.
+// Core NATS (not JetStream) — ephemeral, fire-and-forget. The
+// orchestrator's HeartbeatTracker consumes these; delivery.py
+// uses them to gate NEIGHBOR UP/DOWN decisions so a stale tmux
+// pane (ssh-reconnect.sh keeping it alive past a real tunnel
+// death) can no longer false-positive an agent as UP.
+
+function publishHeartbeat() {
+  if (!nc) return;
+  const payload = JSON.stringify({
+    type: HEARTBEAT_MESSAGE_TYPE,
+    agent: agentRole,
+    timestamp: new Date().toISOString(),
+    interval_seconds: HEARTBEAT_INTERVAL_SEC,
+  });
+  try {
+    nc.publish(heartbeatSubject, sc.encode(payload));
+  } catch (err) {
+    // Don't crash the bridge over a missed heartbeat — the next
+    // tick will try again and the orchestrator's max-age window
+    // (2× interval) absorbs one missed beat.
+    process.stderr.write(
+      `[${new Date().toISOString()}] heartbeat publish failed: ${err.message}\n`,
+    );
+  }
+}
+
+function startHeartbeat() {
+  // First beat immediately so the orchestrator sees liveness
+  // before the first interval elapses.
+  publishHeartbeat();
+  heartbeatTimer = setInterval(publishHeartbeat, HEARTBEAT_INTERVAL_SEC * 1000);
+  process.stderr.write(
+    `[${new Date().toISOString()}] Heartbeat publishing on ${heartbeatSubject} every ${HEARTBEAT_INTERVAL_SEC}s\n`,
+  );
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer !== null) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -477,10 +545,27 @@ async function main() {
   // Start background inbox subscription (push notification channel)
   startInboxSubscription();
 
+  // #80: heartbeat publisher — authoritative liveness signal
+  // for the orchestrator's NEIGHBOR UP/DOWN determination.
+  startHeartbeat();
+
   process.stderr.write(`MCP bridge ready for "${agentRole}"\n`);
 }
 
+// Graceful shutdown: stop heartbeat before nc.close() so we don't
+// spin one more publish on a connection in the process of
+// tearing down.
+function shutdown() {
+  stopHeartbeat();
+  if (nc) {
+    nc.close().catch(() => {});
+  }
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
 main().catch((err) => {
   process.stderr.write(`MCP bridge fatal error: ${err.message}\n`);
+  stopHeartbeat();
   process.exit(1);
 });

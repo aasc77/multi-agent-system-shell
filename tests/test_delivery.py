@@ -7,7 +7,7 @@ retransmit/backoff, dead letters, grace period, push notification.
 import json
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -769,3 +769,364 @@ class TestRouteTableLog:
         assert not any("| pending=" in m for m in messages), (
             f"legacy `| pending=` label must be gone; got {messages!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# #80: heartbeat-gated probe + proactive UP→DOWN alerting
+# ---------------------------------------------------------------------------
+
+
+def _make_config_with_heartbeat(**hb_overrides):
+    """_make_config + a `heartbeat:` section that defaults to 30s
+    interval / 60s max-age / 60s startup grace (#80 defaults)."""
+    cfg = _make_config()
+    heartbeat = {
+        "interval_seconds": 30,
+        "max_age_seconds": 60,
+        "startup_grace_seconds": 60,
+        "alert_on_neighbor_down": True,
+        "neighbor_down_alert_cooldown_seconds": 600,
+    }
+    heartbeat.update(hb_overrides)
+    cfg["heartbeat"] = heartbeat
+    return cfg
+
+
+def _make_nats_mock():
+    """Async mock with publish_to_inbox tracking."""
+    mock = MagicMock()
+    mock.publish_to_inbox = AsyncMock()
+    return mock
+
+
+class TestHeartbeatGatedProbe:
+    """#80: ``_probe_neighbors`` must consult the ``HeartbeatTracker``
+    and force DOWN when the agent's MCP bridge has not heartbeated
+    within ``max_age_seconds``. This closes the ssh-reconnect
+    stale-pane false-positive gap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeat_plus_idle_pane_stays_up(self):
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        tracker.touch("hub")  # fresh heartbeat
+        tmux = _make_tmux(idle_agents=["hub"], reachable_agents=["hub"])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.UP
+
+    @pytest.mark.asyncio
+    async def test_stale_heartbeat_forces_down_even_when_pane_idle(self):
+        """The exact RTX5090 silent-logout scenario: pane looks
+        fine (❯ prompt visible) but the bridge has stopped
+        publishing. Heartbeat gate must override pane signal and
+        demote to DOWN.
+        """
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        # Heartbeat from 200s ago; max_age is 60s → stale.
+        tracker.touch("hub", now=time.time() - 200)
+        tmux = _make_tmux(idle_agents=["hub"], reachable_agents=["hub"])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        # Simulate orchestrator has been running past startup grace.
+        dp._orchestrator_started_at = time.time() - 600
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.DOWN
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeat_but_pane_capture_fails_is_down(self):
+        """Pane-level failure still wins when heartbeat is fresh —
+        we can't deliver to a pane we can't read. Covers the case
+        where the bridge is alive but tmux is broken."""
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        tracker.touch("hub")
+        tmux = _make_tmux(idle_agents=[], reachable_agents=[])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.DOWN
+
+    @pytest.mark.asyncio
+    async def test_startup_grace_never_seen_heartbeat_does_not_demote(self):
+        """During the orchestrator's startup-grace window, a
+        never-observed-heartbeat agent must NOT be forced DOWN.
+        Prevents alert-spam when bridges are still booting.
+        """
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()  # empty
+        tmux = _make_tmux(idle_agents=["hub"], reachable_agents=["hub"])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(startup_grace_seconds=300),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        # Orchestrator just started — inside the grace window.
+        dp._orchestrator_started_at = time.time() - 5
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.UP
+
+    @pytest.mark.asyncio
+    async def test_monitors_exempt_from_heartbeat_gate(self):
+        """Monitor agents don't have an MCP bridge that publishes
+        on the heartbeat pattern; pane state is the only signal
+        available for them. Must not be forced DOWN even when the
+        tracker has never seen a heartbeat from them."""
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()  # empty — including for manager
+        tmux = _make_tmux(
+            idle_agents=["manager"], reachable_agents=["manager"],
+        )
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        dp._orchestrator_started_at = time.time() - 600  # past grace
+        await dp._probe_neighbors()
+        assert dp._neighbors["manager"].state == NeighborState.UP
+
+    @pytest.mark.asyncio
+    async def test_no_tracker_preserves_pre_pr_probe_behavior(self):
+        """Without a heartbeat tracker wired up, ``_probe_neighbors``
+        behaves exactly as it did pre-#80 — pane-only determination."""
+        from orchestrator.delivery import DeliveryProtocol
+        tmux = _make_tmux(idle_agents=["hub"], reachable_agents=["hub"])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config(),
+            heartbeat_tracker=None,
+        )
+        _age_neighbors(dp)
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.UP
+
+
+class TestDownAlert:
+    """#80: UP/BUSY → DOWN transitions must fire a `manager_directive`
+    with subtype `agent_logout`, cooldown-suppressed and
+    env-kill-switchable.
+    """
+
+    @pytest.mark.asyncio
+    async def test_up_to_down_fires_directive_once(self):
+        from orchestrator.delivery import DeliveryProtocol, NeighborState
+        nats = _make_nats_mock()
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config_with_heartbeat(),
+            nats_client=nats,
+        )
+        # Force "past startup grace" so the alert isn't suppressed.
+        dp._orchestrator_started_at = time.time() - 600
+        n = dp._neighbors["hub"]
+        n.state = NeighborState.UP
+
+        await dp._maybe_alert_neighbor_down(n, NeighborState.UP)
+
+        nats.publish_to_inbox.assert_called_once()
+        call = nats.publish_to_inbox.call_args[0]
+        assert call[0] == "manager"
+        directive = call[1]
+        assert directive["type"] == "manager_directive"
+        assert directive["subtype"] == "agent_logout"
+        assert directive["agent"] == "hub"
+        assert directive["priority"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_repeated_down_within_cooldown_fires_once(self):
+        from orchestrator.delivery import DeliveryProtocol, NeighborState
+        nats = _make_nats_mock()
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config_with_heartbeat(
+                neighbor_down_alert_cooldown_seconds=600,
+            ),
+            nats_client=nats,
+        )
+        dp._orchestrator_started_at = time.time() - 600
+        n = dp._neighbors["hub"]
+
+        await dp._maybe_alert_neighbor_down(n, NeighborState.UP)
+        await dp._maybe_alert_neighbor_down(n, NeighborState.BUSY)
+        await dp._maybe_alert_neighbor_down(n, NeighborState.UP)
+
+        # Only the first fires; the rest are cooldown-suppressed.
+        assert nats.publish_to_inbox.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_startup_grace_suppresses_alert(self):
+        """Transitions observed during the startup-grace window
+        must not produce alerts (bounce-noise suppression)."""
+        from orchestrator.delivery import DeliveryProtocol, NeighborState
+        nats = _make_nats_mock()
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config_with_heartbeat(
+                startup_grace_seconds=300,
+            ),
+            nats_client=nats,
+        )
+        # Inside grace window.
+        dp._orchestrator_started_at = time.time() - 5
+        n = dp._neighbors["hub"]
+        await dp._maybe_alert_neighbor_down(n, NeighborState.UP)
+        nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_env_kill_switch_suppresses_alert(self, monkeypatch):
+        from orchestrator.delivery import DeliveryProtocol, NeighborState
+        nats = _make_nats_mock()
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config_with_heartbeat(),
+            nats_client=nats,
+        )
+        dp._orchestrator_started_at = time.time() - 600
+        monkeypatch.setenv("MAS_SUPPRESS_DOWN_ALERTS", "1")
+        n = dp._neighbors["hub"]
+        await dp._maybe_alert_neighbor_down(n, NeighborState.UP)
+        nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_config_flag_disables_alert(self):
+        """``alert_on_neighbor_down: false`` disables the path
+        entirely regardless of env / cooldown."""
+        from orchestrator.delivery import DeliveryProtocol, NeighborState
+        nats = _make_nats_mock()
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config_with_heartbeat(alert_on_neighbor_down=False),
+            nats_client=nats,
+        )
+        dp._orchestrator_started_at = time.time() - 600
+        n = dp._neighbors["hub"]
+        await dp._maybe_alert_neighbor_down(n, NeighborState.UP)
+        nats.publish_to_inbox.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_transition_up_to_down_fires_alert(self):
+        """End-to-end via the real probe loop: agent starts UP,
+        heartbeat goes stale, next probe demotes to DOWN AND
+        fires the alert."""
+        from orchestrator.delivery import DeliveryProtocol, NeighborState
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        # Start with a fresh heartbeat so the first probe lands on UP.
+        tracker.touch("hub")
+        tmux = _make_tmux(idle_agents=["hub"], reachable_agents=["hub"])
+        nats = _make_nats_mock()
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+            nats_client=nats,
+        )
+        _age_neighbors(dp)
+        dp._orchestrator_started_at = time.time() - 600
+
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.UP
+        nats.publish_to_inbox.assert_not_called()
+
+        # Now simulate bridge gone silent by overwriting the
+        # tracker entry with an ancient timestamp.
+        tracker.touch("hub", now=time.time() - 500)
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.DOWN
+        nats.publish_to_inbox.assert_called_once()
+        directive = nats.publish_to_inbox.call_args[0][1]
+        assert directive["subtype"] == "agent_logout"
+        assert directive["agent"] == "hub"
+
+
+class TestHeartbeatHandler:
+    """``handle_heartbeat_message`` forwards the agent name from a
+    heartbeat payload into the tracker."""
+
+    @pytest.mark.asyncio
+    async def test_handler_records_heartbeat(self):
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        msg = SimpleNamespace(data=json.dumps({
+            "type": "heartbeat",
+            "agent": "dgx",
+            "timestamp": "2026-04-18T00:00:00Z",
+            "interval_seconds": 30,
+        }).encode())
+        await dp.handle_heartbeat_message(msg)
+        assert tracker.last_seen("dgx") is not None
+
+    @pytest.mark.asyncio
+    async def test_handler_ignores_wrong_type(self):
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        msg = SimpleNamespace(data=json.dumps({
+            "type": "not_a_heartbeat", "agent": "dgx",
+        }).encode())
+        await dp.handle_heartbeat_message(msg)
+        assert tracker.snapshot() == {}
+
+    @pytest.mark.asyncio
+    async def test_handler_ignores_malformed_json(self):
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        msg = SimpleNamespace(data=b"not json")
+        await dp.handle_heartbeat_message(msg)  # must not raise
+        assert tracker.snapshot() == {}
+
+    @pytest.mark.asyncio
+    async def test_handler_noop_when_tracker_none(self):
+        """If no tracker is wired, the handler must still be safe
+        to invoke — the subscription may still be live in a
+        downgraded config."""
+        from orchestrator.delivery import DeliveryProtocol
+        dp = DeliveryProtocol(
+            tmux_comm=_make_tmux(),
+            config=_make_config(),
+            heartbeat_tracker=None,
+        )
+        msg = SimpleNamespace(data=json.dumps({
+            "type": "heartbeat", "agent": "hub",
+        }).encode())
+        await dp.handle_heartbeat_message(msg)  # must not raise

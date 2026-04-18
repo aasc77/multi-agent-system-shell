@@ -32,6 +32,7 @@ from orchestrator.watchdog import IdleWatchdog, InactivityAnnouncer
 from orchestrator.delivery import DeliveryProtocol
 from orchestrator.activity_tracker import ActivityTracker
 from orchestrator.pane_state_cache import PaneStateCache
+from orchestrator.heartbeat_tracker import HeartbeatTracker
 from orchestrator.version import (
     capture_startup_info,
     make_version_request_handler,
@@ -195,11 +196,19 @@ tmux_comm = TmuxComm(component_config)
 # away from agents that are actively WORKING.
 pane_state_cache = PaneStateCache()
 
+# #80: per-agent heartbeat tracker. Populated by the NATS
+# `agents.*.heartbeat` subscription (subscribed below); read by
+# delivery's probe loop to gate UP/DOWN determination against
+# real bridge liveness instead of pane content alone.
+heartbeat_tracker = HeartbeatTracker()
+
 # Delivery protocol (reliable nudge with ACK + retransmit)
 delivery = DeliveryProtocol(
     tmux_comm=tmux_comm,
     config=component_config,
     pane_state_cache=pane_state_cache,
+    heartbeat_tracker=heartbeat_tracker,
+    nats_client=nats_client,
 )
 
 # Per-agent MCP activity tracker (#55). Wired to MessageRouter so
@@ -322,8 +331,14 @@ async def main():
 
     # Start delivery protocol (reliable nudge with ACK + retransmit)
     await nats_client.subscribe_ack(delivery.handle_ack_message)
+    # #80: heartbeat subscription. Fires the tracker on every
+    # `agents.*.heartbeat` publish from any MCP bridge; delivery's
+    # probe loop reads the tracker to gate UP/DOWN decisions.
+    await nats_client.subscribe_heartbeat(delivery.handle_heartbeat_message)
     asyncio.create_task(delivery.run())
-    logger.info("Delivery protocol started -- ACK subscribed")
+    logger.info(
+        "Delivery protocol started -- ACK + heartbeat subscribed",
+    )
 
     # Start idle watchdog
     watchdog_cfg = component_config.get("watchdog", {})
