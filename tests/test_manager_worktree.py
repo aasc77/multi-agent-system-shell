@@ -304,6 +304,78 @@ class TestSetupScriptIdempotencyInTempRepo:
             f"second run should be a no-op, got:\n{combined}"
         )
 
+    def test_fails_when_worktree_exists_on_wrong_branch(self, tmp_path):
+        """#61 Observation 2: if the target path already IS a git
+        worktree but on a different branch than `manager-worktree`,
+        the setup script must error with an actionable message — not
+        silently no-op (which would leave manager pointing at the
+        wrong branch).
+
+        Before #61 the idempotency check was path-based only: any
+        worktree at the target path was treated as \"already set up\".
+        After #61 it must also verify the branch.
+        """
+        repo_dir = tmp_path / "repo"
+        self._make_repo(repo_dir)
+
+        # Add a second branch so we can put a worktree on it.
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "branch", "decoy-branch"],
+            check=True,
+        )
+        worktree_path = tmp_path / "mgr-wt-wrong-branch"
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "worktree", "add",
+             str(worktree_path), "decoy-branch"],
+            check=True, capture_output=True,
+        )
+        assert (worktree_path / "README.md").is_file(), (
+            "precondition: decoy worktree should have the seed README"
+        )
+
+        # Run setup against the existing-but-wrong-branch worktree.
+        test_scripts_dir = repo_dir / "scripts"
+        test_scripts_dir.mkdir()
+        dest = test_scripts_dir / "setup-manager-worktree.sh"
+        dest.write_text(SETUP_SCRIPT.read_text())
+        dest.chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(dest)],
+            capture_output=True, text=True,
+            env={
+                **os.environ,
+                "MAS_MANAGER_WORKTREE": str(worktree_path),
+            },
+        )
+        assert result.returncode != 0, (
+            "setup must error non-zero when the worktree is on the "
+            "wrong branch; got returncode=0"
+        )
+        combined = result.stdout + result.stderr
+        assert "decoy-branch" in combined, (
+            "error message must name the actual branch so the "
+            "operator can identify the stale worktree: " + combined
+        )
+        assert "manager-worktree" in combined, (
+            "error message must name the expected branch: " + combined
+        )
+        assert "git worktree remove" in combined, (
+            "error must include the actionable remediation command: "
+            + combined
+        )
+        # Worktree must not have been mutated — README still there,
+        # still on decoy-branch, still has the same contents.
+        assert (worktree_path / "README.md").is_file()
+        branch_here = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse",
+             "--abbrev-ref", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert branch_here == "decoy-branch", (
+            f"worktree branch must not have been touched; got {branch_here!r}"
+        )
+
     def test_fails_cleanly_when_path_exists_but_is_not_worktree(self, tmp_path):
         """If the target path exists but isn't a registered worktree,
         the script must refuse with a clear error (not blow away
@@ -345,21 +417,44 @@ class TestStartShInvokesSetup:
             "before spawning manager's claude pane (#45)."
         )
 
-    def test_start_sh_dry_run_plans_worktree_setup(self):
-        """A dry-run of start.sh should reveal the setup-manager-worktree
-        call in the emitted plan."""
+    def test_start_sh_dry_run_plans_worktree_setup(self, tmp_path):
+        """A dry-run of start.sh must recurse into the setup script's
+        dry-run so the operator sees the full git-ops plan inline (#61
+        Observation 1).
+
+        Without the recursion, `start.sh` dry-run just prints the
+        `bash scripts/setup-manager-worktree.sh` *invocation* but not
+        the `git worktree add ...` the setup would actually run. The
+        point of a dry-run is \"show me every command before it runs\"
+        — the recursion closes that gap.
+
+        We redirect MAS_MANAGER_WORKTREE at a fresh tmp path so the
+        setup produces a visible \"git worktree add\" plan line
+        instead of the \"already present — no-op\" path it takes
+        against the real sibling worktree on this machine.
+        """
         env = os.environ.copy()
         env["_TEST_DRY_RUN"] = "true"
+        env["MAS_MANAGER_WORKTREE"] = str(tmp_path / "fresh-mgr-wt")
         result = subprocess.run(
             [str(START_SCRIPT), "demo"],
             capture_output=True, text=True, env=env, timeout=30,
             cwd=str(REPO_ROOT),
         )
         combined = result.stdout + result.stderr
+        # Invocation announcement — unchanged from the previous test.
         assert "setup-manager-worktree.sh" in combined, (
             f"start.sh dry-run should print the worktree setup call; got:\n"
             f"{combined}"
         )
+        # #61 Observation 1: the recursive setup plan must also appear.
+        assert "git worktree add" in combined, (
+            "start.sh dry-run must recurse into setup-manager-worktree.sh "
+            "and print its plan (#61). Expected a `git worktree add ...` "
+            "line from the setup's dry-run in the output; got:\n"
+            f"{combined}"
+        )
+        assert "manager-worktree" in combined
 
 
 class TestConfigYaml:

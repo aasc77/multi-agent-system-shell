@@ -445,7 +445,13 @@ ensure_manager_worktree() {
         return 0
     fi
     if [ "$DRY_RUN" = "true" ]; then
+        # Propagate dry-run to the setup script (#61) so its plan
+        # (git worktree add <path> <branch>) is printed inline as
+        # part of start.sh's dry-run output. Otherwise operators
+        # auditing a start.sh dry-run would miss the git ops the
+        # setup script actually intends to run.
         echo "[DRY-RUN] bash ${setup}"
+        _TEST_DRY_RUN=true bash "$setup" || true
         return 0
     fi
     if ! bash "$setup"; then

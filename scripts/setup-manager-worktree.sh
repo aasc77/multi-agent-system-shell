@@ -53,13 +53,40 @@ run() {
 
 cd "$REPO_ROOT"
 
-# If the path already appears in `git worktree list`, there is nothing
-# left to do. Parse the porcelain output to be resilient against
-# colors, trailing (prunable) annotations, etc.
+# If the path already appears in `git worktree list`, it is either
+# the right worktree (no-op) or a pre-existing one on the WRONG
+# branch (error). A naive path-only idempotency check would silently
+# leave the wrong worktree in place and manager would point at the
+# wrong branch. See #61 Observation 2.
+#
+# `git worktree list --porcelain` emits a record per worktree like:
+#     worktree /abs/path
+#     HEAD <sha>
+#     branch refs/heads/<branch-name>    (or `detached`)
+# Extract the `branch` line for our target path and compare to the
+# expected WORKTREE_BRANCH.
 if git worktree list --porcelain 2>/dev/null \
     | awk -v p="$WORKTREE_PATH" '$1=="worktree" && $2==p {found=1} END{exit !found}'; then
-    log "Worktree already present at ${WORKTREE_PATH} — no-op."
-    exit 0
+    existing_branch="$(
+        git worktree list --porcelain 2>/dev/null \
+            | awk -v p="$WORKTREE_PATH" '
+                $1=="worktree" && $2==p {found=1; next}
+                found && $1=="branch" {print $2; exit}
+                found && NF==0 {exit}
+            '
+    )"
+    # `existing_branch` is either `refs/heads/<name>` or empty
+    # (detached-HEAD worktree). Strip the refs/heads/ prefix for
+    # comparison. An empty value means detached — treat as wrong.
+    existing_short="${existing_branch#refs/heads/}"
+    if [ "$existing_short" = "$WORKTREE_BRANCH" ]; then
+        log "Worktree already present at ${WORKTREE_PATH} — no-op."
+        exit 0
+    fi
+    actual="${existing_short:-detached}"
+    log "ERROR: worktree at ${WORKTREE_PATH} is on branch '${actual}', expected '${WORKTREE_BRANCH}'." >&2
+    log "Remove/reconfigure it (git worktree remove ${WORKTREE_PATH}) then re-run." >&2
+    exit 1
 fi
 
 # The target path may exist without being a worktree (e.g., a stale
