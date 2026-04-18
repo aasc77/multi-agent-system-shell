@@ -426,6 +426,35 @@ auto_start_nats
 # -----------------------------------------------------------------------
 DRY_RUN="${_TEST_DRY_RUN:-false}"
 
+# -----------------------------------------------------------------------
+# Manager worktree isolation (#45)
+#
+# Manager's fun-mode writes and operational-script output should not
+# land on whichever branch hub has checked out in the primary
+# working directory. Ensure the dedicated worktree at
+# ../multi-agent-system-shell-manager/ exists before spawning
+# manager's claude pane. The setup script is idempotent, so calling
+# it on every start is cheap. A setup failure does NOT abort start.sh
+# — manager just runs from the shared dir for this session and the
+# operator gets a warning they can act on.
+# -----------------------------------------------------------------------
+ensure_manager_worktree() {
+    local setup="${SCRIPT_DIR}/setup-manager-worktree.sh"
+    if [ ! -x "$setup" ]; then
+        echo "[start] WARNING: ${setup} not found or not executable — skipping manager worktree setup." >&2
+        return 0
+    fi
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "[DRY-RUN] bash ${setup}"
+        return 0
+    fi
+    if ! bash "$setup"; then
+        echo "[start] WARNING: manager worktree setup failed — manager will run from the shared dir for this session. Fix and re-run scripts/setup-manager-worktree.sh manually." >&2
+    fi
+}
+
+ensure_manager_worktree
+
 # If MAS_TMUX_SOCKET is set, route every tmux invocation through
 # `tmux -L <socket>`. A dedicated socket = a dedicated server = full
 # namespace isolation from the user's default-socket sessions. Used by
