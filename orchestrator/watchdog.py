@@ -261,8 +261,16 @@ class IdleWatchdog:
             await asyncio.sleep(self._check_interval)
             cycle += 1
             active = self._get_active_agents()
-            logger.info("Watchdog cycle %d — %d active agents: %s", cycle, len(active),
-                        [a for a, _ in active] if active else "none (fallback to state machine)")
+            if active:
+                logger.info(
+                    "Watchdog cycle %d — %d agents assigned to in_progress tasks: %s",
+                    cycle, len(active), [a for a, _ in active],
+                )
+            else:
+                logger.info(
+                    "Watchdog cycle %d — pipeline idle (no task-queue work)",
+                    cycle,
+                )
             try:
                 await self._check_idle_agents()
             except Exception:

@@ -11,6 +11,7 @@ Usage:
 """
 
 import asyncio
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -211,6 +212,52 @@ class TestGetActiveAgents:
         assert "hub" in agent_names
         assert "macmini" in agent_names
         assert "dgx" not in agent_names
+
+
+# ---------------------------------------------------------------------------
+# Cycle Log Line Tests (#27)
+# ---------------------------------------------------------------------------
+
+class TestCycleLogLine:
+    """Verifies the per-cycle log line phrasing from #27.
+
+    The old "N active agents: ... (fallback to state machine)" wording
+    read as "no agents are doing anything" but actually only reflected
+    tasks.json assigned_agents — invisible to ad-hoc send_to_agent
+    traffic. New wording disambiguates that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_log_when_agents_assigned(self, watchdog, caplog):
+        calls = {"n": 0}
+        async def _cancel_after_first(_delay):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise asyncio.CancelledError
+        with patch("asyncio.sleep", side_effect=_cancel_after_first):
+            with caplog.at_level(logging.INFO, logger="orchestrator.watchdog"):
+                with pytest.raises(asyncio.CancelledError):
+                    await watchdog.run()
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("agents assigned to in_progress tasks" in m for m in messages)
+        assert not any("active agents" in m for m in messages)
+        assert not any("fallback to state machine" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_log_when_pipeline_idle(self, watchdog_no_tq, caplog):
+        calls = {"n": 0}
+        async def _cancel_after_first(_delay):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise asyncio.CancelledError
+        with patch("asyncio.sleep", side_effect=_cancel_after_first):
+            with caplog.at_level(logging.INFO, logger="orchestrator.watchdog"):
+                with pytest.raises(asyncio.CancelledError):
+                    await watchdog_no_tq.run()
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("pipeline idle (no task-queue work)" in m for m in messages)
+        assert not any("active agents" in m for m in messages)
+        assert not any("fallback to state machine" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------
