@@ -177,16 +177,38 @@ class TmuxComm:
             _CFG_NUDGE_SEND_RETRIES, _DEFAULT_SEND_RETRIES,
         )
 
-        # Build pane mapping: agent_name -> 0-based pane index (config order).
-        # Skip agents with role=monitor -- they launch in the control window,
-        # not the agents window (mirrors start.sh behaviour).
+        # Build pane mapping: agent_name -> 0-based pane index.
+        #
+        # Skip agents with role=monitor -- they launch in the control
+        # window, not the agents window (mirrors start.sh behaviour).
+        #
+        # Issue #51 / #68: we prefer @label-based resolution over
+        # config-order enumeration so the pane mapping survives layout
+        # rearrangement (continuum restore, manual splits, sibling
+        # grouped sessions with different child pane ordering, …).
+        # #52 only wired @label resolution for monitors — regular
+        # agents kept using config-order, which silently misrouted
+        # every NUDGE once the tmux layout drifted from config order.
+        # This builds both a label map and the config-order fallback,
+        # then picks per-agent with precedence:
+        #   label_to_index[agent_label]   (preferred)
+        #     > label_to_index[agent_name]  (name-as-label fallback)
+        #     > config_order_index           (no live tmux / tests)
         pane_agents = [
-            name for name, cfg in config[_CFG_AGENTS].items()
+            (name, cfg if isinstance(cfg, dict) else {})
+            for name, cfg in config[_CFG_AGENTS].items()
             if not (isinstance(cfg, dict) and cfg.get("role") == "monitor")
         ]
-        self._pane_mapping: dict[str, int] = {
-            name: idx for idx, name in enumerate(pane_agents)
-        }
+        label_to_index = self._scan_agents_pane_labels()
+        self._pane_mapping: dict[str, int] = {}
+        for fallback_idx, (name, agent_cfg) in enumerate(pane_agents):
+            configured_label = agent_cfg.get("label", name)
+            idx = label_to_index.get(configured_label)
+            if idx is None:
+                idx = label_to_index.get(name)
+            if idx is None:
+                idx = fallback_idx
+            self._pane_mapping[name] = idx
 
         # Monitor agents live in the control window.  Rather than hardcode
         # pane indices (which break if the user rearranges the layout),
@@ -241,11 +263,33 @@ class TmuxComm:
         Returns an empty dict on any failure (tmux not running, session
         missing, etc.) so the caller can fall back to a default layout.
         """
+        return self._scan_window_pane_labels("control")
+
+    def _scan_agents_pane_labels(self) -> dict[str, int]:
+        """Scan the ``agents`` window for pane @labels and return a
+        ``{label: pane_index}`` mapping.
+
+        Used by ``__init__`` to resolve regular-agent pane indices by
+        @label rather than config order (issue #51 / #68). Returns an
+        empty dict on any failure (tmux not running, no session,
+        agents window missing, unit-test mode, …) so the caller can
+        fall back to config order.
+        """
+        return self._scan_window_pane_labels(_AGENTS_WINDOW)
+
+    def _scan_window_pane_labels(self, window: str) -> dict[str, int]:
+        """Shared helper for ``_scan_{control,agents}_pane_labels``.
+
+        Runs ``tmux list-panes -t <session>:<window> -F '<idx>\\t<@label>'``
+        and parses the tab-delimited output. Returns an empty dict on
+        any failure so callers can fall back to a legacy positional
+        layout.
+        """
         try:
             result = subprocess.run(
                 [
                     *_tmux_cmd(), "list-panes",
-                    "-t", f"{self._session_name}:control",
+                    "-t", f"{self._session_name}:{window}",
                     "-F", "#{pane_index}\t#{@label}",
                 ],
                 capture_output=True,
