@@ -374,11 +374,17 @@ class TestCycleLogMcpActive:
         assert "stale" in idle_part
         assert "hub" in idle_part
 
-    def test_assigned_agent_takes_priority_over_mcp_active(self):
-        """An agent listed in tasks.json assigned_agents shows up in
-        the task-queue block, not in MCP-active or idle (even if its
-        timestamp is inside the window). Prevents double-counting in
-        the log."""
+    def test_assigned_agent_not_reported_as_idle_even_with_mcp_activity(self):
+        """An agent listed in tasks.json assigned_agents appears in
+        the task-queue block and must NOT also appear in the idle
+        block — even when it also has fresh MCP activity within the
+        window. Dual-reporting with MCP-active is intentional (same
+        composite-log philosophy documented on other tests in this
+        class), so this test only pins the idle-exclusion invariant.
+        The old name ``takes_priority_over_mcp_active`` implied the
+        test asserted a priority that the assertions don't actually
+        enforce — see #73.
+        """
         from orchestrator.activity_tracker import ActivityTracker
         tracker = ActivityTracker()
         now = 1000.0
