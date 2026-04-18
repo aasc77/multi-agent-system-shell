@@ -18,8 +18,11 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
 
 import nats
@@ -173,13 +176,101 @@ class NatsClient:
     async def publish_to_inbox(self, role: str, message: dict[str, Any]) -> None:
         """Publish a JSON *message* to ``<prefix>.<role>.inbox``.
 
+        The *message* is envelope-wrapped before publish — ``message_id``,
+        ``timestamp``, and ``from`` are filled in with sensible defaults
+        if the caller has not set them. The envelope enables the
+        mas-bridge ``handleCheckMessages`` dedup path to correctly
+        collapse the push-subscription buffer copy against the durable
+        JetStream pull copy; without an envelope the bridge fails open
+        and delivers every orchestrator-generated message twice to
+        the target agent.
+
+        The caller's *message* dict is NOT mutated — a shallow copy is
+        made before envelope fields are added, so callers that reuse
+        the same dict across multiple publish calls (e.g.
+        ``publish_all_done``) get a fresh envelope on every publish
+        without accidentally sharing ``message_id`` across recipients.
+
+        Callers that set any of ``message_id``, ``timestamp``, or
+        ``from`` themselves retain their values — the library never
+        clobbers caller intent.
+
         Raises:
             NatsClientError: If not connected.
         """
         self._require_connected()
         subject = self.inbox_subject(role)
-        payload = json.dumps(message).encode()
+        enveloped = self._envelope_wrap(message)
+        payload = json.dumps(enveloped).encode()
         await self._js.publish(subject, payload)
+
+    def _envelope_wrap(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Return a shallow copy of *message* with envelope fields filled in.
+
+        Fields added if missing: ``message_id``, ``timestamp``, ``from``.
+        Caller-set values are preserved. The original dict is never
+        mutated so callers can safely reuse it across publish calls.
+
+        Shallow-copy caveat: the envelope fields are all top-level scalars
+        (strings), so a shallow ``dict(message)`` is sufficient to keep
+        the caller's dict isolated from our mutations. Do NOT mutate
+        nested containers on *enveloped* — any nested dict/list is still
+        shared with the caller via reference, and in-place edits there
+        would propagate back to the caller and silently break fanout.
+        """
+        enveloped = dict(message)
+        if not enveloped.get("message_id"):
+            enveloped["message_id"] = self._generate_message_id(enveloped)
+        if not enveloped.get("timestamp"):
+            enveloped["timestamp"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds",
+            )
+        if not enveloped.get("from"):
+            enveloped["from"] = "orchestrator"
+        return enveloped
+
+    @staticmethod
+    def _generate_message_id(message: dict[str, Any]) -> str:
+        """Generate a content-deterministic ``message_id`` for *message*.
+
+        Format: ``<type>-<short-hash>-<epoch>`` where:
+
+        - ``<type>``: ``message.get("type", "orchestrator")`` with
+          whitespace replaced by ``_``. Keeps each publisher's ids
+          namespaced in traces and widens mas-bridge's dedup hash
+          space across concurrent senders.
+        - ``<short-hash>``: first 8 hex chars of SHA-256 over a
+          canonical JSON serialization of the *semantic* payload —
+          i.e. the message with any caller-supplied envelope fields
+          (``message_id``, ``timestamp``, ``from``) stripped out
+          first. Two publishes of the same content hash the same,
+          regardless of envelope-field carry-over.
+        - ``<epoch>``: ``int(time.time())``. Two publishes of the
+          same content within the same second produce the same id
+          so the bridge can collapse accidental/intentional repeats;
+          two publishes in different seconds produce different ids
+          so legitimate re-occurrences are still delivered.
+
+        This is the #34 generalization of the #28 deterministic-id
+        patch: every caller of ``publish_to_inbox`` automatically
+        gets the dedup-friendly id, not just ``_check_agent_auth_failure``.
+        """
+        raw_type = str(message.get("type") or "orchestrator")
+        msg_type = raw_type.replace(" ", "_")
+        semantic = {
+            k: v for k, v in message.items()
+            if k not in ("message_id", "timestamp", "from")
+        }
+        # `default=str` stringifies any value JSON can't encode natively.
+        # Every semantic payload in-tree today is plain dicts of scalars
+        # (type, agent, message, subtype, priority) — not a live risk.
+        # Future risk (#63): if a caller ever passes a datetime or custom
+        # object whose `str()` repr matches a different object's, the
+        # hash could collapse messages that should deliver independently.
+        canonical = json.dumps(semantic, sort_keys=True, default=str)
+        short_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
+        epoch = int(time.time())
+        return f"{msg_type}-{short_hash}-{epoch}"
 
     async def publish_raw(self, subject: str, payload: bytes) -> None:
         """Publish raw bytes to an arbitrary NATS subject.
@@ -189,6 +280,41 @@ class NatsClient:
         """
         self._require_connected()
         await self._js.publish(subject, payload)
+
+    async def subscribe_core(
+        self,
+        subject: str,
+        callback: MessageCallback,
+    ) -> Any:
+        """Register a core-NATS push subscription on *subject*.
+
+        Use for core-NATS request/reply or ephemeral-signal
+        subscriptions on subjects OUTSIDE the JetStream ``agents.>``
+        wildcard. For durable agent-addressed messages use
+        :meth:`subscribe_to_inbox` / :meth:`subscribe_to_outbox`.
+
+        Unlike the JetStream-backed subscribe methods, this is a
+        plain push subscription with no durable consumer, no ack
+        tracking, and no redelivery on disconnect. Messages missed
+        while the subscriber is down are lost by design — that is
+        exactly the semantic you want for request/reply handlers
+        (the request is scoped to a single call and replies go back
+        over the inbox-subject the request was made on) and for
+        loss-tolerant diagnostic signals.
+
+        First caller: issue #31 orchestrator version probe, which
+        registers a handler on ``system.orchestrator.version`` that
+        responds via ``msg.respond(bytes)`` on the incoming message.
+
+        Returns:
+            The underlying ``nats.aio.subscription.Subscription``
+            object, useful for ``.unsubscribe()`` on shutdown.
+
+        Raises:
+            NatsClientError: If not connected.
+        """
+        self._require_connected()
+        return await self._conn.subscribe(subject, cb=callback)
 
     async def publish_all_done(self, summary: str) -> None:
         """Publish an ``all_done`` message to every agent's inbox.

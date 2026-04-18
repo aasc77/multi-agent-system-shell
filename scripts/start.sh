@@ -106,17 +106,28 @@ if [ ! -f "$PROJECT_CONFIG" ]; then
 fi
 
 # -----------------------------------------------------------------------
-# Parse configs using Python (YAML parsing with deep merge)
+# Parse configs, resolve provider placeholders, extract launcher values
 # -----------------------------------------------------------------------
-parse_configs() {
-    # Parse and merge global + project YAML configs into JSON.
-    # Project values override global; merges two levels deep for dicts.
+parse_and_resolve_config() {
+    # One python3 subprocess merges global+project YAML recursively,
+    # resolves {{providers.<section>.<field>}} placeholders in every
+    # agent's system_prompt, and emits four lines on stdout:
+    #   1. SESSION_NAME
+    #   2. NATS_URL
+    #   3. AGENTS_JSON (with substituted prompts)
+    #   4. CONFIG_JSON (full merged config, used downstream)
+    #
+    # An unresolved or malformed placeholder exits non-zero with a
+    # single "Error: ..." line naming the agent and the token — a
+    # silently-unresolved placeholder would be a launcher-side prompt
+    # corruption and never reaches the running agent.
     python3 -c "
-import json, sys, os
+import json, os, re, sys
 try:
     import yaml
 except ImportError:
-    sys.exit(0)
+    sys.stderr.write('Error: PyYAML is required to parse config files\n')
+    sys.exit(1)
 
 project_config_path = os.environ['_PROJECT_CONFIG']
 global_config_path = os.environ['_GLOBAL_CONFIG']
@@ -129,54 +140,90 @@ if os.path.isfile(global_config_path):
 with open(project_config_path) as f:
     project_cfg = yaml.safe_load(f) or {}
 
-# Deep merge: project overrides global, two levels
-merged = dict(global_cfg)
-for key, val in project_cfg.items():
-    if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
-        merged[key] = {**merged[key], **val}
-    else:
-        merged[key] = val
+def deep_merge(base, override):
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
 
-print(json.dumps(merged))
+config = deep_merge(global_cfg, project_cfg)
+
+session_name = config.get('tmux', {}).get('session_name', config.get('project', '$DEFAULT_SESSION_NAME'))
+nats_url = config.get('nats', {}).get('url', '$DEFAULT_NATS_URL')
+agents = config.get('agents', {})
+providers = config.get('providers', {})
+
+for section_name in sorted(providers):
+    section = providers[section_name]
+    if isinstance(section, dict):
+        backend = section.get('backend', '?')
+        url = section.get('url', '?')
+        sys.stderr.write(f'providers.{section_name} = {backend} @ {url}\n')
+
+PLACEHOLDER_RE = re.compile(r'\{\{providers\.([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\}\}')
+LITERAL_MARKER = '{{providers.'
+
+def resolve_placeholders(agent_name, prompt):
+    def _sub(match):
+        section, field = match.group(1), match.group(2)
+        section_cfg = providers.get(section)
+        if not isinstance(section_cfg, dict) or field not in section_cfg:
+            raise ValueError(
+                f\"agent '{agent_name}' has unresolved placeholder \"
+                f'{{{{providers.{section}.{field}}}}}'
+            )
+        return str(section_cfg[field])
+    resolved = PLACEHOLDER_RE.sub(_sub, prompt)
+    if LITERAL_MARKER in resolved:
+        # A {{providers.*}} prefix made it through re.sub untouched — either
+        # the key shape is wrong or the closing }} is missing. Refuse to ship
+        # a raw placeholder into a live system prompt.
+        raise ValueError(
+            f\"agent '{agent_name}' has an unparseable providers placeholder; \"
+            f\"expected form is \"
+            f'{{{{providers.<section>.<field>}}}}'
+        )
+    return resolved
+
+try:
+    for agent_name, agent_cfg in agents.items():
+        if not isinstance(agent_cfg, dict):
+            continue
+        prompt = agent_cfg.get('system_prompt')
+        if isinstance(prompt, str) and LITERAL_MARKER in prompt:
+            agent_cfg['system_prompt'] = resolve_placeholders(agent_name, prompt)
+except ValueError as e:
+    sys.stderr.write(f'Error: {e}\n')
+    sys.exit(1)
+
+print(session_name)
+print(nats_url)
+print(json.dumps(agents))
+print(json.dumps(config))
 "
 }
 
-CONFIG_JSON=$(
+CONFIG_VALUES=$(
     _PROJECT_CONFIG="$PROJECT_CONFIG" \
     _GLOBAL_CONFIG="$GLOBAL_CONFIG" \
-    parse_configs
-)
+    parse_and_resolve_config
+) || {
+    echo "Error: Failed to parse or resolve config files" >&2
+    exit 1
+}
 
-if [ -z "$CONFIG_JSON" ]; then
+if [ -z "$CONFIG_VALUES" ]; then
     echo "Error: Failed to parse config files" >&2
     exit 1
 fi
 
-# -----------------------------------------------------------------------
-# Extract config values via a single consolidated Python call
-# -----------------------------------------------------------------------
-read_config_values() {
-    # Extract session_name, nats_url, and agents JSON from merged config.
-    # Outputs three lines: SESSION_NAME, NATS_URL, AGENTS_JSON.
-    python3 -c "
-import json, sys
-
-config = json.loads(sys.stdin.read())
-
-session_name = config.get('tmux', {}).get('session_name', config.get('project', '$DEFAULT_SESSION_NAME'))
-nats_url = config.get('nats', {}).get('url', '$DEFAULT_NATS_URL')
-agents = json.dumps(config.get('agents', {}))
-
-print(session_name)
-print(nats_url)
-print(agents)
-" <<< "$CONFIG_JSON"
-}
-
-CONFIG_VALUES=$(read_config_values)
 SESSION_NAME=$(echo "$CONFIG_VALUES" | sed -n '1p')
 NATS_URL=$(echo "$CONFIG_VALUES" | sed -n '2p')
 AGENTS_JSON=$(echo "$CONFIG_VALUES" | sed -n '3p')
+CONFIG_JSON=$(echo "$CONFIG_VALUES" | sed -n '4p')
 
 # -----------------------------------------------------------------------
 # MCP config generation (for claude_code agents only)
@@ -326,6 +373,22 @@ if [ -n "$REMOTE_AGENTS" ]; then
     done <<< "$REMOTE_AGENTS"
 fi
 
+service_is_running() {
+    # Check whether a background service matching the given pgrep pattern
+    # is alive. Takes the pattern and the name of the per-service test env
+    # var (e.g. _TEST_INDEXER_RUNNING) for test overrides. MUST be called
+    # in conditional context (if / && / ||); a bare call would let the
+    # pgrep exit code trip `set -e`.
+    local pattern="$1"
+    local test_var="$2"
+    local override="${!test_var:-}"
+    if [ -n "$override" ]; then
+        [ "$override" = "true" ]
+        return
+    fi
+    pgrep -f "$pattern" &>/dev/null
+}
+
 # -----------------------------------------------------------------------
 # NATS auto-start
 # -----------------------------------------------------------------------
@@ -363,12 +426,60 @@ auto_start_nats
 # -----------------------------------------------------------------------
 DRY_RUN="${_TEST_DRY_RUN:-false}"
 
+# -----------------------------------------------------------------------
+# Manager worktree isolation (#45)
+#
+# Manager's fun-mode writes and operational-script output should not
+# land on whichever branch hub has checked out in the primary
+# working directory. Ensure the dedicated worktree at
+# ../multi-agent-system-shell-manager/ exists before spawning
+# manager's claude pane. The setup script is idempotent, so calling
+# it on every start is cheap. A setup failure does NOT abort start.sh
+# — manager just runs from the shared dir for this session and the
+# operator gets a warning they can act on.
+# -----------------------------------------------------------------------
+ensure_manager_worktree() {
+    local setup="${SCRIPT_DIR}/setup-manager-worktree.sh"
+    if [ ! -x "$setup" ]; then
+        echo "[start] WARNING: ${setup} not found or not executable — skipping manager worktree setup." >&2
+        return 0
+    fi
+    if [ "$DRY_RUN" = "true" ]; then
+        # Propagate dry-run to the setup script (#61) so its plan
+        # (git worktree add <path> <branch>) is printed inline as
+        # part of start.sh's dry-run output. Otherwise operators
+        # auditing a start.sh dry-run would miss the git ops the
+        # setup script actually intends to run.
+        echo "[DRY-RUN] bash ${setup}"
+        _TEST_DRY_RUN=true bash "$setup" || true
+        return 0
+    fi
+    if ! bash "$setup"; then
+        echo "[start] WARNING: manager worktree setup failed — manager will run from the shared dir for this session. Fix and re-run scripts/setup-manager-worktree.sh manually." >&2
+    fi
+}
+
+ensure_manager_worktree
+
+# If MAS_TMUX_SOCKET is set, route every tmux invocation through
+# `tmux -L <socket>`. A dedicated socket = a dedicated server = full
+# namespace isolation from the user's default-socket sessions. Used by
+# pytest (see tests/conftest.py) so a buggy test fixture can never
+# reach live user sessions. See #46.
+_tmux() {
+    if [ -n "${MAS_TMUX_SOCKET:-}" ]; then
+        command tmux -L "$MAS_TMUX_SOCKET" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
 tmux_cmd() {
     # Execute a tmux command, or print it in dry-run mode.
     if [ "$DRY_RUN" = "true" ]; then
         echo "[DRY-RUN] tmux $*"
     else
-        tmux "$@" 2>/dev/null || true
+        _tmux "$@" 2>/dev/null || true
     fi
 }
 
@@ -382,7 +493,7 @@ session_exists() {
         [ "$_TEST_SESSION_EXISTS" = "true" ]
         return
     fi
-    tmux has-session -t "$SESSION_NAME" 2>/dev/null
+    _tmux has-session -t "$SESSION_NAME" 2>/dev/null
 }
 
 ensure_clean_session() {
@@ -460,32 +571,44 @@ else:
     # Start knowledge-store indexer as a background daemon (if available)
     local indexer_script="${ROOT_DIR}/knowledge-store/indexer.py"
     if [ -f "$indexer_script" ]; then
-        mkdir -p "${ROOT_DIR}/data"
-        NATS_URL="${NATS_URL}" \
-        CHROMADB_PATH="${ROOT_DIR}/data/chromadb" \
-        OLLAMA_URL="http://localhost:11434" \
-            python3 "$indexer_script" >> "${ROOT_DIR}/data/indexer.log" 2>&1 &
-        echo "Knowledge indexer started (PID: $!)"
+        if service_is_running "knowledge-store/indexer.py" "_TEST_INDEXER_RUNNING"; then
+            echo "Knowledge indexer already running. Skipping."
+        else
+            mkdir -p "${ROOT_DIR}/data"
+            NATS_URL="${NATS_URL}" \
+            CHROMADB_PATH="${ROOT_DIR}/data/chromadb" \
+            OLLAMA_URL="http://localhost:11434" \
+                python3 "$indexer_script" >> "${ROOT_DIR}/data/indexer.log" 2>&1 &
+            echo "Knowledge indexer started (PID: $!)"
+        fi
     fi
 
     # Start speaker service as a background daemon (routes speak requests to hassio)
     local speaker_script="${ROOT_DIR}/services/speaker-service.py"
     if [ -f "$speaker_script" ]; then
-        mkdir -p "${ROOT_DIR}/data"
-        NATS_URL="${NATS_URL}" \
-        NATS_STREAM="${STREAM_NAME:-AGENTS}" \
-            python3 "$speaker_script" >> "${ROOT_DIR}/data/speaker-service.log" 2>&1 &
-        echo "Speaker service started (PID: $!)"
+        if service_is_running "services/speaker-service.py" "_TEST_SPEAKER_RUNNING"; then
+            echo "Speaker service already running. Skipping."
+        else
+            mkdir -p "${ROOT_DIR}/data"
+            NATS_URL="${NATS_URL}" \
+            NATS_STREAM="${STREAM_NAME:-AGENTS}" \
+                python3 "$speaker_script" >> "${ROOT_DIR}/data/speaker-service.log" 2>&1 &
+            echo "Speaker service started (PID: $!)"
+        fi
     fi
 
     # Start thermostat service as a background daemon (HA climate control via NATS)
     local thermostat_script="${ROOT_DIR}/services/thermostat-service.py"
     if [ -f "$thermostat_script" ]; then
-        mkdir -p "${ROOT_DIR}/data"
-        NATS_URL="${NATS_URL}" \
-        NATS_STREAM="${STREAM_NAME:-AGENTS}" \
-            python3 "$thermostat_script" >> "${ROOT_DIR}/data/thermostat-service.log" 2>&1 &
-        echo "Thermostat service started (PID: $!)"
+        if service_is_running "services/thermostat-service.py" "_TEST_THERMOSTAT_RUNNING"; then
+            echo "Thermostat service already running. Skipping."
+        else
+            mkdir -p "${ROOT_DIR}/data"
+            NATS_URL="${NATS_URL}" \
+            NATS_STREAM="${STREAM_NAME:-AGENTS}" \
+                python3 "$thermostat_script" >> "${ROOT_DIR}/data/thermostat-service.log" 2>&1 &
+            echo "Thermostat service started (PID: $!)"
+        fi
     fi
 
     local monitor_script="${SCRIPT_DIR}/nats-monitor.sh"
@@ -669,7 +792,7 @@ setup_agent_panes() {
     local pane_ids=()  # parallel array: pane_ids[N] = tmux pane_id for grid cell N
 
     # Seed pane_ids[0] with the already-existing first pane of AGENTS_WINDOW.
-    pane_ids[0]=$(tmux display-message -p -t "${SESSION_NAME}:${AGENTS_WINDOW}.0" '#{pane_id}')
+    pane_ids[0]=$(_tmux display-message -p -t "${SESSION_NAME}:${AGENTS_WINDOW}.0" '#{pane_id}')
 
     while IFS= read -r agent_line; do
         [ -z "$agent_line" ] && continue
@@ -784,44 +907,27 @@ fi
 # -t <group>: join the group so windows are shared with the primary
 # -----------------------------------------------------------------------
 TMUX_BIN="$(command -v tmux)"
+# Honor MAS_TMUX_SOCKET for tests: the `-L <socket>` prefix must ride
+# along in the single-string commands we pass to osascript / wt.exe /
+# gnome-terminal below, otherwise those terminal launchers would spawn
+# tmux against the default socket and bypass the isolation. See #46.
+if [ -n "${MAS_TMUX_SOCKET:-}" ]; then
+    TMUX_BIN="${TMUX_BIN} -L ${MAS_TMUX_SOCKET}"
+fi
 
 # Kill stale grouped sessions that tmux-resurrect/continuum may have restored.
 # Without this, `new-session -A` below would attach to the restored (empty)
 # session instead of creating a fresh one grouped with ${SESSION_NAME},
 # producing ghost windows with bare zsh panes instead of the real workload.
-"${TMUX_BIN}" kill-session -t "${SESSION_NAME}-control" 2>/dev/null || true
-"${TMUX_BIN}" kill-session -t "${SESSION_NAME}-agents"  2>/dev/null || true
+${TMUX_BIN} kill-session -t "${SESSION_NAME}-control" 2>/dev/null || true
+${TMUX_BIN} kill-session -t "${SESSION_NAME}-agents"  2>/dev/null || true
 
 TMUX_CMD_CONTROL="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-control -t ${SESSION_NAME} \; select-window -t ${CONTROL_WINDOW}"
 TMUX_CMD_AGENTS="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-agents -t ${SESSION_NAME} \; select-window -t ${AGENTS_WINDOW}"
 
-# Create the grouped sessions DETACHED first so they exist regardless of
-# whether we can pop a terminal window to attach them. Without this,
-# Terminal.app users (where the iTerm2 osascript silently fails) end up
-# with no grouped sessions at all and `tmux attach -t <session>-control`
-# returns "can't find session". The `-d` flag keeps them detached; the
-# terminal-launch commands below then just attach to these pre-existing
-# sessions instead of creating them on first launch.
-#
-# select-window pins each session to the right window on first attach —
-# otherwise both sessions land on the primary's active window and
-# `tmux attach -t <session>-agents` opens on the control pane.
-"${TMUX_BIN}" new-session -d -A -s "${SESSION_NAME}-control" -t "${SESSION_NAME}" 2>/dev/null || true
-"${TMUX_BIN}" select-window -t "${SESSION_NAME}-control:${CONTROL_WINDOW}" 2>/dev/null || true
-"${TMUX_BIN}" new-session -d -A -s "${SESSION_NAME}-agents"  -t "${SESSION_NAME}" 2>/dev/null || true
-"${TMUX_BIN}" select-window -t "${SESSION_NAME}-agents:${AGENTS_WINDOW}"   2>/dev/null || true
-
-# Detect whether iTerm2 is actually running (not just installed) so we
-# can fall back to Terminal.app on systems that use it as the default.
-# osascript to a non-running iTerm2 fails silently, which is exactly the
-# bug that was leaving Terminal.app users with no attached windows.
-iterm2_is_running() {
-    osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null | grep -q true
-}
-
 open_two_windows() {
-    if command -v osascript &>/dev/null && iterm2_is_running; then
-        # macOS + iTerm2 (only if actually running)
+    if command -v osascript &>/dev/null; then
+        # macOS + iTerm2
         osascript -e 'tell application "iTerm2"
             activate
             create window with default profile command "'"${TMUX_CMD_CONTROL}"'"
@@ -831,24 +937,6 @@ open_two_windows() {
             create window with default profile command "'"${TMUX_CMD_AGENTS}"'"
         end tell' 2>/dev/null
         echo "Opened iTerm windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
-
-    elif command -v osascript &>/dev/null; then
-        # macOS + Terminal.app fallback. Terminal.app doesn't accept a
-        # command via `create window`, so we use `do script` which opens
-        # a new window and runs the command there.
-        osascript <<APPLESCRIPT 2>/dev/null
-tell application "Terminal"
-    activate
-    do script "${TMUX_CMD_CONTROL}"
-end tell
-APPLESCRIPT
-        sleep 1
-        osascript <<APPLESCRIPT 2>/dev/null
-tell application "Terminal"
-    do script "${TMUX_CMD_AGENTS}"
-end tell
-APPLESCRIPT
-        echo "Opened Terminal.app windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
 
     elif command -v wt.exe &>/dev/null; then
         # Windows Terminal (WSL)

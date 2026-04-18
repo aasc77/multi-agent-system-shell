@@ -13,18 +13,26 @@ control and agents side-by-side on your screen:
 
 ```
  Window 1 — control                     Window 2 — agents
-┌──────────────────┬───────────────┐    ┌──────────────┬──────────────┐
-│   orchestrator   │  nats-monitor │    │  dev (hub)   │  qa (macmini)│
-│  (state machine  │ (live msgs)   │    │ (claude_code)│ (claude_code)│
-│   + console)     │               │    ├──────────────┼──────────────┤
-├──────────────────┘               │    │  dgx1        │  hassio      │
-│   manager (monitor)              │    │ (claude_code)│ (claude_code)│
-│  (autonomous oversight)          │    └──────────────┴──────────────┘
-└──────────────────────────────────┘
+┌──────────┬──────────────────┐         ┌──────────────┬──────────────┐
+│          │  orchestrator    │         │     dev      │   macmini    │
+│          │ (state machine   │         │ (claude_code)│ (claude_code)│
+│          │  + console)      │         ├──────────────┼──────────────┤
+│ manager  ├──────────────────┤         │     dgx1     │     dgx2     │
+│ (monitor)│  nats-monitor    │         │ (claude_code)│ (claude_code)│
+│          │  (live msgs)     │         ├──────────────┼──────────────┤
+│          │                  │         │   RTX5090    │    hassio    │
+│          │                  │         │   (script)   │ (claude_code)│
+└──────────┴──────────────────┘         └──────────────┴──────────────┘
             │                    │
             └────── NATS ────────┘
               JetStream pub/sub
 ```
+
+The control window puts the manager agent on the left at full height (so
+it has room for long conversations), with the orchestrator and NATS
+monitor stacked on the right. The agents window is a tiled grid sized to
+however many agents are in the project config — the example above shows
+the 6-agent `remote-test` layout.
 
 Both windows share the same tmux session via grouped sessions, so each can
 independently view a different tmux window.
@@ -48,6 +56,8 @@ independently view a different tmux window.
 - **Built-in actions**: `assign_to_agent`, `merge_and_assign`, `merge_to_default`, `flag_human`
 - **MCP bridge**: tools for Claude Code agents (`send_message`, `check_messages`, `send_to_agent`)
 - **Manager agent**: autonomous monitor that watches task progress, agent health, and logs
+- **Orchestrator singleton**: flock-based lock at `/tmp/mas-orch-<project>.lock` prevents duplicate orchestrators per project
+- **Delivery protocol**: OSPF-style neighbor table with TCP-style ACK + retransmit (exponential backoff 0→15s→1m→5m→1hr) and Pushover escalation on dead-letter
 - **Idle watchdog**: detects idle agents with pending tasks and alerts the manager
 - **Inactivity announcer**: alerts when no agent has any NATS activity for a configurable threshold
 - **Knowledge store**: ChromaDB + Ollama embeddings for semantic search across agent messages and operational docs
@@ -64,12 +74,13 @@ independently view a different tmux window.
 ```
 multi-agent-system-shell/
 ├── orchestrator/          # Core orchestrator modules
-│   ├── __main__.py        # Entry point (python3 -m orchestrator <project>)
+│   ├── __main__.py        # Entry point + flock singleton lock
 │   ├── config.py          # YAML config loader (global + project merge)
 │   ├── state_machine.py   # Config-driven state engine
 │   ├── task_queue.py      # Task queue manager
 │   ├── nats_client.py     # NATS JetStream wrapper
 │   ├── router.py          # Message router + inbox relay
+│   ├── delivery.py        # OSPF-style neighbor table + ACK delivery protocol
 │   ├── tmux_comm.py       # tmux communication (nudge, clear, send)
 │   ├── lifecycle.py       # Task lifecycle manager
 │   ├── watchdog.py        # Idle agent detection + inactivity announcer
@@ -86,24 +97,28 @@ multi-agent-system-shell/
 │   ├── server.py           # MCP server (search_knowledge, index_knowledge)
 │   └── indexer.py          # NATS message indexer daemon
 ├── services/
-│   ├── speaker-service.py  # NATS→hassio speaker routing with voice map
-│   └── voice-call-service.py # Twilio TTS voice call via NATS
+│   ├── speaker-service.py     # NATS→hassio speaker routing with voice map
+│   ├── voice-call-service.py  # Twilio TTS voice call via NATS
+│   ├── thermostat-service.py  # NATS listener for natural-language HA climate control
+│   └── dog-tracker/           # YOLO + ByteTrack + ONVIF PTZ camera tracker
 ├── mcp-bridge/
 │   ├── index.js           # MCP server (send_message, check_messages)
 │   └── package.json
 ├── scripts/
-│   ├── start.sh           # Launch two iTerm windows with all agents
-│   ├── stop.sh            # Graceful shutdown
-│   ├── setup-nats.sh      # Install and start NATS server
-│   ├── reset-tasks.sh     # Reset task statuses to pending
-│   ├── nats-monitor.sh    # Live NATS message monitor
-│   ├── share-file.sh      # Distribute files to all agent workspaces
-│   ├── tmux-paste-image.sh # Paste clipboard image into any agent pane
-│   ├── ssh-reconnect.sh   # Auto-reconnect wrapper for remote SSH agents
-│   ├── notify.sh          # macOS text-to-speech notification helper
-│   ├── push-notify.py     # Pushover push notification script
-│   ├── sms-notify.py      # Twilio SMS notification script
-│   └── conversation-mode.py # Standalone conversation mode listener
+│   ├── start.sh                 # Launch two terminal windows with all agents
+│   ├── stop.sh                  # Graceful shutdown (kills full session group)
+│   ├── bounce-orchestrator.sh   # Cleanly restart just the orchestrator
+│   ├── start-agent-logging.sh   # Start tmux pipe-pane logging for agent panes
+│   ├── setup-nats.sh            # Install and start NATS server
+│   ├── reset-tasks.sh           # Reset task statuses to pending
+│   ├── nats-monitor.sh          # Live NATS message monitor
+│   ├── share-file.sh            # Distribute files to all agent workspaces
+│   ├── tmux-paste-image.sh      # Paste clipboard image into any agent pane
+│   ├── ssh-reconnect.sh         # Auto-reconnect wrapper for remote SSH agents
+│   ├── notify.sh                # macOS text-to-speech notification helper
+│   ├── push-notify.py           # Pushover push notification script
+│   ├── sms-notify.py            # Twilio SMS notification script
+│   └── conversation-mode.py     # Standalone conversation mode listener
 ├── projects/
 │   └── demo/              # Example project (writer + executor)
 │       ├── config.yaml    # Project config with agents + state machine
@@ -140,7 +155,31 @@ tmux:
 
 tasks:
   max_attempts_per_task: 5             # retries before task marked stuck
+
+providers:
+  stt:
+    backend: whisper
+    url: http://192.168.1.51:5112
+  tts:
+    backend: piper
+    url: http://192.168.1.51:5111
 ```
+
+### Provider configuration (`providers:`)
+
+The `providers:` subtree gives the realtime STT and TTS backends a single config home. Each slot has two fields — `backend` (engine name) and `url` (endpoint).
+
+Agent `system_prompt` strings can reference any provider field using the `{{providers.<section>.<field>}}` placeholder syntax:
+
+```yaml
+system_prompt: "You run the TTS pipeline ({{providers.tts.backend}} at {{providers.tts.url}}), STT ({{providers.stt.backend}} at {{providers.stt.url}})."
+```
+
+At launch, `scripts/start.sh` runs a substitution pass over each agent's prompt before the MCP config is generated. The placeholders are resolved from the merged global+project `providers:` subtree and the result is passed to `claude --append-system-prompt`. Operators can verify the resolved values in the launcher log — `start.sh` emits one `providers.<section> = <backend> @ <url>` line per slot to stderr at startup.
+
+Switching backends is a one-line edit. When Voxtral replaces Whisper, flip `providers.stt.backend: voxtral` and `providers.stt.url: http://192.168.1.41:5100` in `config.yaml` and bounce the orchestrator — no other file changes. Unknown placeholders fail the launch loudly (naming both the offending agent and the token), so typos are caught immediately instead of silently shipping broken prompts.
+
+Project configs may override individual leaf keys (e.g. `providers.stt.url`) and the global sibling keys (e.g. `providers.stt.backend`) are preserved via recursive deep-merge.
 
 ### Project Config (`projects/<name>/config.yaml`)
 
@@ -212,6 +251,12 @@ state_machine:
       source_agent: qa
       status: pass
 ```
+
+### Background services
+
+`scripts/start.sh` launches three background daemons alongside the agent panes: the knowledge-store indexer, the speaker service, and the thermostat service. Each is spawned idempotently — if a matching process is already running (for example, a prior `start.sh` run whose children got reparented to launchd, or a separately-installed LaunchAgent), `start.sh` logs `"<service> already running. Skipping."` and bypasses its own spawn so the two don't fight over the same ChromaDB or NATS subjects. `scripts/stop.sh` pkills all three services in addition to killing the tmux session and cleaning up `.mcp-configs/`.
+
+If the `com.local.knowledge-indexer` LaunchAgent plist is installed (`~/Library/LaunchAgents/com.local.knowledge-indexer.plist` with `KeepAlive=true`), it owns the indexer's environment variables whenever it's the first mover; `start.sh` detects the plist-spawned process and skips its own. To apply shell-env changes (`NATS_URL`, `CHROMADB_PATH`, etc.) to the indexer, `launchctl unload` the plist first, then re-run `start.sh`.
 
 ## Dependencies
 

@@ -30,6 +30,11 @@ from orchestrator.logging_setup import setup_logging
 from orchestrator.session_report import SessionReport
 from orchestrator.watchdog import IdleWatchdog, InactivityAnnouncer
 from orchestrator.delivery import DeliveryProtocol
+from orchestrator.activity_tracker import ActivityTracker
+from orchestrator.version import (
+    capture_startup_info,
+    make_version_request_handler,
+)
 
 # --- CLI ---
 parser = argparse.ArgumentParser(description="Multi-Agent System Shell Orchestrator")
@@ -75,6 +80,13 @@ _lock_fd.flush()
 # --- Paths ---
 root_dir = Path(__file__).parent.parent
 projects_dir = root_dir / "projects"
+
+# --- Version probe (issue #31) ---
+# Capture startup SHA, boot time, and pid once. The cached snapshot
+# is handed to a NATS request handler registered in main() so
+# external callers can detect stale-binary drift via
+# `scripts/check-orchestrator-version.sh`.
+_STARTUP_INFO = capture_startup_info(root_dir)
 
 # --- Config ---
 try:
@@ -182,6 +194,11 @@ delivery = DeliveryProtocol(
     config=component_config,
 )
 
+# Per-agent MCP activity tracker (#55). Wired to MessageRouter so
+# every NATS outbox/inbox event updates the recency map; watchdog
+# reads it each cycle for the composite log line.
+activity_tracker = ActivityTracker()
+
 # Lifecycle manager
 lifecycle = TaskLifecycleManager(
     task_queue=task_queue,
@@ -216,6 +233,7 @@ watchdog = IdleWatchdog(
     tmux_comm=tmux_comm,
     config=component_config,
     task_queue=task_queue,
+    activity_tracker=activity_tracker,
 )
 
 # Message router
@@ -227,6 +245,7 @@ router = MessageRouter(
     tmux_comm=tmux_comm,
     watchdog=watchdog,
     delivery=delivery,
+    activity_tracker=activity_tracker,
 )
 
 # --- Interactive command reader ---
@@ -257,6 +276,21 @@ async def main():
     # Start router (subscribes to outbox subjects)
     await router.start()
     logger.info("Message router started -- subscribed to agent outboxes")
+
+    # Register the version probe handler (issue #31). Core-NATS
+    # request/reply on `system.orchestrator.version` — outside the
+    # JetStream `agents.>` wildcard so requests are ephemeral and
+    # responses fire back on the request-scoped inbox subject.
+    version_handler = make_version_request_handler(_STARTUP_INFO)
+    await nats_client.subscribe_core(
+        "system.orchestrator.version", version_handler,
+    )
+    logger.info(
+        "Version probe registered on system.orchestrator.version "
+        "(startup_sha=%s pid=%d)",
+        _STARTUP_INFO.startup_sha or "unknown",
+        _STARTUP_INFO.pid,
+    )
 
     # Wait for agents to initialize (Claude Code needs time to start + connect MCP)
     logger.info("Waiting for agents to initialize...")

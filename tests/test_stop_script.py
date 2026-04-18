@@ -49,6 +49,19 @@ STOP_SCRIPT = os.path.join(REPO_ROOT, "scripts", "stop.sh")
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _tmux_for_test() -> list[str]:
+    """Return the ``tmux`` argv prefix honoring ``MAS_TMUX_SOCKET``.
+
+    Conftest sets this env var for the whole pytest session (see #46)
+    so every direct ``subprocess.run(["tmux", ...])`` in these tests
+    rides the isolated socket instead of the default one.
+    """
+    socket = os.environ.get("MAS_TMUX_SOCKET")
+    if socket:
+        return ["tmux", "-L", socket]
+    return ["tmux"]
+
+
 def _run_stop_script(args=None, env_overrides=None, cwd=None):
     """Helper to run stop.sh and capture output."""
     cmd = [STOP_SCRIPT]
@@ -201,6 +214,59 @@ class TestTmuxSessionKill:
         result = _run_stop_script("demo", env_overrides=env)
         assert result.returncode == 0, (
             f"Expected exit code 0 after kill, got {result.returncode}"
+        )
+
+
+# ===========================================================================
+# 2b. BACKGROUND SERVICES CLEANUP
+# ===========================================================================
+
+
+class TestBackgroundServicesCleanup:
+    """stop.sh must pkill all three background services that start.sh spawns.
+
+    start.sh launches the knowledge indexer, speaker service, and thermostat
+    service as backgrounded Python children (start.sh:495-524). If stop.sh
+    misses any of them, they reparent to launchd (PPID=1) and linger as
+    zombies after a teardown. Each test here asserts the dry-run pkill
+    invocation for one service; together they guard against a future
+    refactor that drops a service from the kill loop.
+    """
+
+    def test_dry_run_kills_knowledge_indexer(self):
+        """stop.sh dry-run must include pkill for knowledge-store/indexer.py."""
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+
+        result = _run_stop_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "pkill -f knowledge-store/indexer.py" in output, (
+            "stop.sh must pkill the knowledge indexer"
+        )
+
+    def test_dry_run_kills_speaker_service(self):
+        """stop.sh dry-run must include pkill for services/speaker-service.py."""
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+
+        result = _run_stop_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "pkill -f services/speaker-service.py" in output, (
+            "stop.sh must pkill the speaker service"
+        )
+
+    def test_dry_run_kills_thermostat_service(self):
+        """stop.sh dry-run must include pkill for services/thermostat-service.py."""
+        env = os.environ.copy()
+        env["_TEST_DRY_RUN"] = "true"
+        env["_TEST_SESSION_EXISTS"] = "true"
+
+        result = _run_stop_script("demo", env_overrides=env)
+        output = result.stdout + result.stderr
+        assert "pkill -f services/thermostat-service.py" in output, (
+            "stop.sh must pkill the thermostat service"
         )
 
 
@@ -366,36 +432,41 @@ class TestGroupedSessionCleanup:
 
         session = f"masstoptest-{uuid.uuid4().hex[:8]}"
 
+        # #46: every tmux op must ride the test socket so we cannot
+        # collide with user sessions on the default socket. conftest
+        # sets MAS_TMUX_SOCKET in our env; prepend `-L <socket>` here.
+        tmux = _tmux_for_test()
+
         # Clean slate.
         subprocess.run(
-            ["tmux", "kill-session", "-t", session],
+            [*tmux, "kill-session", "-t", session],
             capture_output=True,
         )
 
         # Create primary + 2 secondaries + 1 stray auto-numbered session.
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", session, "-n", "control"],
+            [*tmux, "new-session", "-d", "-s", session, "-n", "control"],
             check=True,
         )
         subprocess.run(
-            ["tmux", "new-session", "-d", "-A", "-s", f"{session}-control",
+            [*tmux, "new-session", "-d", "-A", "-s", f"{session}-control",
              "-t", session],
             check=True,
         )
         subprocess.run(
-            ["tmux", "new-session", "-d", "-A", "-s", f"{session}-agents",
+            [*tmux, "new-session", "-d", "-A", "-s", f"{session}-agents",
              "-t", session],
             check=True,
         )
         # Stray auto-numbered grouped session (old start.sh behavior pre-fix)
         subprocess.run(
-            ["tmux", "new-session", "-d", "-t", session],
+            [*tmux, "new-session", "-d", "-t", session],
             check=True,
         )
 
         # Verify pre-condition: multiple sessions in the group exist.
         pre = subprocess.run(
-            ["tmux", "list-sessions", "-F",
+            [*tmux, "list-sessions", "-F",
              "#{session_name}|#{session_group}"],
             capture_output=True, text=True,
         )
@@ -421,7 +492,7 @@ class TestGroupedSessionCleanup:
 
             # Verify post-condition: NO sessions in the group remain.
             post = subprocess.run(
-                ["tmux", "list-sessions", "-F",
+                [*tmux, "list-sessions", "-F",
                  "#{session_name}|#{session_group}"],
                 capture_output=True, text=True,
             )
@@ -436,7 +507,7 @@ class TestGroupedSessionCleanup:
             # Belt-and-suspenders cleanup
             for suffix in ["", "-control", "-agents"]:
                 subprocess.run(
-                    ["tmux", "kill-session", "-t", f"{session}{suffix}"],
+                    [*tmux, "kill-session", "-t", f"{session}{suffix}"],
                     capture_output=True,
                 )
 

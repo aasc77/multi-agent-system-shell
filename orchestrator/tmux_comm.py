@@ -23,12 +23,88 @@ Requirements traced to PRD:
 
 from __future__ import annotations
 
+import enum
+import hashlib
 import logging
+import os
 import subprocess
 import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _tmux_cmd() -> list[str]:
+    """Return the ``tmux`` argv prefix, honoring ``MAS_TMUX_SOCKET``.
+
+    When the env var is set, every ``subprocess.run`` dispatched from
+    this module prepends ``-L <socket>``, routing ops to a dedicated
+    tmux server. Used by pytest (see ``tests/conftest.py``) to isolate
+    test tmux operations from default-socket user sessions. See #46.
+    """
+    socket = os.environ.get("MAS_TMUX_SOCKET")
+    if socket:
+        return ["tmux", "-L", socket]
+    return ["tmux"]
+
+
+# ---------------------------------------------------------------------------
+# Agent pane state (issue #42)
+# ---------------------------------------------------------------------------
+#
+# Replaces the pre-#42 negative-signal `is_agent_idle()` check (which
+# inferred "working" from the absence of the `❯` prompt character) with
+# a three-state positive-signal model derived from pane-content hashing.
+#
+# How the states are computed (see `TmuxComm.get_pane_state()`):
+#   - WORKING: pane content hash changed since last cycle. Active work
+#     continuously ticks time counters, token streams, and the `Running…`
+#     animation — so a changing hash is direct positive proof of life.
+#   - IDLE: pane unchanged since last cycle AND the `❯` idle prompt is
+#     visible. The agent has parked at a prompt and is waiting for a
+#     nudge. Preserves the existing idle-watchdog behavior.
+#   - UNKNOWN: pane unchanged since last cycle AND no `❯` visible,
+#     observed for at least `_STALE_DEBOUNCE_CYCLES` consecutive cycles.
+#     New detection capability: catches crashed processes, bash prompts,
+#     confirmation dialogs, and other failure modes that the pre-#42
+#     check silently treated as "probably working". Debouncing avoids
+#     one-shot false positives from a capture-timing race.
+#
+# Rejected alternatives (see #42 architectural discussion):
+#   - `esc to interrupt` substring match: the string does not exist in
+#     claude-code v2.1.x UI chrome. Empirically verified across 5 agent
+#     panes — zero hits in live UI, all prose false positives. Also
+#     vulnerable to the same self-reference trap as #28's `-32603`.
+#   - Ranked-signal regex on gerund/Running patterns: needs line-start
+#     anchor + hub exclusion + version parity check, all of which
+#     pane-diff avoids by construction.
+#
+# See also:
+#   - `_AGENT_STATE_CAPTURE_LINES` — hash-window line count
+#   - `_STALE_DEBOUNCE_CYCLES` — min consecutive stale cycles to flag
+#   - `is_agent_idle` — thin backwards-compat wrapper on `get_pane_state`
+
+
+_AGENT_STATE_CAPTURE_LINES = 30
+_STALE_DEBOUNCE_CYCLES = 2
+
+
+class AgentPaneState(enum.Enum):
+    """Positive-signal three-state model for agent pane liveness.
+
+    See module-level comment for the full rationale. Values are
+    string-valued so they serialize cleanly into directive payloads
+    published by the watchdog.
+    """
+
+    WORKING = "working"
+    IDLE = "idle"
+    UNKNOWN = "unknown"
+    #: Pane capture subprocess failed for `_STALE_DEBOUNCE_CYCLES`
+    #: consecutive cycles. Operators troubleshoot this differently
+    #: from UNKNOWN (tmux/session health vs agent health), so it
+    #: gets its own enum value and directive subtype.
+    CAPTURE_FAILED = "capture_failed"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -101,16 +177,38 @@ class TmuxComm:
             _CFG_NUDGE_SEND_RETRIES, _DEFAULT_SEND_RETRIES,
         )
 
-        # Build pane mapping: agent_name -> 0-based pane index (config order).
-        # Skip agents with role=monitor -- they launch in the control window,
-        # not the agents window (mirrors start.sh behaviour).
+        # Build pane mapping: agent_name -> 0-based pane index.
+        #
+        # Skip agents with role=monitor -- they launch in the control
+        # window, not the agents window (mirrors start.sh behaviour).
+        #
+        # Issue #51 / #68: we prefer @label-based resolution over
+        # config-order enumeration so the pane mapping survives layout
+        # rearrangement (continuum restore, manual splits, sibling
+        # grouped sessions with different child pane ordering, …).
+        # #52 only wired @label resolution for monitors — regular
+        # agents kept using config-order, which silently misrouted
+        # every NUDGE once the tmux layout drifted from config order.
+        # This builds both a label map and the config-order fallback,
+        # then picks per-agent with precedence:
+        #   label_to_index[agent_label]   (preferred)
+        #     > label_to_index[agent_name]  (name-as-label fallback)
+        #     > config_order_index           (no live tmux / tests)
         pane_agents = [
-            name for name, cfg in config[_CFG_AGENTS].items()
+            (name, cfg if isinstance(cfg, dict) else {})
+            for name, cfg in config[_CFG_AGENTS].items()
             if not (isinstance(cfg, dict) and cfg.get("role") == "monitor")
         ]
-        self._pane_mapping: dict[str, int] = {
-            name: idx for idx, name in enumerate(pane_agents)
-        }
+        label_to_index = self._scan_agents_pane_labels()
+        self._pane_mapping: dict[str, int] = {}
+        for fallback_idx, (name, agent_cfg) in enumerate(pane_agents):
+            configured_label = agent_cfg.get("label", name)
+            idx = label_to_index.get(configured_label)
+            if idx is None:
+                idx = label_to_index.get(name)
+            if idx is None:
+                idx = fallback_idx
+            self._pane_mapping[name] = idx
 
         # Monitor agents live in the control window.  Rather than hardcode
         # pane indices (which break if the user rearranges the layout),
@@ -147,6 +245,14 @@ class TmuxComm:
         self._consecutive_skips: dict[str, int] = {}
         self._escalated: dict[str, bool] = {}
 
+        # Pane state derivation state (issue #42 pane-diff staleness
+        # detection). Keyed by agent name. The watchdog reads these
+        # indirectly via `get_pane_state()`; they are write-once-per-
+        # cycle from the tmux capture path.
+        self._last_pane_hash: dict[str, str] = {}
+        self._consecutive_stale_cycles: dict[str, int] = {}
+        self._consecutive_capture_failures: dict[str, int] = {}
+
         # Escalation callback
         self._flag_human_callback: Optional[FlagHumanCallback] = None
 
@@ -157,11 +263,33 @@ class TmuxComm:
         Returns an empty dict on any failure (tmux not running, session
         missing, etc.) so the caller can fall back to a default layout.
         """
+        return self._scan_window_pane_labels("control")
+
+    def _scan_agents_pane_labels(self) -> dict[str, int]:
+        """Scan the ``agents`` window for pane @labels and return a
+        ``{label: pane_index}`` mapping.
+
+        Used by ``__init__`` to resolve regular-agent pane indices by
+        @label rather than config order (issue #51 / #68). Returns an
+        empty dict on any failure (tmux not running, no session,
+        agents window missing, unit-test mode, …) so the caller can
+        fall back to config order.
+        """
+        return self._scan_window_pane_labels(_AGENTS_WINDOW)
+
+    def _scan_window_pane_labels(self, window: str) -> dict[str, int]:
+        """Shared helper for ``_scan_{control,agents}_pane_labels``.
+
+        Runs ``tmux list-panes -t <session>:<window> -F '<idx>\\t<@label>'``
+        and parses the tab-delimited output. Returns an empty dict on
+        any failure so callers can fall back to a legacy positional
+        layout.
+        """
         try:
             result = subprocess.run(
                 [
-                    "tmux", "list-panes",
-                    "-t", f"{self._session_name}:control",
+                    *_tmux_cmd(), "list-panes",
+                    "-t", f"{self._session_name}:{window}",
                     "-F", "#{pane_index}\t#{@label}",
                 ],
                 capture_output=True,
@@ -226,7 +354,7 @@ class TmuxComm:
         """
         target = self.get_target(agent)
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+            [*_tmux_cmd(), "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
             capture_output=True,
             text=True,
         )
@@ -234,17 +362,14 @@ class TmuxComm:
             return None
         return result.stdout
 
-    def is_agent_idle(self, agent: str) -> bool:
-        """Return ``True`` if the agent's pane appears idle (at prompt).
+    def _has_idle_prompt(self, pane_text: str) -> bool:
+        """Return ``True`` if *pane_text* contains Claude Code's
+        ``❯`` idle-prompt marker.
 
-        Claude Code agents show a ``❯`` prompt when idle.  The status bar
-        (e.g. ``⏵⏵ bypass permissions on``, status line, Dapple bubble)
-        often sits below the prompt, so we check enough lines to cover
-        the tallest possible status footer.
+        Pure helper. Shared between :meth:`get_pane_state` (which
+        reads the prompt status as part of the 3-state derivation)
+        and :meth:`is_agent_idle` (backwards-compat wrapper).
         """
-        pane_text = self.capture_pane(agent, lines=10)
-        if pane_text is None:
-            return False
         lines = [l for l in pane_text.strip().splitlines() if l.strip()]
         if not lines:
             return False
@@ -259,6 +384,152 @@ class TmuxComm:
             or l.strip().startswith("❯")
             for l in lines
         )
+
+    def get_pane_state(self, agent: str) -> AgentPaneState:
+        """Return the current 3-state liveness signal for *agent*.
+
+        Captures the agent's pane, hashes the content, and compares
+        against the previous cycle's hash to decide between WORKING
+        (hash changed = active work ticking counters), IDLE (unchanged
+        + ``❯`` visible), UNKNOWN (unchanged + no ``❯`` for at least
+        :data:`_STALE_DEBOUNCE_CYCLES` consecutive cycles), or
+        CAPTURE_FAILED (pane capture returned ``None`` for at least
+        :data:`_STALE_DEBOUNCE_CYCLES` consecutive cycles).
+
+        Issue #42 positive-signal liveness. See module-level comment
+        for the architectural rationale and rejected alternatives.
+
+        Side effect: updates :attr:`_last_pane_hash`,
+        :attr:`_consecutive_stale_cycles`, and
+        :attr:`_consecutive_capture_failures` in place. The watchdog
+        is expected to call this exactly once per check cycle per
+        agent; repeat calls within a cycle would double-count the
+        debounce counter.
+        """
+        pane_text = self.capture_pane(
+            agent, lines=_AGENT_STATE_CAPTURE_LINES,
+        )
+        if pane_text is None:
+            # Transient capture failure — debounce before flagging.
+            # A single failed capture is a test-bench / tmux artifact,
+            # not an agent-state signal. Only a sustained inability
+            # to read the pane warrants a directive.
+            failures = self._consecutive_capture_failures.get(agent, 0) + 1
+            self._consecutive_capture_failures[agent] = failures
+            if failures >= _STALE_DEBOUNCE_CYCLES:
+                return AgentPaneState.CAPTURE_FAILED
+            # Benefit of doubt on the first failure — return the
+            # least-alarming state so existing idle alerts don't
+            # misfire on a transient hiccup. WORKING is a safe
+            # default because it suppresses any follow-on alerting
+            # paths until the next cycle confirms.
+            return AgentPaneState.WORKING
+
+        # Capture succeeded — reset the failure counter.
+        if agent in self._consecutive_capture_failures:
+            del self._consecutive_capture_failures[agent]
+
+        current_hash = hashlib.sha256(
+            pane_text.encode("utf-8", errors="replace"),
+        ).hexdigest()
+        has_prompt = self._has_idle_prompt(pane_text)
+        last_hash = self._last_pane_hash.get(agent)
+        self._last_pane_hash[agent] = current_hash
+
+        if last_hash is None:
+            # First-ever capture for this agent. No prior hash to
+            # compare against → we have no information to flag on.
+            # Return WORKING as the least-alarming default; the next
+            # cycle will have real signal. Do NOT increment the
+            # stale counter on the first capture — debouncing starts
+            # on the second cycle onward.
+            return AgentPaneState.WORKING
+
+        if current_hash != last_hash:
+            # Hash changed → active work. Reset staleness counter.
+            if agent in self._consecutive_stale_cycles:
+                del self._consecutive_stale_cycles[agent]
+            return AgentPaneState.WORKING
+
+        # Unchanged hash.
+        if has_prompt:
+            # Idle at the prompt — reset staleness counter because
+            # the agent is in a known-good state, just waiting for
+            # a nudge.
+            if agent in self._consecutive_stale_cycles:
+                del self._consecutive_stale_cycles[agent]
+            return AgentPaneState.IDLE
+
+        # Unchanged + no prompt → starting to look stale. Debounce
+        # by requiring N consecutive stale cycles before flagging.
+        stale_count = self._consecutive_stale_cycles.get(agent, 0) + 1
+        self._consecutive_stale_cycles[agent] = stale_count
+        if stale_count >= _STALE_DEBOUNCE_CYCLES:
+            return AgentPaneState.UNKNOWN
+        return AgentPaneState.WORKING
+
+    def get_stale_cycle_count(self, agent: str) -> int:
+        """Return the number of consecutive stale cycles recorded for
+        *agent* by :meth:`get_pane_state`.
+
+        Used by the watchdog cycle log (#56) to show how long an
+        agent has been stuck. Pure read — does not mutate the
+        counter. Returns 0 for agents that have never gone stale or
+        that were most recently WORKING / IDLE.
+        """
+        return self._consecutive_stale_cycles.get(agent, 0)
+
+    def is_agent_idle(self, agent: str) -> bool:
+        """Return ``True`` if the agent's pane appears idle (at prompt).
+
+        Pure function — does NOT mutate the pane-state debounce
+        machinery owned by :meth:`get_pane_state`. Callers from
+        multiple paths and threads (watchdog idle check, delivery
+        probe thread pool, legacy code) can invoke this at any
+        cadence without polluting the 2-cycle debounce counters
+        on UNKNOWN / CAPTURE_FAILED that :meth:`get_pane_state`
+        relies on.
+
+        Why this separation matters: an earlier #42 refactor made
+        ``is_agent_idle`` a thin wrapper around
+        ``get_pane_state``. That looked like a harmless
+        simplification but leaked the side effects on
+        ``_consecutive_stale_cycles`` and
+        ``_consecutive_capture_failures`` into three independent
+        call sites at three different cadences:
+
+        1. watchdog ``_check_idle_agents`` → ``_check_single_agent``
+           → ``is_agent_idle`` (once per watchdog cycle, 15s)
+        2. watchdog ``_check_unknown_agents`` →
+           ``_check_single_agent_pane_state`` → ``get_pane_state``
+           directly (once per watchdog cycle, 15s — same cycle)
+        3. delivery ``_probe_neighbors`` →
+           ``asyncio.to_thread(is_agent_idle, name)`` (once per
+           delivery probe interval, 10s — separate thread)
+
+        Every call advanced the debounce counters. CAPTURE_FAILED
+        fired on the FIRST capture failure instead of the second,
+        because the combined advance rate was 2-3× the designed
+        rate. A single transient tmux hiccup would produce a
+        spurious directive. There was also a thread-safety hazard
+        from ``asyncio.to_thread`` mutating the same dicts the
+        watchdog asyncio loop was reading.
+
+        The fix (macmini's #43 review finding): revert
+        ``is_agent_idle`` to a pure 4-line function that reads a
+        10-line capture and checks for the ``❯`` prompt via
+        :meth:`_has_idle_prompt`, with NO state mutations.
+        :meth:`get_pane_state` remains the single owner of the
+        pane-state debounce machinery, invoked exactly once per
+        watchdog cycle per agent from ``_check_unknown_agents``.
+
+        Callers that need to distinguish WORKING, UNKNOWN, and
+        CAPTURE_FAILED should use :meth:`get_pane_state` directly.
+        """
+        pane_text = self.capture_pane(agent, lines=10)
+        if pane_text is None:
+            return False
+        return self._has_idle_prompt(pane_text)
 
     def nudge(self, agent: str, force: bool = False) -> bool:
         """Nudge an agent pane with the configured nudge prompt.
@@ -380,7 +651,7 @@ class TmuxComm:
         """
         result = subprocess.run(
             [
-                "tmux", "display-message", "-p", "-t", target,
+                *_tmux_cmd(), "display-message", "-p", "-t", target,
                 "#{pane_current_command}",
             ],
             capture_output=True,
@@ -394,7 +665,7 @@ class TmuxComm:
     def _tmux_send_keys_once(target: str, text: str) -> bool:
         """Send text + Enter to a tmux pane. Returns True if tmux commands succeeded."""
         result = subprocess.run(
-            ["tmux", "send-keys", "-t", target, text],
+            [*_tmux_cmd(), "send-keys", "-t", target, text],
             capture_output=True,
             text=True,
         )
@@ -403,7 +674,7 @@ class TmuxComm:
             return False
         time.sleep(_SEND_KEYS_DELAY)
         result = subprocess.run(
-            ["tmux", "send-keys", "-t", target, "Enter"],
+            [*_tmux_cmd(), "send-keys", "-t", target, "Enter"],
             capture_output=True,
             text=True,
         )
@@ -416,7 +687,7 @@ class TmuxComm:
     def _tmux_clear_input(target: str) -> None:
         """Send Escape to clear any partial TUI input state."""
         subprocess.run(
-            ["tmux", "send-keys", "-t", target, "Escape"],
+            [*_tmux_cmd(), "send-keys", "-t", target, "Escape"],
             capture_output=True,
             text=True,
         )
@@ -426,7 +697,7 @@ class TmuxComm:
     def _capture_pane_text(target: str, lines: int = 5) -> str:
         """Capture recent pane text for delivery verification."""
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
+            [*_tmux_cmd(), "capture-pane", "-t", target, "-p", "-S", f"-{lines}"],
             capture_output=True,
             text=True,
         )

@@ -488,7 +488,76 @@ class TestEdgeCases:
 
 
 # ===========================================================================
-# 7. ConfigError CUSTOM EXCEPTION
+# 7. PROVIDERS
+# ===========================================================================
+
+
+class TestProviders:
+    """Tests for the ``providers:`` subtree (stt + tts slots).
+
+    Pins two properties:
+
+    1. The global config exposes ``providers.stt.*`` / ``providers.tts.*``
+       via dot-access on the loaded config object.
+    2. A project-level override of a *leaf* key does NOT wipe sibling keys
+       from the global subtree — requires recursive ``_deep_merge``.
+    """
+
+    def test_providers_load_from_global_config(self, workspace):
+        """Global config's providers subtree must load via dot-access."""
+        cfg = load_config(root_dir=workspace, project_name="demo")
+        assert cfg.providers.stt.backend == "whisper"
+        assert cfg.providers.stt.url == "http://192.168.1.51:5112"
+        assert cfg.providers.tts.backend == "piper"
+        assert cfg.providers.tts.url == "http://192.168.1.51:5111"
+
+    def test_project_override_preserves_sibling_providers_keys(self, tmp_path):
+        """Project override of providers.stt.url must keep providers.stt.backend."""
+        global_cfg = tmp_path / "config.yaml"
+        global_cfg.write_text(
+            "providers:\n"
+            "  stt:\n"
+            "    backend: whisper\n"
+            "    url: http://192.168.1.51:5112\n"
+            "  tts:\n"
+            "    backend: piper\n"
+            "    url: http://192.168.1.51:5111\n"
+        )
+
+        project_dir = tmp_path / "projects" / "override"
+        project_dir.mkdir(parents=True)
+        (project_dir / "config.yaml").write_text(
+            "project: override\n"
+            "providers:\n"
+            "  stt:\n"
+            "    url: http://192.168.1.41:5100\n"
+            "agents:\n"
+            "  worker:\n"
+            "    runtime: script\n"
+            "    command: echo\n"
+            "state_machine:\n"
+            "  initial: idle\n"
+            "  states:\n"
+            "    idle:\n"
+            "      description: noop\n"
+            "  transitions:\n"
+            "    - from: idle\n"
+            "      to: idle\n"
+            "      trigger: task_assigned\n"
+        )
+
+        cfg = load_config(root_dir=tmp_path, project_name="override")
+        # Project override of the leaf wins
+        assert cfg.providers.stt.url == "http://192.168.1.41:5100"
+        # Sibling from global survives the recursive merge
+        assert cfg.providers.stt.backend == "whisper"
+        # Untouched section from global is fully intact
+        assert cfg.providers.tts.backend == "piper"
+        assert cfg.providers.tts.url == "http://192.168.1.51:5111"
+
+
+# ===========================================================================
+# 8. ConfigError CUSTOM EXCEPTION
 # ===========================================================================
 
 

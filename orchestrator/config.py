@@ -1,12 +1,14 @@
 """Config Loader for Multi-Agent System Shell.
 
-Loads global and project YAML configs, deep-merges them (two levels),
+Loads global and project YAML configs, deep-merges them recursively,
 and returns a structured dot-access config object.
 
 Merge strategy (PRD R9):
-    Project config overrides global. Two levels deep -- e.g., project
-    ``tmux.session_name`` overrides global ``tmux.session_name`` but
-    inherits ``tmux.nudge_prompt`` if not specified by the project.
+    Project config overrides global, merged recursively. For any key
+    present in both where both values are dicts, inner keys are merged
+    at every depth; project wins on scalar conflicts. A project override
+    of a leaf (e.g. ``providers.stt.url``) therefore preserves its
+    siblings (e.g. ``providers.stt.backend``).
 
 API::
 
@@ -76,20 +78,16 @@ def _to_config_node(value: Any) -> Any:
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Two-level deep merge of *override* into *base*.
+    """Recursive deep merge of *override* into *base*.
 
-    For each key in *override*:
-
-    * If both ``base[key]`` and ``override[key]`` are ``dict``s, their
-      inner keys are merged (one level down).
-    * Otherwise the value from *override* wins outright.
+    For each key in *override*: if both sides are dicts, merge recursively
+    so sibling preservation holds at every depth; otherwise the override
+    value wins outright.
     """
     result = dict(base)
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            merged_section = dict(result[key])
-            merged_section.update(value)
-            result[key] = merged_section
+            result[key] = _deep_merge(result[key], value)
         else:
             result[key] = value
     return result

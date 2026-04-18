@@ -35,6 +35,19 @@ REPO_ROOT = os.path.abspath(
 BOUNCE_SCRIPT = os.path.join(REPO_ROOT, "scripts", "bounce-orchestrator.sh")
 
 
+def _tmux_for_test() -> list[str]:
+    """Return the ``tmux`` argv prefix honoring ``MAS_TMUX_SOCKET``.
+
+    Conftest sets this env var for the whole pytest session (see #46)
+    so every direct ``subprocess.run(["tmux", ...])`` in these tests
+    rides the isolated socket instead of the default one.
+    """
+    socket = os.environ.get("MAS_TMUX_SOCKET")
+    if socket:
+        return ["tmux", "-L", socket]
+    return ["tmux"]
+
+
 # ---------------------------------------------------------------------------
 # Helper: run a lightweight Python process that acquires the orchestrator
 # lock for a fake project name, then sleeps. We can't run the full
@@ -553,30 +566,31 @@ class TestBouncePaneLookup:
 
         project = f"bouncepane-{uuid.uuid4().hex[:8]}"
         session = project
+        tmux = _tmux_for_test()  # #46: dedicated socket
 
         # Clean slate.
         subprocess.run(
-            ["tmux", "kill-session", "-t", session], capture_output=True
+            [*tmux, "kill-session", "-t", session], capture_output=True
         )
 
         try:
             # Create the Fix 5 layout: manager (0, left) | orch (1, top-right).
             subprocess.run(
-                ["tmux", "new-session", "-d", "-s", session,
+                [*tmux, "new-session", "-d", "-s", session,
                  "-n", "control", "-x", "200", "-y", "50"],
                 check=True,
             )
             subprocess.run(
-                ["tmux", "set-option", "-p",
+                [*tmux, "set-option", "-p",
                  "-t", f"{session}:control.0", "@label", "manager"],
                 check=True,
             )
             subprocess.run(
-                ["tmux", "split-window", "-h", "-t", f"{session}:control.0"],
+                [*tmux, "split-window", "-h", "-t", f"{session}:control.0"],
                 check=True,
             )
             subprocess.run(
-                ["tmux", "set-option", "-p",
+                [*tmux, "set-option", "-p",
                  "-t", f"{session}:control.1", "@label", "orchestrator"],
                 check=True,
             )
@@ -601,7 +615,7 @@ class TestBouncePaneLookup:
             )
         finally:
             subprocess.run(
-                ["tmux", "kill-session", "-t", session], capture_output=True
+                [*tmux, "kill-session", "-t", session], capture_output=True
             )
             try:
                 os.unlink(f"/tmp/mas-orch-{project}.lock")
@@ -618,20 +632,21 @@ class TestBouncePaneLookup:
 
         project = f"bouncefb-{uuid.uuid4().hex[:8]}"
         session = project
+        tmux = _tmux_for_test()  # #46: dedicated socket
 
         subprocess.run(
-            ["tmux", "kill-session", "-t", session], capture_output=True
+            [*tmux, "kill-session", "-t", session], capture_output=True
         )
 
         try:
             subprocess.run(
-                ["tmux", "new-session", "-d", "-s", session,
+                [*tmux, "new-session", "-d", "-s", session,
                  "-n", "control", "-x", "200", "-y", "50"],
                 check=True,
             )
             # Set a label that is NOT "orchestrator".
             subprocess.run(
-                ["tmux", "set-option", "-p",
+                [*tmux, "set-option", "-p",
                  "-t", f"{session}:control.0", "@label", "something-else"],
                 check=True,
             )
@@ -652,7 +667,7 @@ class TestBouncePaneLookup:
             )
         finally:
             subprocess.run(
-                ["tmux", "kill-session", "-t", session], capture_output=True
+                [*tmux, "kill-session", "-t", session], capture_output=True
             )
             try:
                 os.unlink(f"/tmp/mas-orch-{project}.lock")

@@ -26,7 +26,12 @@ watchdog:
 agents:
   manager:
     runtime: claude_code
-    working_dir: .
+    # Manager runs in a dedicated git worktree so fun-mode and
+    # operational-script writes don't cross-contaminate whichever
+    # branch hub has checked out in the primary working directory.
+    # Created on first start via scripts/setup-manager-worktree.sh
+    # (idempotent). See #45.
+    working_dir: ../multi-agent-system-shell-manager
     role: monitor
     label: manager
     system_prompt: "You are the manager agent. Follow the instructions in manager/CLAUDE.md exactly. Start your monitoring loop immediately. Be silent when things work."
@@ -70,7 +75,7 @@ agents:
     remote_working_dir: ~/mas-workspace
     remote_bridge_path: ~/mas-bridge/index.js
     label: hassio
-    system_prompt: "You are the Home Assistant agent on the Hassio server. You own all HA integrations: speaker service (voice announcements via HA media_player), TTS pipeline (Piper on port 5111, Whisper STT on port 5112), camera/ONVIF credential management (Reolink NVR at 192.168.1.46), HA entity updates (sensors, binary_sensors), and automations. You are the authority on anything that touches Home Assistant. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
+    system_prompt: "You are the Home Assistant agent on the Hassio server. You own all HA integrations: speaker service (voice announcements via HA media_player), TTS pipeline ({{providers.tts.backend}} at {{providers.tts.url}}), STT ({{providers.stt.backend}} at {{providers.stt.url}}), camera/ONVIF credential management (Reolink NVR at 192.168.1.46), HA entity updates (sensors, binary_sensors), and automations. You are the authority on anything that touches Home Assistant. To message other agents directly, use send_to_agent with target_agent (hub, dgx, dgx2, macmini, or hassio) and message. When nudged, always call check_messages first. When replying to a message, always check the from field and reply to that agent — not hub or manager unless they sent it. Files shared by the user appear in the shared/ directory of your workspace — use your Read tool to view them. When you complete a major task, hit a blocker, or need the user attention, use /speak to announce it on the home speakers."
 
 state_machine:
   initial: idle

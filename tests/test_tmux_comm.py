@@ -29,7 +29,13 @@ import pytest
 from unittest.mock import patch, MagicMock, call
 
 # --- The import that MUST fail in RED phase ---
-from orchestrator.tmux_comm import TmuxComm, TmuxCommError
+from orchestrator.tmux_comm import (
+    AgentPaneState,
+    TmuxComm,
+    TmuxCommError,
+    _AGENT_STATE_CAPTURE_LINES,
+    _STALE_DEBOUNCE_CYCLES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +214,179 @@ class TestPaneIndexMapping:
         assert mapping["dgx"] == 1
         assert mapping["macmini"] == 2
         assert mapping["hassio"] == 3
+
+
+# ===========================================================================
+# 1b. REGULAR-AGENT @LABEL RESOLUTION (#51 / #68)
+# ===========================================================================
+
+
+class TestRegularAgentLabelResolution:
+    """#68: regular-agent pane mapping must come from tmux @labels on
+    the agents window, not config-order enumeration. Config-order
+    silently misrouted every NUDGE once the live tmux layout drifted
+    from config order (continuum restore, manual splits, etc.).
+
+    Each test mocks ``_scan_window_pane_labels`` to simulate a given
+    live tmux state and asserts the resulting pane mapping.
+    """
+
+    def _base_config(self):
+        return {
+            "tmux": {
+                "session_name": "remote-test",
+                "nudge_prompt": "check",
+                "nudge_cooldown_seconds": 30,
+                "max_nudge_retries": 20,
+            },
+            "agents": {
+                "hub": {"runtime": "claude_code", "label": "dev"},
+                "macmini": {"runtime": "claude_code", "label": "macmini (qa)"},
+                "hassio": {"runtime": "claude_code"},
+                "RTX5090": {"runtime": "claude_code", "label": "RTX5090"},
+                "dgx": {"runtime": "claude_code", "label": "dgx1"},
+                "dgx2": {"runtime": "claude_code"},
+            },
+        }
+
+    def test_label_field_wins_over_name(self):
+        """When agent has a configured ``label`` and a pane with that
+        @label exists, that pane index wins — regardless of the
+        agent's position in config or the agent's own name."""
+        from unittest.mock import patch
+        label_map = {
+            # Simulate the drifted real-world layout from #68:
+            # [hub, hassio, dgx1, macmini (qa), RTX5090, dgx2]
+            "dev": 0,
+            "hassio": 1,
+            "dgx1": 2,
+            "macmini (qa)": 3,
+            "RTX5090": 4,
+            "dgx2": 5,
+        }
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels",
+            return_value=label_map,
+        ):
+            comm = TmuxComm(self._base_config())
+        mapping = comm.get_pane_mapping()
+        # This is the exact misrouting scenario from #68 — macmini
+        # must land on pane 3, not pane 1 (hassio's pane).
+        assert mapping["macmini"] == 3, (
+            "macmini must resolve to its real @label pane index 3, "
+            f"not config-order index 1; got {mapping['macmini']}"
+        )
+        assert mapping["hub"] == 0
+        assert mapping["hassio"] == 1
+        assert mapping["dgx"] == 2
+        assert mapping["RTX5090"] == 4
+        assert mapping["dgx2"] == 5
+
+    def test_name_fallback_when_no_label_field(self):
+        """An agent without a configured ``label`` falls back to
+        matching against its own name in the label map. Exercises
+        the hassio + dgx2 case from the real config."""
+        from unittest.mock import patch
+        label_map = {
+            "dev": 0,
+            "hassio": 1,
+            "dgx1": 2,
+            "macmini (qa)": 3,
+            "RTX5090": 4,
+            "dgx2": 5,
+        }
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels",
+            return_value=label_map,
+        ):
+            comm = TmuxComm(self._base_config())
+        mapping = comm.get_pane_mapping()
+        # hassio and dgx2 have no `label` — must match on name.
+        assert mapping["hassio"] == 1
+        assert mapping["dgx2"] == 5
+
+    def test_config_order_fallback_when_tmux_query_fails(self):
+        """No live tmux (unit tests, pre-session boot): scan returns
+        empty dict → every agent falls back to config-order index.
+        This preserves the pre-#68 test contract."""
+        from unittest.mock import patch
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels",
+            return_value={},
+        ):
+            comm = TmuxComm(self._base_config())
+        mapping = comm.get_pane_mapping()
+        assert mapping["hub"] == 0
+        assert mapping["macmini"] == 1
+        assert mapping["hassio"] == 2
+        assert mapping["RTX5090"] == 3
+        assert mapping["dgx"] == 4
+        assert mapping["dgx2"] == 5
+
+    def test_partial_label_match_uses_label_for_some_falls_back_for_others(self):
+        """If only some agents' labels appear in the map, those get
+        their live index and everybody else falls back to config
+        order. Covers mid-boot partial-registration edge cases."""
+        from unittest.mock import patch
+        # Only macmini's label is registered.
+        label_map = {"macmini (qa)": 3}
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels",
+            return_value=label_map,
+        ):
+            comm = TmuxComm(self._base_config())
+        mapping = comm.get_pane_mapping()
+        assert mapping["macmini"] == 3       # from label
+        assert mapping["hub"] == 0            # config order
+        assert mapping["hassio"] == 2         # config order
+        assert mapping["RTX5090"] == 3        # config order — collides with macmini-by-label, by design (map is name→idx, not idx→name)
+        assert mapping["dgx"] == 4
+        assert mapping["dgx2"] == 5
+
+    def test_monitors_still_excluded_from_pane_mapping(self):
+        """Regression guard: #68's label resolution must not change
+        the #42/#51 monitors-excluded-from-agents-window invariant."""
+        from unittest.mock import patch
+        cfg = self._base_config()
+        cfg["agents"] = {
+            "manager": {"runtime": "claude_code", "role": "monitor"},
+            **cfg["agents"],
+        }
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels",
+            return_value={"manager": 0, "dev": 0},
+        ):
+            comm = TmuxComm(cfg)
+        mapping = comm.get_pane_mapping()
+        assert "manager" not in mapping, (
+            "monitors must NOT appear in the regular-agent pane mapping"
+        )
+
+    def test_scan_agents_uses_agents_window(self):
+        """Regression guard: the agents-window scanner must target
+        ``<session>:agents``, not the control window."""
+        from unittest.mock import patch, MagicMock
+        cfg = self._base_config()
+        captured = {}
+        def _fake_scan(self, window):
+            captured["window"] = window
+            return {}
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels", _fake_scan,
+        ):
+            TmuxComm(cfg)
+        # __init__ calls both scans (agents + control). The agents
+        # scan should be first; we assert the last captured window
+        # is either "control" or "agents", then separately check
+        # the agents method exists by invoking it.
+        comm2 = TmuxComm(cfg)
+        # Direct: the agents-window scanner must call the underlying
+        # helper with "agents".
+        with patch.object(
+            comm2, "_scan_window_pane_labels", return_value={},
+        ) as mock_scan:
+            comm2._scan_agents_pane_labels()
+            mock_scan.assert_called_once_with("agents")
 
 
 # ===========================================================================
@@ -901,3 +1080,447 @@ class TestEdgeCases:
         # Nudge should still be possible (no cooldown from msg)
         result = comm.nudge("qa")
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# 11. Agent pane state (issue #42)
+# ---------------------------------------------------------------------------
+
+
+def _patch_capture(comm: TmuxComm, captures):
+    """Replace comm.capture_pane with a side_effect sequence.
+
+    *captures* is an iterable of return values. Each call to
+    ``capture_pane(agent, lines=...)`` yields the next value. When
+    the iterable is exhausted, subsequent calls raise StopIteration
+    — tests should provide enough values for all expected calls.
+    """
+    it = iter(captures)
+
+    def _side_effect(agent, lines=10):
+        return next(it)
+
+    comm.capture_pane = MagicMock(side_effect=_side_effect)
+
+
+class TestGetPaneStateWorking:
+    """Hash-changed → WORKING branch."""
+
+    def test_first_cycle_returns_working_no_prior_hash(self, comm):
+        """Very first call for an agent has no prior hash to compare
+        against. Must return WORKING as the least-alarming default,
+        NOT UNKNOWN — we have no information to flag on.
+        """
+        _patch_capture(comm, ["✻ Scurrying… (3s · ↓ 12 tokens)\n"])
+        state = comm.get_pane_state("qa")
+        assert state == AgentPaneState.WORKING
+
+    def test_changed_hash_returns_working(self, comm):
+        """Two consecutive captures with different content → WORKING
+        on the second (hash changed = active work ticking).
+        """
+        _patch_capture(comm, [
+            "✻ Scurrying… (3s · ↓ 12 tokens)\n",
+            "✻ Scurrying… (4s · ↓ 18 tokens)\n",
+        ])
+        comm.get_pane_state("qa")
+        state = comm.get_pane_state("qa")
+        assert state == AgentPaneState.WORKING
+
+    def test_tool_exec_running_animation_ticks_as_working(self, comm):
+        """Real-world bash-tool-call phase: Running… (Xs · timeout Ys)
+        time counter increments → pane hash changes each cycle →
+        WORKING.
+        """
+        _patch_capture(comm, [
+            "⎿  Running… (3s · timeout 15s)\n  (ctrl+b ctrl+b hint)\n",
+            "⎿  Running… (4s · timeout 15s)\n  (ctrl+b ctrl+b hint)\n",
+        ])
+        comm.get_pane_state("qa")
+        state = comm.get_pane_state("qa")
+        assert state == AgentPaneState.WORKING
+
+
+class TestGetPaneStateIdle:
+    """Hash-unchanged + ❯ present → IDLE branch."""
+
+    def test_unchanged_pane_with_prompt_returns_idle(self, comm):
+        """Agent parked at the ❯ prompt, pane unchanged between
+        cycles → IDLE (existing watchdog behavior preserved).
+        """
+        idle_pane = "banner\n❯ \n  footer line\n"
+        _patch_capture(comm, [idle_pane, idle_pane])
+        comm.get_pane_state("qa")
+        state = comm.get_pane_state("qa")
+        assert state == AgentPaneState.IDLE
+
+    def test_idle_then_activity_returns_working(self, comm):
+        """Idle → activity transition: prior IDLE cycle, then the
+        hash changes → WORKING. Pins the reset-on-change semantics.
+        """
+        _patch_capture(comm, [
+            "❯ \n",
+            "❯ \n",
+            "⎿ Running… (1s)\n❯ \n",
+        ])
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING  # cycle 1: first, no prior
+        assert comm.get_pane_state("qa") == AgentPaneState.IDLE     # cycle 2: unchanged + prompt
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING  # cycle 3: hash changed
+
+
+class TestGetPaneStateUnknown:
+    """Hash-unchanged + no ❯ + debounced → UNKNOWN branch."""
+
+    def test_first_stale_cycle_returns_working_benefit_of_doubt(self, comm):
+        """One stale capture is debounced. Single cycle where the
+        pane is unchanged and has no prompt → WORKING, not UNKNOWN.
+        """
+        # bash prompt, no ❯, repeated. First call establishes the
+        # baseline hash; second call is the first stale observation.
+        _patch_capture(comm, [
+            "user@host:~$ \n",
+            "user@host:~$ \n",
+        ])
+        comm.get_pane_state("qa")  # baseline
+        state = comm.get_pane_state("qa")  # first stale — still WORKING
+        assert state == AgentPaneState.WORKING
+
+    def test_second_consecutive_stale_returns_unknown(self, comm):
+        """Two consecutive stale cycles → flagged UNKNOWN."""
+        _patch_capture(comm, [
+            "user@host:~$ \n",  # baseline
+            "user@host:~$ \n",  # stale 1 → WORKING (benefit of doubt)
+            "user@host:~$ \n",  # stale 2 → UNKNOWN
+        ])
+        comm.get_pane_state("qa")  # baseline
+        comm.get_pane_state("qa")  # stale 1 (WORKING)
+        state = comm.get_pane_state("qa")  # stale 2 (UNKNOWN)
+        assert state == AgentPaneState.UNKNOWN
+
+    def test_crashed_agent_with_stack_trace_detected(self, comm):
+        """Real-world failure: python agent crashed with stack trace
+        visible in pane but no ❯. Pre-#42 is_agent_idle would return
+        False here and the old watchdog would silently consider this
+        'working'. Post-#42 must flag it UNKNOWN after debounce.
+        """
+        crash_pane = (
+            "Traceback (most recent call last):\n"
+            '  File "agent.py", line 42\n'
+            "KeyError: 'missing'\n"
+        )
+        _patch_capture(comm, [crash_pane, crash_pane, crash_pane])
+        comm.get_pane_state("qa")
+        comm.get_pane_state("qa")
+        assert comm.get_pane_state("qa") == AgentPaneState.UNKNOWN
+
+    def test_recovery_after_unknown_returns_working(self, comm):
+        """After flagging UNKNOWN, if the pane starts changing again,
+        next cycle must return WORKING and the stale counter resets.
+        """
+        _patch_capture(comm, [
+            "stuck\n",
+            "stuck\n",
+            "stuck\n",  # UNKNOWN
+            "moving! 1s\n",  # recovery
+            "moving! 2s\n",  # still moving
+        ])
+        comm.get_pane_state("qa")
+        comm.get_pane_state("qa")
+        assert comm.get_pane_state("qa") == AgentPaneState.UNKNOWN
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+
+    def test_unknown_then_prompt_returns_idle(self, comm):
+        """Agent stuck (UNKNOWN) → pane updates to show a prompt →
+        next cycle is IDLE, stale counter resets.
+        """
+        _patch_capture(comm, [
+            "stuck\n",
+            "stuck\n",
+            "stuck\n",  # UNKNOWN
+            "recovered\n❯ \n",  # new content with prompt — WORKING
+            "recovered\n❯ \n",  # unchanged with prompt — IDLE
+        ])
+        comm.get_pane_state("qa")
+        comm.get_pane_state("qa")
+        assert comm.get_pane_state("qa") == AgentPaneState.UNKNOWN
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+        assert comm.get_pane_state("qa") == AgentPaneState.IDLE
+
+
+class TestGetPaneStateCaptureFailed:
+    """capture_pane() returned None → debounced → CAPTURE_FAILED."""
+
+    def test_first_capture_failure_is_debounced(self, comm):
+        """A single None from capture_pane does NOT immediately
+        return CAPTURE_FAILED — debounced.
+        """
+        _patch_capture(comm, [None])
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+
+    def test_second_consecutive_capture_failure_flags_failed(self, comm):
+        """Two consecutive None captures → CAPTURE_FAILED."""
+        _patch_capture(comm, [None, None])
+        comm.get_pane_state("qa")
+        assert comm.get_pane_state("qa") == AgentPaneState.CAPTURE_FAILED
+
+    def test_capture_recovery_resets_failure_counter(self, comm):
+        """After a single failure, a successful capture resets the
+        counter so a future single failure does NOT immediately
+        flag. Prevents accumulating failures across long-running
+        orchestrators.
+        """
+        _patch_capture(comm, [
+            None,            # failure 1 (benefit of doubt)
+            "normal pane\n",  # recovery, counter reset
+            None,            # failure 1 again (benefit of doubt)
+        ])
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+
+
+class TestGetPaneStateAgentIsolation:
+    """State tracking is per-agent — one agent going stale must not
+    affect another agent's counter.
+    """
+
+    def test_staleness_is_per_agent(self, comm):
+        """Agent A goes stale for 2 cycles (UNKNOWN), agent B is
+        active. B must not inherit A's staleness.
+        """
+        call_count = {"qa": 0, "dev": 0}
+
+        def _capture(agent, lines=10):
+            call_count[agent] += 1
+            if agent == "qa":
+                return "stuck\n"  # always same → goes stale
+            return f"dev cycle {call_count[agent]}\n"  # always changing
+
+        comm.capture_pane = MagicMock(side_effect=_capture)
+        for _ in range(3):
+            qa_state = comm.get_pane_state("qa")
+            dev_state = comm.get_pane_state("dev")
+        assert qa_state == AgentPaneState.UNKNOWN
+        assert dev_state == AgentPaneState.WORKING
+
+
+class TestGetPaneStateEmptyCapture:
+    """Empty or whitespace-only pane edge cases."""
+
+    def test_empty_string_capture_returns_working_first_cycle(self, comm):
+        """A legitimate empty string from capture_pane (not None —
+        successful capture of an empty pane) behaves like any other
+        content: first cycle is WORKING, repeated identical → stale.
+        """
+        _patch_capture(comm, ["", "", ""])
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+        # Second call: hash of "" matches prior → no prompt → stale 1
+        assert comm.get_pane_state("qa") == AgentPaneState.WORKING
+        # Third call: stale 2 → UNKNOWN
+        assert comm.get_pane_state("qa") == AgentPaneState.UNKNOWN
+
+
+class TestIsAgentIdleBackcompat:
+    """Pure prompt-detection function — NO side effects on the
+    pane-state debounce machinery owned by :meth:`get_pane_state`.
+
+    Revert from the earlier #42 draft that made this a thin
+    wrapper around ``get_pane_state``. Caught in #43 review by
+    macmini: the wrapper leaked state advances into three
+    independent call sites and broke the 2-cycle debounce.
+    """
+
+    def test_returns_true_for_idle_pane(self, comm):
+        """A pane ending in ``❯`` returns True — the original
+        contract, preserved.
+        """
+        comm.capture_pane = MagicMock(return_value="banner\n❯ \n")
+        assert comm.is_agent_idle("qa") is True
+
+    def test_returns_false_for_busy_pane(self, comm):
+        """A pane without ``❯`` returns False."""
+        comm.capture_pane = MagicMock(return_value="⎿  Running…\n")
+        assert comm.is_agent_idle("qa") is False
+
+    def test_returns_false_on_capture_failure(self, comm):
+        """Transient capture failure (None) returns False — matches
+        pre-#42 behavior. get_pane_state owns the capture-failure
+        debounce; is_agent_idle just conservatively says "not idle".
+        """
+        comm.capture_pane = MagicMock(return_value=None)
+        assert comm.is_agent_idle("qa") is False
+
+    def test_requests_10_line_capture_not_30(self, comm):
+        """is_agent_idle continues to request 10 lines (the pre-#42
+        default), NOT the 30-line hash window get_pane_state uses.
+        Preserves the existing fast-path for the delivery probe.
+        """
+        comm.capture_pane = MagicMock(return_value="❯ \n")
+        comm.is_agent_idle("qa")
+        call_kwargs = comm.capture_pane.call_args.kwargs
+        assert call_kwargs.get("lines") == 10
+
+    def test_does_not_advance_capture_failed_debounce(self, comm):
+        """**Regression test for the #43 review finding.**
+
+        ``is_agent_idle`` must NOT mutate
+        ``_consecutive_capture_failures``. Only ``get_pane_state``
+        (called once per watchdog cycle from
+        ``_check_unknown_agents``) is allowed to advance the
+        CAPTURE_FAILED debounce counter.
+
+        Without this guard, ``is_agent_idle`` could be called from
+        multiple code paths and threads (watchdog idle check,
+        delivery probe thread pool) and each call would advance
+        the counter, firing CAPTURE_FAILED on the first capture
+        failure instead of the second. Spurious directive on every
+        transient tmux hiccup.
+        """
+        comm.capture_pane = MagicMock(return_value=None)
+
+        # Call is_agent_idle many times with failing captures
+        for _ in range(10):
+            comm.is_agent_idle("qa")
+
+        # The state machine dicts MUST be untouched
+        assert comm._consecutive_capture_failures.get("qa", 0) == 0, (
+            "is_agent_idle leaked into the CAPTURE_FAILED debounce "
+            "counter — the #43 review finding has regressed"
+        )
+        assert comm._consecutive_stale_cycles.get("qa", 0) == 0
+        assert "qa" not in comm._last_pane_hash
+
+    def test_does_not_advance_unknown_debounce(self, comm):
+        """Same contract for UNKNOWN / ``_consecutive_stale_cycles``.
+
+        ``is_agent_idle`` called many times with a static non-idle
+        pane must not advance the stale-cycle counter, even though
+        that's structurally a "stale" capture from the perspective
+        of ``get_pane_state``.
+        """
+        comm.capture_pane = MagicMock(return_value="busy bash\n")
+        for _ in range(10):
+            comm.is_agent_idle("qa")
+        assert comm._consecutive_stale_cycles.get("qa", 0) == 0
+        assert "qa" not in comm._last_pane_hash
+
+    def test_interleaved_calls_preserve_get_pane_state_debounce(self, comm):
+        """End-to-end gate: interleave ``is_agent_idle`` and
+        ``get_pane_state`` calls the way production does (watchdog
+        idle check → delivery probe → watchdog unknown check) and
+        verify ``get_pane_state`` still honors the exact 2-cycle
+        CAPTURE_FAILED debounce.
+        """
+        comm.capture_pane = MagicMock(return_value=None)
+
+        # Simulate one watchdog cycle: is_agent_idle (idle check) +
+        # delivery probe (is_agent_idle via thread pool) + unknown check
+        # (get_pane_state). Only the get_pane_state call should
+        # advance the counter.
+        comm.is_agent_idle("qa")   # idle check
+        comm.is_agent_idle("qa")   # delivery probe
+        state1 = comm.get_pane_state("qa")  # unknown check, counter = 1
+        assert state1 == AgentPaneState.WORKING, (
+            "first capture failure in first cycle should be debounced"
+        )
+
+        # Second watchdog cycle, same pattern
+        comm.is_agent_idle("qa")
+        comm.is_agent_idle("qa")
+        state2 = comm.get_pane_state("qa")  # counter = 2
+        assert state2 == AgentPaneState.CAPTURE_FAILED, (
+            "second capture failure in second cycle should flag"
+        )
+
+
+class TestGetStaleCycleCount:
+    """#56: `get_stale_cycle_count(agent)` exposes the debounce
+    counter used by `get_pane_state` without mutating it, so the
+    watchdog cycle log can show ``pane-stuck: dgx(N cycles)``
+    without re-computing any pane hashes.
+    """
+
+    def test_returns_zero_for_unknown_agent(self, comm):
+        assert comm.get_stale_cycle_count("never-seen") == 0
+
+    def test_returns_zero_after_working_reset(self, comm):
+        """Advancing through WORKING clears the counter."""
+        with patch.object(comm, "capture_pane",
+                          side_effect=["frame-a\n", "frame-b\n"]):
+            comm.get_pane_state("hub")  # first capture → WORKING (no prior)
+            comm.get_pane_state("hub")  # hash changed → WORKING
+        assert comm.get_stale_cycle_count("hub") == 0
+
+    def test_increments_as_pane_stays_stale(self, comm):
+        """The counter increments once per consecutive stale cycle."""
+        # No-prompt frame, repeated.
+        stale_frame = "Running a tool call...\n"
+        with patch.object(comm, "capture_pane", return_value=stale_frame):
+            comm.get_pane_state("hub")  # first capture → WORKING, counter 0
+            comm.get_pane_state("hub")  # stale 1 → WORKING, counter 1
+            comm.get_pane_state("hub")  # stale 2 → UNKNOWN, counter 2
+        assert comm.get_stale_cycle_count("hub") == 2
+
+    def test_read_is_non_mutating(self, comm):
+        """Reading via get_stale_cycle_count must NOT advance the
+        counter — otherwise the watchdog's log-format read path
+        would corrupt the #42 state machine."""
+        stale_frame = "Running a tool call...\n"
+        with patch.object(comm, "capture_pane", return_value=stale_frame):
+            comm.get_pane_state("hub")
+            comm.get_pane_state("hub")
+        before = comm.get_stale_cycle_count("hub")
+        comm.get_stale_cycle_count("hub")
+        comm.get_stale_cycle_count("hub")
+        assert comm.get_stale_cycle_count("hub") == before
+
+
+class TestStateTransitionTable:
+    """Table-driven test covering a full state-machine walk:
+    WORKING → IDLE → WORKING → stale×2 → UNKNOWN → recover → WORKING.
+    """
+
+    def test_full_lifecycle(self, comm):
+        seq = [
+            ("⎿ Running 1s\n", AgentPaneState.WORKING),   # first cycle (no prior hash)
+            ("⎿ Running 2s\n", AgentPaneState.WORKING),   # hash changed
+            ("❯ \n",           AgentPaneState.WORKING),   # hash changed
+            ("❯ \n",           AgentPaneState.IDLE),      # unchanged + prompt
+            ("⎿ Running 1s\n", AgentPaneState.WORKING),   # hash changed
+            ("stuck\n",        AgentPaneState.WORKING),   # hash changed
+            ("stuck\n",        AgentPaneState.WORKING),   # stale 1 (benefit of doubt)
+            ("stuck\n",        AgentPaneState.UNKNOWN),   # stale 2
+            ("stuck\n",        AgentPaneState.UNKNOWN),   # stale 3 (still UNKNOWN)
+            ("recovered\n",    AgentPaneState.WORKING),   # hash changed — reset
+            ("recovered\n",    AgentPaneState.WORKING),   # stale 1 again
+        ]
+        captures = [c for c, _ in seq]
+        _patch_capture(comm, captures)
+        for i, (_, expected) in enumerate(seq):
+            got = comm.get_pane_state("qa")
+            assert got == expected, (
+                f"cycle {i}: expected {expected}, got {got}"
+            )
+
+
+class TestCaptureLineCount:
+    """Pin the AGENT_STATE_CAPTURE_LINES constant so a future
+    refactor that changes the hash window size is caught in review.
+    """
+
+    def test_hash_window_is_30_lines(self):
+        assert _AGENT_STATE_CAPTURE_LINES == 30
+
+    def test_debounce_is_2_cycles(self):
+        assert _STALE_DEBOUNCE_CYCLES == 2
+
+    def test_get_pane_state_requests_correct_line_count(self, comm):
+        """Verify get_pane_state asks capture_pane for the hash-window
+        size, not the legacy 10-line default. Regression guard
+        against accidental reversion.
+        """
+        comm.capture_pane = MagicMock(return_value="test\n")
+        comm.get_pane_state("qa")
+        call_kwargs = comm.capture_pane.call_args.kwargs
+        assert call_kwargs.get("lines") == _AGENT_STATE_CAPTURE_LINES
