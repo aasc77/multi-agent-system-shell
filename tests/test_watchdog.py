@@ -1014,6 +1014,13 @@ class TestCheckUnknownAgents:
         assert directive["agent"] == "RTX5090"
         assert directive["priority"] == "high"
         assert "message" in directive
+        # #44: directive must name the long-tool-call false-positive
+        # scenario and point operators at tasks.json / outbox activity
+        # before assuming the agent crashed.
+        message = directive["message"]
+        assert "ticking" in message
+        assert "tasks.json" in message
+        assert "outbox" in message
 
     @pytest.mark.asyncio
     async def test_capture_failed_publishes_different_subtype(

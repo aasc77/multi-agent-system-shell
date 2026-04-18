@@ -605,7 +605,15 @@ class IdleWatchdog:
                 f"visible. The agent may be crashed, stuck on a "
                 f"confirmation dialog, showing an error screen, or "
                 f"otherwise hung in a non-responsive state. Check the "
-                f"pane manually and nudge or restart as appropriate."
+                f"pane manually and nudge or restart as appropriate. "
+                f"May also fire if the agent is mid-way through a tool "
+                f"call whose output block doesn't include a ticking "
+                f"timer (e.g. a blocking subprocess with no stdout, "
+                f"slow `git clone` / `npm install`). Before assuming "
+                f"crash, check `tasks.json` for an in-progress task and "
+                f"the agent's last observed outbox activity — a recent "
+                f"outbox message means the bridge is still publishing "
+                f"even if the pane looks frozen."
             ),
             "priority": "high",
         }
