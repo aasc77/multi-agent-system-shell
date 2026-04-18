@@ -150,12 +150,18 @@ else
             behind="$(echo "$divergence" | awk '{print $1}')"
             ahead="$(echo "$divergence" | awk '{print $2}')"
             if [ -n "$behind" ] && [ -n "$ahead" ]; then
+                # #71: the log wraps this string with "(local '<branch>'
+                # is ${state})", so any "local " prefix inside the
+                # state itself would double up. Use bare counts +
+                # correct plural/singular suffix for each side.
+                ahead_suffix="$([ "$ahead" -eq 1 ] || echo s)"
+                behind_suffix="$([ "$behind" -eq 1 ] || echo s)"
                 if [ "$behind" -gt 0 ] && [ "$ahead" -gt 0 ]; then
-                    state="diverged (local ${ahead} ahead / ${behind} behind)"
+                    state="diverged (${ahead} commit${ahead_suffix} ahead, ${behind} commit${behind_suffix} behind)"
                 elif [ "$behind" -gt 0 ]; then
-                    state="local ${behind} commits behind"
+                    state="${behind} commit${behind_suffix} behind"
                 elif [ "$ahead" -gt 0 ]; then
-                    state="local ${ahead} commits ahead"
+                    state="${ahead} commit${ahead_suffix} ahead"
                 else
                     state="in sync"
                 fi
