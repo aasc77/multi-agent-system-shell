@@ -1195,19 +1195,29 @@ class TestHeartbeatDeploySkewFailOpen:
         assert dp._neighbors["hub"].state == NeighborState.DOWN
 
     @pytest.mark.asyncio
-    async def test_gate_reengages_once_any_agent_heartbeats(self):
-        """Mixed fleet: agent A has a fresh heartbeat, agent B has
-        never been seen. Past grace → B must be forced DOWN. The
-        tracker being non-empty is the signal that bridges ARE
-        publishing and any missing agent is a real logout.
+    async def test_partial_deploy_skew_never_seen_agents_stay_up(self):
+        """#88: the exact scenario that mass-demoted the fleet
+        right after #87 landed. Manager's bridge got restarted
+        first with the #80 code and started heartbeating. Every
+        other agent (hub, dgx2, macmini, …) was still on pre-#80
+        bridge code and had never published a heartbeat.
+
+        Pre-#88 rule (\"gate re-engages once any agent heartbeats\"):
+        tracker non-empty + others never-seen + past grace →
+        force DOWN for every other agent. Broke live fleet.
+
+        #88 rule (\"gate is per-agent\"): never-seen-THIS-agent →
+        fall through to pane. Only agents we have personally
+        observed heartbeat can be force-demoted when they go
+        silent. Everyone else stays UP via their idle pane.
         """
         from orchestrator.delivery import DeliveryProtocol
         from orchestrator.heartbeat_tracker import HeartbeatTracker
         tracker = HeartbeatTracker()
-        tracker.touch("hub")  # one agent heartbeating — deploy is fine
+        tracker.touch("manager")  # only manager has been updated
         tmux = _make_tmux(
-            idle_agents=["hub", "dgx2"],
-            reachable_agents=["hub", "dgx2"],
+            idle_agents=["manager", "hub", "dgx2", "macmini"],
+            reachable_agents=["manager", "hub", "dgx2", "macmini"],
         )
         dp = DeliveryProtocol(
             tmux_comm=tmux,
@@ -1217,18 +1227,23 @@ class TestHeartbeatDeploySkewFailOpen:
         _age_neighbors(dp)
         dp._orchestrator_started_at = time.time() - 3600
         await dp._probe_neighbors()
-        # hub is fresh → UP via pane
-        assert dp._neighbors["hub"].state == NeighborState.UP
-        # dgx2 has never been seen — tracker non-empty → gate
-        # re-engages → forced DOWN regardless of idle pane.
-        assert dp._neighbors["dgx2"].state == NeighborState.DOWN
+        # manager is fresh → UP via pane.
+        assert dp._neighbors["manager"].state == NeighborState.UP
+        # Never-seen agents with idle panes STAY UP — pre-#88 this
+        # is where the mass-DOWN regression lived.
+        assert dp._neighbors["hub"].state == NeighborState.UP, (
+            "hub never heartbeated; gate must not demote on "
+            f"another agent's heartbeat alone. got {dp._neighbors['hub'].state}"
+        )
+        assert dp._neighbors["dgx2"].state == NeighborState.UP
+        assert dp._neighbors["macmini"].state == NeighborState.UP
 
     @pytest.mark.asyncio
     async def test_stale_entry_in_tracker_still_triggers_gate(self):
-        """Regression guard for the distinction that matters:
-        an entry that IS present but stale means heartbeats DID
-        arrive for that agent and then stopped — real silent
-        logout. The gate must still force DOWN for that agent.
+        """Regression guard for the only case that legitimately
+        forces DOWN under the #88 rule: an agent we have previously
+        observed heartbeat, whose heartbeat has since gone stale.
+        That's a real silent logout — the whole reason #80 exists.
         """
         from orchestrator.delivery import DeliveryProtocol
         from orchestrator.heartbeat_tracker import HeartbeatTracker
@@ -1244,6 +1259,44 @@ class TestHeartbeatDeploySkewFailOpen:
         dp._orchestrator_started_at = time.time() - 3600
         await dp._probe_neighbors()
         assert dp._neighbors["hub"].state == NeighborState.DOWN
+
+    @pytest.mark.asyncio
+    async def test_mixed_fleet_stale_demotes_fresh_and_never_seen_up(self):
+        """Combines the two #88 invariants in one scenario:
+
+        - Agent A: fresh heartbeat → UP via pane
+        - Agent B: stale heartbeat (was seen, went silent) → DOWN
+        - Agent C: never observed heartbeat → UP via pane
+
+        This is the full-shape rule: the gate is per-agent and only
+        the \"seen then gone\" case demotes. The other two fall
+        through to pane.
+        """
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        tracker.touch("hub")                          # fresh
+        tracker.touch("dgx2", now=time.time() - 500)  # stale
+        # macmini: never touched → no entry
+        tmux = _make_tmux(
+            idle_agents=["hub", "dgx2", "macmini"],
+            reachable_agents=["hub", "dgx2", "macmini"],
+        )
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        dp._orchestrator_started_at = time.time() - 3600
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.UP
+        assert dp._neighbors["dgx2"].state == NeighborState.DOWN, (
+            "stale-after-seeing IS a real silent logout; must demote"
+        )
+        assert dp._neighbors["macmini"].state == NeighborState.UP, (
+            "never-seen + idle pane must stay UP under #88"
+        )
 
     @pytest.mark.asyncio
     async def test_empty_tracker_inside_grace_still_respects_grace(self):
