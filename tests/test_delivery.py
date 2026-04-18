@@ -740,3 +740,32 @@ class TestPaneStateGate:
             "DOWN path must still increment attempt even if WORKING "
             "gate was previously exercised"
         )
+
+
+class TestRouteTableLog:
+    """#81: the ROUTE TABLE log line must label its pending counter
+    as ``pending_ack`` (not bare ``pending``) so operators reading
+    the log do not have to remember what the counter measures.
+    """
+
+    def test_route_table_log_says_pending_ack_not_pending(self, caplog):
+        import logging
+        from orchestrator.delivery import DeliveryProtocol
+        dp = DeliveryProtocol(tmux_comm=_make_tmux(), config=_make_config())
+        # Mark one mailbox pending so the counter is non-zero; locks
+        # the format verbatim rather than counting on coincidences.
+        dp._neighbors["hub"].mailbox.pending = True
+        with caplog.at_level(logging.INFO, logger="orchestrator.delivery"):
+            dp._log_route_table()
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("ROUTE TABLE:" in m for m in messages), messages
+        assert any("pending_ack=1" in m for m in messages), (
+            f"expected `pending_ack=1` in the log; got {messages!r}"
+        )
+        # The old bare `pending=N` form must not appear (a `pending=1`
+        # substring inside `pending_ack=1` would falsely match; we
+        # check against the literal `| pending=` the pre-#81 format
+        # emitted).
+        assert not any("| pending=" in m for m in messages), (
+            f"legacy `| pending=` label must be gone; got {messages!r}"
+        )

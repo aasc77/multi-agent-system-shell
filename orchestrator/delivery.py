@@ -523,4 +523,6 @@ class DeliveryProtocol:
             flag = "*" if n.mailbox.pending else ""
             entries.append(f"{name}={n.state.value}{flag}")
         pending = sum(1 for n in self._neighbors.values() if n.mailbox.pending)
-        logger.info("ROUTE TABLE: %s | pending=%d", " ".join(entries), pending)
+        logger.info(
+            "ROUTE TABLE: %s | pending_ack=%d", " ".join(entries), pending,
+        )
