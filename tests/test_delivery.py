@@ -1130,3 +1130,139 @@ class TestHeartbeatHandler:
             "type": "heartbeat", "agent": "hub",
         }).encode())
         await dp.handle_heartbeat_message(msg)  # must not raise
+
+
+class TestHeartbeatDeploySkewFailOpen:
+    """#86 (follow-up to #80): when the tracker is globally empty
+    AND we are past startup grace, fail open to pane-only
+    determination. Otherwise a merge + orchestrator-bounce with
+    un-redeployed bridges mass-demotes the whole fleet to DOWN,
+    which is exactly what happened on the first #80 rollout —
+    and was not covered by the original 30 #80 tests.
+
+    The gate re-engages the moment any agent has an observed
+    heartbeat (even a stale one): a present-but-stale entry
+    IS a real silent-logout signal; only the wholly-empty tracker
+    is the deploy-skew tell.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_tracker_past_grace_fails_open_to_pane_up(self):
+        """The exact production scenario that slipped past #80:
+        orchestrator on post-#80 code, bridges still on pre-#80
+        code (no heartbeat publish), idle ❯ panes everywhere.
+        Must resolve to UP via pane path, NOT forced DOWN.
+        """
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()  # empty — no bridge has heartbeated
+        tmux = _make_tmux(
+            idle_agents=["hub", "dgx2", "macmini"],
+            reachable_agents=["hub", "dgx2", "macmini"],
+        )
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        # Well past startup grace → the never-seen branch would
+        # normally force DOWN. Fail-open keeps them UP.
+        dp._orchestrator_started_at = time.time() - 3600
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.UP
+        assert dp._neighbors["dgx2"].state == NeighborState.UP
+        assert dp._neighbors["macmini"].state == NeighborState.UP
+
+    @pytest.mark.asyncio
+    async def test_empty_tracker_past_grace_dead_pane_still_down(self):
+        """Fail-open only falls through to the pane path — it does
+        not force UP. A truly dead pane still produces DOWN via the
+        existing pane-capture-fails branch."""
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()  # empty
+        tmux = _make_tmux(idle_agents=[], reachable_agents=[])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        dp._orchestrator_started_at = time.time() - 3600
+        await dp._probe_neighbors()
+        # Pane capture returned None → DOWN via the existing path.
+        assert dp._neighbors["hub"].state == NeighborState.DOWN
+
+    @pytest.mark.asyncio
+    async def test_gate_reengages_once_any_agent_heartbeats(self):
+        """Mixed fleet: agent A has a fresh heartbeat, agent B has
+        never been seen. Past grace → B must be forced DOWN. The
+        tracker being non-empty is the signal that bridges ARE
+        publishing and any missing agent is a real logout.
+        """
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        tracker.touch("hub")  # one agent heartbeating — deploy is fine
+        tmux = _make_tmux(
+            idle_agents=["hub", "dgx2"],
+            reachable_agents=["hub", "dgx2"],
+        )
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        dp._orchestrator_started_at = time.time() - 3600
+        await dp._probe_neighbors()
+        # hub is fresh → UP via pane
+        assert dp._neighbors["hub"].state == NeighborState.UP
+        # dgx2 has never been seen — tracker non-empty → gate
+        # re-engages → forced DOWN regardless of idle pane.
+        assert dp._neighbors["dgx2"].state == NeighborState.DOWN
+
+    @pytest.mark.asyncio
+    async def test_stale_entry_in_tracker_still_triggers_gate(self):
+        """Regression guard for the distinction that matters:
+        an entry that IS present but stale means heartbeats DID
+        arrive for that agent and then stopped — real silent
+        logout. The gate must still force DOWN for that agent.
+        """
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()
+        tracker.touch("hub", now=time.time() - 500)  # stale entry
+        tmux = _make_tmux(idle_agents=["hub"], reachable_agents=["hub"])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        dp._orchestrator_started_at = time.time() - 3600
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.DOWN
+
+    @pytest.mark.asyncio
+    async def test_empty_tracker_inside_grace_still_respects_grace(self):
+        """Belt-and-suspenders: empty tracker + INSIDE grace window
+        was already covered by test_startup_grace_never_seen... but
+        pin it here too to show the grace + fail-open decisions
+        don't interact badly."""
+        from orchestrator.delivery import DeliveryProtocol
+        from orchestrator.heartbeat_tracker import HeartbeatTracker
+        tracker = HeartbeatTracker()  # empty
+        tmux = _make_tmux(idle_agents=["hub"], reachable_agents=["hub"])
+        dp = DeliveryProtocol(
+            tmux_comm=tmux,
+            config=_make_config_with_heartbeat(
+                startup_grace_seconds=300,
+            ),
+            heartbeat_tracker=tracker,
+        )
+        _age_neighbors(dp)
+        dp._orchestrator_started_at = time.time() - 5  # inside grace
+        await dp._probe_neighbors()
+        assert dp._neighbors["hub"].state == NeighborState.UP

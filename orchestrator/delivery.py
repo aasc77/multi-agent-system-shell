@@ -499,13 +499,40 @@ class DeliveryProtocol:
             return False
         now = time.time()
         age = self._heartbeat_tracker.age_seconds(agent, now=now)
-        if age is None:
-            # Never seen a heartbeat. During startup grace, give the
-            # bridge time to boot; afterwards, no heartbeat means
-            # DOWN.
-            elapsed = now - self._orchestrator_started_at
-            return elapsed >= self._heartbeat_startup_grace_sec
-        return age > self._heartbeat_max_age_sec
+        if age is not None and age <= self._heartbeat_max_age_sec:
+            # Fresh heartbeat — definitely not forcing DOWN.
+            return False
+
+        # Respect startup grace: even a never-seen agent stays UP
+        # during the initial window so the bridge has time to boot.
+        elapsed = now - self._orchestrator_started_at
+        if elapsed < self._heartbeat_startup_grace_sec:
+            return False
+
+        # #86 (follow-up to #80): DEPLOY-SKEW FAIL-OPEN.
+        #
+        # If the tracker has observed ZERO heartbeats from ANY agent
+        # in the fleet, the most likely explanation is that the MCP
+        # bridges are running pre-#80 code that doesn't publish on
+        # `agents.<role>.heartbeat` yet. Forcing everyone DOWN here
+        # is a test-gap regression — #80's test suite covered the
+        # single-agent stale case but never the global-empty case,
+        # so a merge + bounce with un-redeployed bridges mass-
+        # demoted the whole fleet.
+        #
+        # Fail-open rule: empty tracker past grace → return False,
+        # fall through to the existing pane-based determination for
+        # every agent. As soon as ANY agent's bridge is updated and
+        # publishes even one heartbeat, the tracker becomes non-
+        # empty and the gate re-engages for the remaining agents
+        # (a stale-but-present entry IS a real silent-logout
+        # signal; only the wholly-empty case is deploy skew).
+        if not self._heartbeat_tracker.snapshot():
+            return False
+
+        # Stale or never-seen, past grace, tracker has at least one
+        # observed heartbeat → legitimate silent-logout. Force DOWN.
+        return True
 
     async def _maybe_alert_neighbor_down(
         self,
