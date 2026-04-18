@@ -32,12 +32,76 @@ from tests.conftest import TMUX_TEST_SOCKET
 REPO_ROOT = Path(__file__).resolve().parent.parent
 START_SH = REPO_ROOT / "scripts" / "start.sh"
 STOP_SH = REPO_ROOT / "scripts" / "stop.sh"
+BOUNCE_SH = REPO_ROOT / "scripts" / "bounce-orchestrator.sh"
+RESET_DEMO_SH = REPO_ROOT / "scripts" / "reset-demo.sh"
+PASTE_IMAGE_SH = REPO_ROOT / "scripts" / "tmux-paste-image.sh"
 
 
 def _tmux_installed() -> bool:
     return subprocess.run(
         ["which", "tmux"], capture_output=True,
     ).returncode == 0
+
+
+# Matches a bare `tmux <subcommand>` token. Accepts:
+#   - line start
+#   - after whitespace
+#   - after `$(` / `)` / `;` / `&&` / `||` / `|` / `` ` ``
+# Rejects `_tmux`, `command tmux`, comment lines, and string-literal uses
+# like `echo "... tmux ..."` (the double quote is the conservative signal).
+_BARE_TMUX_RE = __import__("re").compile(
+    r"""(?mx)                     # multiline, verbose
+    ^                              # line start
+    (?!\s*\#)                      # not a comment line
+    (?:                            # allowed prefix before `tmux`
+        [^"'\n]*?                  # ... no quote chars on this line yet
+        (?:^|\s|\$\(|\(|;|\|\||&&|\|)  # token boundary
+    )
+    tmux                           # the bare command
+    (?=\s|$)                       # followed by whitespace or EOL
+    """,
+)
+
+
+def _assert_no_bare_tmux(path: Path) -> None:
+    src = path.read_text()
+    stripped_lines = []
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        # Allow `command tmux ...` inside the wrapper definition itself.
+        if "command tmux" in stripped:
+            continue
+        stripped_lines.append(line)
+    body = "\n".join(stripped_lines)
+    # Find any bare `tmux <word>` that isn't prefixed by `_`.
+    import re as _re
+    offenders = []
+    for match in _re.finditer(r"(?<![\w-])tmux\s+([a-zA-Z-]+)", body):
+        # Allow documented substrings inside echo / string literals by
+        # ignoring matches that sit inside a quoted string on the same
+        # logical line.
+        start = match.start()
+        line_start = body.rfind("\n", 0, start) + 1
+        line_end = body.find("\n", start)
+        if line_end == -1:
+            line_end = len(body)
+        line = body[line_start:line_end]
+        # Conservative: if the match appears after a `"`, it's a string.
+        prefix = line[: start - line_start]
+        if prefix.count('"') % 2 == 1 or prefix.count("'") % 2 == 1:
+            continue
+        # Ignore "_tmux" — the prefix ensures it's not _tmux already.
+        if prefix.endswith("_"):
+            continue
+        offenders.append(line.strip())
+    assert not offenders, (
+        f"Found bare `tmux <subcommand>` in {path.name} — every call "
+        f"must go through the `_tmux` wrapper so MAS_TMUX_SOCKET "
+        f"isolation holds. Offending lines:\n  "
+        + "\n  ".join(offenders)
+    )
 
 
 class TestSocketConstant:
@@ -109,6 +173,34 @@ class TestShellScriptWrappers:
         # The TMUX_BIN single-string used for osascript/wt.exe commands
         # must append -L $MAS_TMUX_SOCKET when the env var is set.
         assert 'TMUX_BIN="${TMUX_BIN} -L ${MAS_TMUX_SOCKET}"' in src
+
+    def test_reset_demo_sh_defines_wrapper(self):
+        """#58: reset-demo.sh is a manual dev utility that drives tmux
+        directly. Previously not exercised by pytest, so the default
+        socket was safe — but if a test ever drove this script without
+        the wrapper, isolation would break. Gate it in now."""
+        src = RESET_DEMO_SH.read_text()
+        assert "_tmux()" in src, "scripts/reset-demo.sh must define _tmux() wrapper (#58)"
+        assert 'MAS_TMUX_SOCKET' in src
+
+    def test_tmux_paste_image_sh_defines_wrapper(self):
+        """#58: tmux-paste-image.sh is a tmux keybinding handler. At
+        interactive runtime the env var is empty so `_tmux` falls
+        through to plain tmux (preserving behavior). In any future
+        test context it'll pick up the socket."""
+        src = PASTE_IMAGE_SH.read_text()
+        assert "_tmux()" in src, "scripts/tmux-paste-image.sh must define _tmux() wrapper (#58)"
+        assert 'MAS_TMUX_SOCKET' in src
+
+    def test_no_bare_tmux_calls_in_reset_demo_sh(self):
+        """Regression guard: no bare `tmux <subcommand>` invocations
+        left in reset-demo.sh. `_tmux` wrapper must intercept every
+        call so MAS_TMUX_SOCKET isolation holds.
+        """
+        _assert_no_bare_tmux(RESET_DEMO_SH)
+
+    def test_no_bare_tmux_calls_in_tmux_paste_image_sh(self):
+        _assert_no_bare_tmux(PASTE_IMAGE_SH)
 
 
 @pytest.mark.skipif(not _tmux_installed(), reason="tmux not installed")

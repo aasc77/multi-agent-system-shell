@@ -11,16 +11,28 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT_DIR="${ROOT_DIR}/projects/${PROJECT}"
 TASKS_FILE="${PROJECT_DIR}/tasks.json"
 
+# Route tmux through MAS_TMUX_SOCKET when set (matches the pattern in
+# start.sh / stop.sh / bounce-orchestrator.sh). Pytest contexts set
+# this env var to isolate tmux ops on a dedicated server; the empty
+# default preserves interactive behavior. See #46 / #58.
+_tmux() {
+    if [ -n "${MAS_TMUX_SOCKET:-}" ]; then
+        command tmux -L "$MAS_TMUX_SOCKET" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
 echo "Resetting project: ${PROJECT}"
 
 # 1. Kill tmux session
-if tmux has-session -t "$PROJECT" 2>/dev/null; then
-    tmux kill-session -t "$PROJECT"
+if _tmux has-session -t "$PROJECT" 2>/dev/null; then
+    _tmux kill-session -t "$PROJECT"
     echo "  Killed tmux session: ${PROJECT}"
 fi
 
 # 2. Clear CLAUDECODE from tmux server
-tmux set-environment -g -u CLAUDECODE 2>/dev/null || true
+_tmux set-environment -g -u CLAUDECODE 2>/dev/null || true
 echo "  Cleared CLAUDECODE from tmux env"
 
 # 3. Clean NATS stream

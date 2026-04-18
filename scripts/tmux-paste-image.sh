@@ -17,37 +17,49 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 TMP_IMG="/tmp/clipboard-${TIMESTAMP}.png"
 
+# Route tmux through MAS_TMUX_SOCKET when set. This script is a
+# tmux keybinding so at runtime the env var is typically empty and
+# `_tmux` falls through to plain `tmux` (preserving interactive
+# behavior). See #46 / #58.
+_tmux() {
+    if [ -n "${MAS_TMUX_SOCKET:-}" ]; then
+        command tmux -L "$MAS_TMUX_SOCKET" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
 # Get session name (passed by tmux or auto-detect)
-SESSION="${1:-$(tmux display-message -p '#{session_name}')}"
+SESSION="${1:-$(_tmux display-message -p '#{session_name}')}"
 
 # --- 1. Grab image from clipboard ---
 if ! command -v pngpaste &>/dev/null; then
-    tmux display-message "pngpaste not found. Run: brew install pngpaste"
+    _tmux display-message "pngpaste not found. Run: brew install pngpaste"
     exit 1
 fi
 
 if ! pngpaste "$TMP_IMG" 2>/dev/null; then
-    tmux display-message "No image in clipboard"
+    _tmux display-message "No image in clipboard"
     exit 1
 fi
 
 # --- 2. Detect which pane we're in and map to agent ---
-CURRENT_PANE=$(tmux display-message -p '#{pane_index}')
-CURRENT_WINDOW=$(tmux display-message -p '#{window_name}')
+CURRENT_PANE=$(_tmux display-message -p '#{pane_index}')
+CURRENT_WINDOW=$(_tmux display-message -p '#{window_name}')
 
 if [ "$CURRENT_WINDOW" != "agents" ]; then
-    tmux display-message "Not in agents window — switch to an agent pane first"
+    _tmux display-message "Not in agents window — switch to an agent pane first"
     rm -f "$TMP_IMG"
     exit 1
 fi
 
 # Get agent label from pane
-PANE_LABEL=$(tmux display-message -p -t "${SESSION}:agents.${CURRENT_PANE}" '#{@label}')
+PANE_LABEL=$(_tmux display-message -p -t "${SESSION}:agents.${CURRENT_PANE}" '#{@label}')
 # Extract agent name (strip the "(local)" or "(hostname)" suffix)
 AGENT_NAME=$(echo "$PANE_LABEL" | sed 's/ (.*//')
 
 if [ -z "$AGENT_NAME" ]; then
-    tmux display-message "Could not detect agent for pane ${CURRENT_PANE}"
+    _tmux display-message "Could not detect agent for pane ${CURRENT_PANE}"
     rm -f "$TMP_IMG"
     exit 1
 fi
@@ -57,7 +69,7 @@ PROJECT_CONFIG="${ROOT_DIR}/projects/${SESSION}/config.yaml"
 FILENAME="clipboard-${TIMESTAMP}.png"
 
 if [ ! -f "$PROJECT_CONFIG" ]; then
-    tmux display-message "No config found for project: ${SESSION}"
+    _tmux display-message "No config found for project: ${SESSION}"
     rm -f "$TMP_IMG"
     exit 1
 fi
@@ -86,10 +98,10 @@ if [ -n "$SSH_HOST" ]; then
     if scp -O -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$TMP_IMG" "${SSH_HOST}:${DEST}${FILENAME}" 2>/dev/null; then
         # Type the path into the pane for Claude Code
         REMOTE_PATH="${REMOTE_WORKING_DIR:-~/mas-workspace}/shared/${FILENAME}"
-        tmux send-keys -t "${SESSION}:agents.${CURRENT_PANE}" "Look at the image I just pasted: shared/${FILENAME}" Enter
-        tmux display-message "Image sent to ${AGENT_NAME} → shared/${FILENAME}"
+        _tmux send-keys -t "${SESSION}:agents.${CURRENT_PANE}" "Look at the image I just pasted: shared/${FILENAME}" Enter
+        _tmux display-message "Image sent to ${AGENT_NAME} → shared/${FILENAME}"
     else
-        tmux display-message "SCP failed to ${AGENT_NAME} (${SSH_HOST})"
+        _tmux display-message "SCP failed to ${AGENT_NAME} (${SSH_HOST})"
     fi
 else
     # Local agent — copy directly
@@ -101,8 +113,8 @@ else
     fi
     mkdir -p "${WD}/shared"
     cp "$TMP_IMG" "${WD}/shared/${FILENAME}"
-    tmux send-keys -t "${SESSION}:agents.${CURRENT_PANE}" "Look at the image I just pasted: shared/${FILENAME}" Enter
-    tmux display-message "Image pasted to ${AGENT_NAME} → shared/${FILENAME}"
+    _tmux send-keys -t "${SESSION}:agents.${CURRENT_PANE}" "Look at the image I just pasted: shared/${FILENAME}" Enter
+    _tmux display-message "Image pasted to ${AGENT_NAME} → shared/${FILENAME}"
 fi
 
 rm -f "$TMP_IMG"
