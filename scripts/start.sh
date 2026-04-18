@@ -426,12 +426,25 @@ auto_start_nats
 # -----------------------------------------------------------------------
 DRY_RUN="${_TEST_DRY_RUN:-false}"
 
+# If MAS_TMUX_SOCKET is set, route every tmux invocation through
+# `tmux -L <socket>`. A dedicated socket = a dedicated server = full
+# namespace isolation from the user's default-socket sessions. Used by
+# pytest (see tests/conftest.py) so a buggy test fixture can never
+# reach live user sessions. See #46.
+_tmux() {
+    if [ -n "${MAS_TMUX_SOCKET:-}" ]; then
+        command tmux -L "$MAS_TMUX_SOCKET" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
 tmux_cmd() {
     # Execute a tmux command, or print it in dry-run mode.
     if [ "$DRY_RUN" = "true" ]; then
         echo "[DRY-RUN] tmux $*"
     else
-        tmux "$@" 2>/dev/null || true
+        _tmux "$@" 2>/dev/null || true
     fi
 }
 
@@ -445,7 +458,7 @@ session_exists() {
         [ "$_TEST_SESSION_EXISTS" = "true" ]
         return
     fi
-    tmux has-session -t "$SESSION_NAME" 2>/dev/null
+    _tmux has-session -t "$SESSION_NAME" 2>/dev/null
 }
 
 ensure_clean_session() {
@@ -744,7 +757,7 @@ setup_agent_panes() {
     local pane_ids=()  # parallel array: pane_ids[N] = tmux pane_id for grid cell N
 
     # Seed pane_ids[0] with the already-existing first pane of AGENTS_WINDOW.
-    pane_ids[0]=$(tmux display-message -p -t "${SESSION_NAME}:${AGENTS_WINDOW}.0" '#{pane_id}')
+    pane_ids[0]=$(_tmux display-message -p -t "${SESSION_NAME}:${AGENTS_WINDOW}.0" '#{pane_id}')
 
     while IFS= read -r agent_line; do
         [ -z "$agent_line" ] && continue
@@ -859,13 +872,20 @@ fi
 # -t <group>: join the group so windows are shared with the primary
 # -----------------------------------------------------------------------
 TMUX_BIN="$(command -v tmux)"
+# Honor MAS_TMUX_SOCKET for tests: the `-L <socket>` prefix must ride
+# along in the single-string commands we pass to osascript / wt.exe /
+# gnome-terminal below, otherwise those terminal launchers would spawn
+# tmux against the default socket and bypass the isolation. See #46.
+if [ -n "${MAS_TMUX_SOCKET:-}" ]; then
+    TMUX_BIN="${TMUX_BIN} -L ${MAS_TMUX_SOCKET}"
+fi
 
 # Kill stale grouped sessions that tmux-resurrect/continuum may have restored.
 # Without this, `new-session -A` below would attach to the restored (empty)
 # session instead of creating a fresh one grouped with ${SESSION_NAME},
 # producing ghost windows with bare zsh panes instead of the real workload.
-"${TMUX_BIN}" kill-session -t "${SESSION_NAME}-control" 2>/dev/null || true
-"${TMUX_BIN}" kill-session -t "${SESSION_NAME}-agents"  2>/dev/null || true
+${TMUX_BIN} kill-session -t "${SESSION_NAME}-control" 2>/dev/null || true
+${TMUX_BIN} kill-session -t "${SESSION_NAME}-agents"  2>/dev/null || true
 
 TMUX_CMD_CONTROL="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-control -t ${SESSION_NAME} \; select-window -t ${CONTROL_WINDOW}"
 TMUX_CMD_AGENTS="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-agents -t ${SESSION_NAME} \; select-window -t ${AGENTS_WINDOW}"

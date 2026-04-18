@@ -44,6 +44,17 @@ DEFAULT_ORCH_PANE="${SESSION_NAME}:${CONTROL_WINDOW}.0"
 DRY_RUN="${_TEST_DRY_RUN:-false}"
 SKIP_TMUX="${_TEST_SKIP_TMUX:-false}"
 
+# If MAS_TMUX_SOCKET is set, route every tmux invocation through
+# `tmux -L <socket>` so pytest can isolate tmux ops from the user's
+# default-socket sessions. See #46.
+_tmux() {
+    if [ -n "${MAS_TMUX_SOCKET:-}" ]; then
+        command tmux -L "$MAS_TMUX_SOCKET" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
 # -----------------------------------------------------------------------
 # Logging helper
 # -----------------------------------------------------------------------
@@ -103,7 +114,7 @@ find_orchestrator_pane() {
 
     local panes_output
     panes_output="$(
-        tmux list-panes -t "${SESSION_NAME}:${CONTROL_WINDOW}" \
+        _tmux list-panes -t "${SESSION_NAME}:${CONTROL_WINDOW}" \
             -F '#{pane_index}|#{@label}' 2>/dev/null || true
     )"
 
@@ -232,13 +243,13 @@ relaunch_orchestrator() {
         return 1
     fi
 
-    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if ! _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         log "WARNING: tmux session '${SESSION_NAME}' not found -- orchestrator not relaunched."
         log "Run scripts/start.sh ${PROJECT} to create the session."
         return 0
     fi
 
-    tmux send-keys -t "$orch_pane" "$launch_cmd" Enter
+    _tmux send-keys -t "$orch_pane" "$launch_cmd" Enter
     log "Orchestrator relaunched in pane ${orch_pane}."
 }
 
