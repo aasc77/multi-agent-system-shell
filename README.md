@@ -161,23 +161,79 @@ providers:
   tts:
     backend: piper
     url: http://192.168.1.51:5111
+  voice:
+    backend: whisper_llm
+    voxtral:       { url: http://192.168.1.41:5100 }
+    whisper_llm:   { stt_url: http://192.168.1.51:5112, llm_url: http://192.168.1.51:11434, model: qwen3:8b }
+    phi4_multimodal: { url: http://192.168.1.41:5100 }
 ```
 
 ### Provider configuration (`providers:`)
 
-The `providers:` subtree gives the realtime STT and TTS backends a single config home. Each slot has two fields — `backend` (engine name) and `url` (endpoint).
+The `providers:` subtree gives the realtime STT, TTS, and voice-understanding backends a single config home.
 
-Agent `system_prompt` strings can reference any provider field using the `{{providers.<section>.<field>}}` placeholder syntax:
+**STT / TTS slots** — prompt metadata, resolved at launch. Each slot has two fields: `backend` (engine name) and `url` (endpoint). Agent `system_prompt` strings can reference any provider field via the `{{providers.<section>.<field>}}` placeholder syntax, and `scripts/start.sh` substitutes them before the MCP config is generated. Operators can verify the resolved values in the launcher log — `start.sh` emits one `providers.<section> = <backend> @ <url>` line per slot to stderr at startup. Unknown placeholders fail the launch loudly, naming both the offending agent and the token.
 
-```yaml
-system_prompt: "You run the TTS pipeline ({{providers.tts.backend}} at {{providers.tts.url}}), STT ({{providers.stt.backend}} at {{providers.stt.url}})."
+**Voice slot** — runtime-callable audio understanding (issue #16). Unlike `stt`/`tts`, the `voice` slot is consumed at request time by `orchestrator.providers.voice.get_voice_provider(cfg)` and returns a callable adapter:
+
+```python
+from orchestrator.providers.voice import get_voice_provider
+provider = get_voice_provider(cfg["providers"]["voice"])
+result = provider.understand(wav_bytes, system_prompt="...", allowed_tools=[...])
+# -> VoiceResponse(text, tool_call, latency_ms, raw)
 ```
 
-At launch, `scripts/start.sh` runs a substitution pass over each agent's prompt before the MCP config is generated. The placeholders are resolved from the merged global+project `providers:` subtree and the result is passed to `claude --append-system-prompt`. Operators can verify the resolved values in the launcher log — `start.sh` emits one `providers.<section> = <backend> @ <url>` line per slot to stderr at startup.
+Supported backends:
 
-Switching backends is a one-line edit. When Voxtral replaces Whisper, flip `providers.stt.backend: voxtral` and `providers.stt.url: http://192.168.1.41:5100` in `config.yaml` and bounce the orchestrator — no other file changes. Unknown placeholders fail the launch loudly (naming both the offending agent and the token), so typos are caught immediately instead of silently shipping broken prompts.
+| backend            | shape            | config keys (under `providers.voice.<backend>`)          |
+| ------------------ | ---------------- | --------------------------------------------------------- |
+| `voxtral`          | one-hop audio→text+tool | `url`, `timeout_seconds`                            |
+| `phi4_multimodal`  | one-hop, same contract as Voxtral | `url`, `timeout_seconds`                 |
+| `whisper_llm`      | two-hop STT→LLM (OpenAI-compatible chat) | `stt_url`, `llm_url`, `model`, `timeout_seconds` |
+| `null`             | in-process stub for tests | `null.text`, `null.tool_call` (optional)         |
 
-Project configs may override individual leaf keys (e.g. `providers.stt.url`) and the global sibling keys (e.g. `providers.stt.backend`) are preserved via recursive deep-merge.
+Unified backends (`voxtral`, `phi4_multimodal`) must expose:
+
+```
+POST {url}/understand  (multipart/form-data)
+    file           = <wav 16kHz mono bytes>
+    system_prompt  = <str>   (optional)
+    allowed_tools  = <json>  (optional)
+
+200 -> { "text": str, "tool_call": {"name": str, "arguments": dict} | null, "latency_ms": int }
+```
+
+`whisper_llm` does NOT expose this endpoint; it chains Whisper `/transcribe` with an OpenAI-compatible `/v1/chat/completions` call internally.
+
+**Swapping backends is one line.** To move from Whisper+LLM to Voxtral (or Phi-4 Multimodal), flip `providers.voice.backend` and bounce the orchestrator — other sub-sections stay in place and are read on-demand:
+
+```yaml
+providers:
+  voice:
+    backend: phi4_multimodal   # <-- only change
+    voxtral:         { url: http://192.168.1.41:5100 }
+    whisper_llm:     { stt_url: ..., llm_url: ..., model: ... }
+    phi4_multimodal: { url: http://192.168.1.41:5100 }
+```
+
+Use `scripts/voice-provider.py` to inspect or flip the setting without hand-editing YAML:
+
+```bash
+python3 scripts/voice-provider.py show              # print resolved config + adapter class
+python3 scripts/voice-provider.py switch voxtral    # in-place edit, preserves comments
+python3 scripts/voice-provider.py test sample.wav   # smoke-test the configured backend
+```
+
+The `switch` command validates the target backend's sub-section before writing; a typo in `whisper_llm.model` fails the switch instead of silently shipping a broken config.
+
+**Push-to-talk integration.** `services/voice/push-to-talk.py` is the canonical push-to-talk daemon; it imports the provider adapter via `sys.path` injection pinned to `$MAS_SHELL_REPO` (defaults to `~/Repositories/multi-agent-system-shell`). Operators running the daemon from outside the repo should symlink it so upgrades follow `git pull`:
+
+```bash
+ln -sf "$HOME/Repositories/multi-agent-system-shell/services/voice/push-to-talk.py" \
+       "$HOME/mas-workspace/voice/push-to-talk.py"
+```
+
+Project configs may override individual leaf keys (e.g. `providers.stt.url`, `providers.voice.voxtral.url`) and the global sibling keys are preserved via recursive deep-merge.
 
 ### Project Config (`projects/<name>/config.yaml`)
 
