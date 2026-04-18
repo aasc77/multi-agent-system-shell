@@ -61,24 +61,32 @@ class TestSetupScriptMetadata:
 class TestSetupScriptDryRun:
     """Dry-run plan should not touch the filesystem or git state."""
 
-    def test_dry_run_prints_git_worktree_command(self):
-        """On this repo (no existing manager-worktree yet), dry-run
-        should plan to fork the branch from feat/manager-agent."""
+    def test_dry_run_prints_git_worktree_command(self, tmp_path):
+        """With a fresh path (no existing worktree registered there),
+        dry-run should plan to fork the branch from feat/manager-agent.
+
+        We intentionally point at ``tmp_path`` via MAS_MANAGER_WORKTREE
+        so the test is independent of whether the real sibling path
+        at ``/Users/angelserrano/Repositories/multi-agent-system-shell-manager``
+        happens to exist on this machine (it will, after macmini QA
+        or any prior test-install run).
+        """
+        fresh_path = tmp_path / "fresh-manager-worktree"
         result = subprocess.run(
             ["bash", str(SETUP_SCRIPT)],
             capture_output=True, text=True,
-            env={**os.environ, "_TEST_DRY_RUN": "true"},
+            env={
+                **os.environ,
+                "_TEST_DRY_RUN": "true",
+                "MAS_MANAGER_WORKTREE": str(fresh_path),
+            },
         )
         assert result.returncode == 0, result.stderr
         combined = result.stdout + result.stderr
         assert "[DRY-RUN]" in combined
         assert "git worktree add" in combined
         assert "manager-worktree" in combined
-        # The target path should be the sibling of the repo root.
-        expected_sibling = str(REPO_ROOT.parent / "multi-agent-system-shell-manager")
-        assert expected_sibling in combined, (
-            f"dry-run should target {expected_sibling}, got:\n{combined}"
-        )
+        assert str(fresh_path) in combined
 
     def test_dry_run_honors_mas_manager_worktree_override(self, tmp_path):
         """_TEST_DRY_RUN + MAS_MANAGER_WORKTREE should redirect the
@@ -96,6 +104,104 @@ class TestSetupScriptDryRun:
         assert result.returncode == 0
         combined = result.stdout + result.stderr
         assert str(override) in combined
+
+    def test_mas_remote_name_override_routes_remote_branch_lookup(self, tmp_path):
+        """MAS_REMOTE_NAME must change which remote the script checks
+        for the remote-branch fallback.
+
+        Per macmini QA on PR #59: default hardcode of REMOTE_NAME=github
+        silently fell back to a stale local branch on checkouts whose
+        remote is named 'origin'. Default is now 'origin' with env
+        override. This test builds a throwaway repo with a fake remote
+        named 'foo' that has a `refs/remotes/foo/manager-worktree` ref,
+        runs the script with MAS_REMOTE_NAME=foo, and asserts the
+        'Creating local branch ... tracking foo/manager-worktree' path
+        fires. Same setup with MAS_REMOTE_NAME=origin (which doesn't
+        exist in this test repo) must NOT find the remote ref.
+        """
+        repo_dir = tmp_path / "repo"
+        subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.email", "t@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.name", "T"],
+            check=True,
+        )
+        (repo_dir / "README.md").write_text("seed\n")
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "add", "README.md"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "-q", "-m", "seed"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "branch", "-m", "feat/manager-agent"],
+            check=True,
+        )
+        # Fabricate a remote-tracking ref under refs/remotes/foo/
+        # pointing at the seed commit, so the script's
+        # `git show-ref --verify refs/remotes/foo/manager-worktree`
+        # succeeds.
+        head_sha = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "update-ref",
+             "refs/remotes/foo/manager-worktree", head_sha],
+            check=True,
+        )
+
+        test_scripts_dir = repo_dir / "scripts"
+        test_scripts_dir.mkdir()
+        dest = test_scripts_dir / "setup-manager-worktree.sh"
+        dest.write_text(SETUP_SCRIPT.read_text())
+        dest.chmod(0o755)
+
+        worktree_path = tmp_path / "mgr-wt"
+
+        # With MAS_REMOTE_NAME=foo the remote-branch fallback fires.
+        foo_result = subprocess.run(
+            ["bash", str(dest)],
+            capture_output=True, text=True,
+            env={
+                **os.environ,
+                "_TEST_DRY_RUN": "true",
+                "MAS_MANAGER_WORKTREE": str(worktree_path),
+                "MAS_REMOTE_NAME": "foo",
+            },
+        )
+        assert foo_result.returncode == 0, foo_result.stderr
+        combined_foo = foo_result.stdout + foo_result.stderr
+        assert "foo/manager-worktree" in combined_foo, (
+            "MAS_REMOTE_NAME=foo should route remote lookup through "
+            "refs/remotes/foo/manager-worktree, got:\n" + combined_foo
+        )
+
+        # With MAS_REMOTE_NAME=origin (absent in this test repo) the
+        # remote fallback must NOT fire — the script should land on
+        # the fresh-fork branch path instead.
+        origin_result = subprocess.run(
+            ["bash", str(dest)],
+            capture_output=True, text=True,
+            env={
+                **os.environ,
+                "_TEST_DRY_RUN": "true",
+                "MAS_MANAGER_WORKTREE": str(worktree_path),
+                "MAS_REMOTE_NAME": "origin",
+            },
+        )
+        assert origin_result.returncode == 0, origin_result.stderr
+        combined_origin = origin_result.stdout + origin_result.stderr
+        assert "origin/manager-worktree" not in combined_origin, (
+            "MAS_REMOTE_NAME=origin should not find origin/manager-worktree "
+            "in this test repo; got:\n" + combined_origin
+        )
+        # Sanity: the fresh-fork path mentions feat/manager-agent.
+        assert "feat/manager-agent" in combined_origin
 
 
 class TestSetupScriptIdempotencyInTempRepo:

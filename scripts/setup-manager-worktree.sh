@@ -19,6 +19,13 @@
 #   _TEST_DRY_RUN          -- "true" to print what would happen
 #   MAS_MANAGER_WORKTREE   -- override the sibling path (default:
 #                             ../multi-agent-system-shell-manager)
+#   MAS_REMOTE_NAME        -- override the git remote name used for
+#                             the remote-branch fallback (default:
+#                             "origin" — matches git's own default).
+#                             The upstream checkout on aasc77's dev
+#                             machine uses the "github" remote; set
+#                             MAS_REMOTE_NAME=github there. See #45
+#                             QA feedback.
 
 set -euo pipefail
 
@@ -28,7 +35,7 @@ PARENT_DIR="$(cd "${REPO_ROOT}/.." && pwd)"
 WORKTREE_PATH="${MAS_MANAGER_WORKTREE:-${PARENT_DIR}/multi-agent-system-shell-manager}"
 WORKTREE_BRANCH="manager-worktree"
 BASE_BRANCH="feat/manager-agent"
-REMOTE_NAME="github"
+REMOTE_NAME="${MAS_REMOTE_NAME:-origin}"
 
 DRY_RUN="${_TEST_DRY_RUN:-false}"
 
