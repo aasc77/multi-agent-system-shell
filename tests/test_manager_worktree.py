@@ -407,6 +407,297 @@ class TestSetupScriptIdempotencyInTempRepo:
         assert (conflict_path / "stuff.txt").is_file()
 
 
+class TestBaseBranchPriority:
+    """#60: when forking `manager-worktree` from `feat/manager-agent`,
+    setup-manager-worktree.sh must prefer the REMOTE ref over the
+    local ref so the manager worktree tracks upstream state rather
+    than whatever local work dev happens to have in progress.
+
+    These tests all rebuild a throwaway repo with a known local +
+    remote-tracking base, run setup against a fresh worktree path
+    (so the `manager-worktree` branch doesn't yet exist and the
+    fork-from-base code path fires), and inspect the resulting
+    worktree HEAD and log messages.
+    """
+
+    def _make_repo_with_remote_base(
+        self, path: Path, local_sha_msg: str, remote_sha_msg: str,
+    ) -> tuple[str, str]:
+        """Build a repo with:
+        - a local ``feat/manager-agent`` branch pointing at a commit
+          whose message is ``local_sha_msg``
+        - a remote-tracking ref ``refs/remotes/origin/feat/manager-agent``
+          pointing at a (different) commit whose message is
+          ``remote_sha_msg``
+
+        The two commits are unrelated siblings off the seed commit, so
+        neither is an ancestor of the other. Returns (local_sha,
+        remote_sha).
+
+        Lets tests verify which base the script picked purely by the
+        resulting worktree HEAD message — no external fetch, no live
+        network.
+        """
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        subprocess.run(
+            ["git", "-C", str(path), "config", "user.email", "t@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(path), "config", "user.name", "T"],
+            check=True,
+        )
+        (path / "README.md").write_text("seed\n")
+        subprocess.run(
+            ["git", "-C", str(path), "add", "README.md"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(path), "commit", "-q", "-m", "seed"],
+            check=True,
+        )
+        # Rename default branch to BASE_BRANCH so "local base" exists.
+        subprocess.run(
+            ["git", "-C", str(path), "branch", "-m", "feat/manager-agent"],
+            check=True,
+        )
+        # Add a second commit to feat/manager-agent — this is the
+        # "stale local" state.
+        (path / "local.txt").write_text("local\n")
+        subprocess.run(
+            ["git", "-C", str(path), "add", "local.txt"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(path), "commit", "-q", "-m", local_sha_msg],
+            check=True,
+        )
+        local_sha = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        # Now fabricate a remote-tracking ref that points at a
+        # different commit (simulating "origin is ahead / diverged").
+        # Create an orphan temporary branch, commit, capture the sha,
+        # then update-ref the remote-tracking ref, and delete the
+        # temp branch so the local feat/manager-agent remains at
+        # local_sha.
+        subprocess.run(
+            ["git", "-C", str(path), "checkout", "-q",
+             "-b", "__tmp_remote_base", "HEAD~1"],
+            check=True,
+        )
+        (path / "remote.txt").write_text("remote-ahead\n")
+        subprocess.run(
+            ["git", "-C", str(path), "add", "remote.txt"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(path), "commit", "-q", "-m", remote_sha_msg],
+            check=True,
+        )
+        remote_sha = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(path), "update-ref",
+             "refs/remotes/origin/feat/manager-agent", remote_sha],
+            check=True,
+        )
+        # Restore the working tree to local.
+        subprocess.run(
+            ["git", "-C", str(path), "checkout", "-q", "feat/manager-agent"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(path), "branch", "-qD", "__tmp_remote_base"],
+            check=True,
+        )
+        return local_sha, remote_sha
+
+    def _install_setup_script(self, repo_dir: Path) -> Path:
+        scripts_dir = repo_dir / "scripts"
+        scripts_dir.mkdir()
+        dest = scripts_dir / "setup-manager-worktree.sh"
+        dest.write_text(SETUP_SCRIPT.read_text())
+        dest.chmod(0o755)
+        return dest
+
+    def test_prefers_remote_when_local_is_stale(self, tmp_path):
+        """Local feat/manager-agent at commit A, remote at commit B
+        (ahead). Setup must fork manager-worktree off B, and the log
+        must call out that local is behind.
+        """
+        repo_dir = tmp_path / "repo"
+        local_sha, remote_sha = self._make_repo_with_remote_base(
+            repo_dir,
+            local_sha_msg="LOCAL stale commit",
+            remote_sha_msg="REMOTE fresh commit",
+        )
+        dest = self._install_setup_script(repo_dir)
+        worktree_path = tmp_path / "mgr-wt"
+
+        result = subprocess.run(
+            ["bash", str(dest)],
+            capture_output=True, text=True,
+            env={**os.environ, "MAS_MANAGER_WORKTREE": str(worktree_path)},
+        )
+        assert result.returncode == 0, result.stderr
+        combined = result.stdout + result.stderr
+        assert "Using remote base" in combined, (
+            "log must announce remote was preferred:\n" + combined
+        )
+        # Divergence summary should name one of "behind" / "ahead" /
+        # "diverged" — we only check "behind" here since that's
+        # the shape for this test.
+        assert "behind" in combined, (
+            "log must describe local as behind when remote is ahead: "
+            + combined
+        )
+        # Verify the worktree's HEAD points at the REMOTE sha, not
+        # the local sha.
+        head_here = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert head_here == remote_sha, (
+            f"worktree HEAD must match remote ({remote_sha}), not "
+            f"local ({local_sha}); got {head_here}"
+        )
+
+    def test_falls_back_to_local_when_remote_missing(self, tmp_path):
+        """No remote-tracking ref configured. Setup must fall back to
+        the local feat/manager-agent and log that the remote wasn't
+        available.
+        """
+        repo_dir = tmp_path / "repo"
+        # Reuse the helper then DROP the remote ref so only local
+        # exists — that matches "remote not configured / unreachable".
+        local_sha, _remote_sha = self._make_repo_with_remote_base(
+            repo_dir,
+            local_sha_msg="LOCAL only",
+            remote_sha_msg="UNUSED",
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "update-ref", "-d",
+             "refs/remotes/origin/feat/manager-agent"],
+            check=True,
+        )
+
+        dest = self._install_setup_script(repo_dir)
+        worktree_path = tmp_path / "mgr-wt-local-only"
+
+        result = subprocess.run(
+            ["bash", str(dest)],
+            capture_output=True, text=True,
+            env={**os.environ, "MAS_MANAGER_WORKTREE": str(worktree_path)},
+        )
+        assert result.returncode == 0, result.stderr
+        combined = result.stdout + result.stderr
+        assert "Using local base" in combined, (
+            "log must announce local-fallback path:\n" + combined
+        )
+        assert "remote" in combined.lower(), (
+            "log must mention the remote is not configured / unreachable: "
+            + combined
+        )
+        head_here = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert head_here == local_sha
+
+    def test_prefers_remote_even_when_local_is_ahead(self, tmp_path):
+        """Design decision (#60): if local `feat/manager-agent` is
+        AHEAD of the remote (dev has unpushed commits), the manager
+        worktree must STILL fork off the remote.
+
+        Rationale: the manager worktree is a clean checkout for
+        fun-mode writes and operational scripts. It should match
+        what the rest of the fleet sees on origin, not dev's private
+        unpushed work. The log should announce the divergence so dev
+        isn't surprised.
+        """
+        repo_dir = tmp_path / "repo"
+        # Build the repo so local is ahead of remote: create the
+        # remote at the seed commit, then keep adding commits to
+        # local.
+        subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.email", "t@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "config", "user.name", "T"],
+            check=True,
+        )
+        (repo_dir / "README.md").write_text("seed\n")
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "add", "README.md"], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "commit", "-q", "-m", "seed"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "branch", "-m", "feat/manager-agent"],
+            check=True,
+        )
+        # Point the remote at the seed commit BEFORE adding local commits.
+        seed_sha = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "update-ref",
+             "refs/remotes/origin/feat/manager-agent", seed_sha],
+            check=True,
+        )
+        # Now add 2 local commits — local is ahead of remote by 2.
+        for i in range(2):
+            (repo_dir / f"local{i}.txt").write_text(f"ahead-{i}\n")
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "add", f"local{i}.txt"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "commit",
+                 "-q", "-m", f"LOCAL ahead {i}"],
+                check=True,
+            )
+        local_sha = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert local_sha != seed_sha  # precondition: local IS ahead
+
+        dest = self._install_setup_script(repo_dir)
+        worktree_path = tmp_path / "mgr-wt-ahead"
+
+        result = subprocess.run(
+            ["bash", str(dest)],
+            capture_output=True, text=True,
+            env={**os.environ, "MAS_MANAGER_WORKTREE": str(worktree_path)},
+        )
+        assert result.returncode == 0, result.stderr
+        combined = result.stdout + result.stderr
+        assert "Using remote base" in combined, (
+            "log must announce remote was preferred even when local is "
+            "ahead: " + combined
+        )
+        assert "ahead" in combined, (
+            "log must describe local as ahead so dev sees the divergence: "
+            + combined
+        )
+        head_here = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert head_here == seed_sha, (
+            "worktree must match remote (seed), not the ahead local: "
+            f"expected {seed_sha}, got {head_here}"
+        )
+
+
 class TestStartShInvokesSetup:
     def test_start_sh_source_calls_setup_script(self):
         """scripts/start.sh must reference setup-manager-worktree.sh

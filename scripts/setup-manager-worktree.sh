@@ -7,10 +7,13 @@
 # hub has checked out in the primary working directory. See #45.
 #
 # Safe to re-run. If the worktree already exists, this script exits
-# 0 without modification. If the branch exists locally or on the
-# `github` remote, it is reused. Otherwise a new branch is forked
-# from `feat/manager-agent` (preferring the local ref; falling back
-# to `github/feat/manager-agent` when only the remote is present).
+# 0 without modification. If the `manager-worktree` branch already
+# exists (local or remote), it is reused. Otherwise a new branch is
+# forked from `feat/manager-agent`, preferring the REMOTE ref over
+# the local ref (see #60) so the manager worktree tracks upstream
+# state rather than whatever local work dev has in progress. The
+# local ref is used only as a fallback when the remote is not
+# configured or unreachable.
 #
 # Usage:
 #   ./scripts/setup-manager-worktree.sh
@@ -109,14 +112,63 @@ elif git show-ref --verify --quiet "refs/remotes/${REMOTE_NAME}/${WORKTREE_BRANC
     run git worktree add -b "$WORKTREE_BRANCH" "$WORKTREE_PATH" \
         "${REMOTE_NAME}/${WORKTREE_BRANCH}"
 else
-    # No branch anywhere — fork a new one from BASE_BRANCH.
+    # No worktree branch yet — fork a new one from BASE_BRANCH.
+    #
+    # Priority order (#60): PREFER remote over local.
+    #   1. refs/remotes/${REMOTE_NAME}/${BASE_BRANCH} (remote)
+    #   2. refs/heads/${BASE_BRANCH} (local fallback when offline
+    #      or remote unreachable)
+    #   3. error
+    #
+    # Rationale: the manager worktree is a fresh checkout used for
+    # manager's fun-mode / operational writes. It should track what
+    # the rest of the fleet sees on the upstream branch, not whatever
+    # state dev happens to have on their local `feat/manager-agent`
+    # (which may be stale or mid-experiment). If dev has unpushed
+    # local work, that's dev's branch to manage — the manager
+    # worktree intentionally matches origin.
     local_base="refs/heads/${BASE_BRANCH}"
     remote_base="refs/remotes/${REMOTE_NAME}/${BASE_BRANCH}"
+    has_local_base="false"
+    has_remote_base="false"
+    git show-ref --verify --quiet "$local_base" && has_local_base="true"
+    git show-ref --verify --quiet "$remote_base" && has_remote_base="true"
 
-    if git show-ref --verify --quiet "$local_base"; then
-        base_ref="$BASE_BRANCH"
-    elif git show-ref --verify --quiet "$remote_base"; then
+    if [ "$has_remote_base" = "true" ]; then
         base_ref="${REMOTE_NAME}/${BASE_BRANCH}"
+        if [ "$has_local_base" = "true" ]; then
+            # Both exist — describe how local compares to remote so
+            # the operator isn't surprised that their local work
+            # wasn't used. `rev-list --left-right --count` emits
+            # "<behind>\t<ahead>" where behind = commits on remote
+            # but not local, ahead = commits on local but not remote.
+            divergence="$(
+                git rev-list --left-right --count \
+                    "${remote_base#refs/remotes/}...${BASE_BRANCH}" \
+                    2>/dev/null || echo ""
+            )"
+            behind="$(echo "$divergence" | awk '{print $1}')"
+            ahead="$(echo "$divergence" | awk '{print $2}')"
+            if [ -n "$behind" ] && [ -n "$ahead" ]; then
+                if [ "$behind" -gt 0 ] && [ "$ahead" -gt 0 ]; then
+                    state="diverged (local ${ahead} ahead / ${behind} behind)"
+                elif [ "$behind" -gt 0 ]; then
+                    state="local ${behind} commits behind"
+                elif [ "$ahead" -gt 0 ]; then
+                    state="local ${ahead} commits ahead"
+                else
+                    state="in sync"
+                fi
+                log "Using remote base '${base_ref}' (local '${BASE_BRANCH}' is ${state})."
+            else
+                log "Using remote base '${base_ref}' (local '${BASE_BRANCH}' also present)."
+            fi
+        else
+            log "Using remote base '${base_ref}'."
+        fi
+    elif [ "$has_local_base" = "true" ]; then
+        base_ref="$BASE_BRANCH"
+        log "Using local base '${BASE_BRANCH}' (remote '${REMOTE_NAME}/${BASE_BRANCH}' not configured or unreachable)."
     else
         log "ERROR: base branch '${BASE_BRANCH}' not found locally or on '${REMOTE_NAME}'." >&2
         log "Fetch it (\`git fetch ${REMOTE_NAME} ${BASE_BRANCH}\`) and retry." >&2
