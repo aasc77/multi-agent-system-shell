@@ -488,6 +488,47 @@ class TestLazyLabelRescan:
             f"counted {calls['n'] - init_calls} extra scan(s)."
         )
 
+    def test_transient_empty_scan_does_not_regress_healthy_mapping(self):
+        """QA flag on PR #92: a transient ``tmux list-panes`` failure
+        returns ``{}``. Without a guard, the refresh would rebuild
+        the mapping from pure config-order fallback and stomp the
+        healthy post-startup label-based mapping for up to one TTL
+        window. Empty-scan guard: skip the swap when the scan came
+        back empty, keep the existing mapping, let the next TTL
+        window retry."""
+        from unittest.mock import patch
+        live_labels = {
+            "dev": 0,
+            "hassio": 1,
+            "dgx1": 2,
+            "macmini (qa)": 3,
+            "RTX5090": 4,
+            "dgx2": 5,
+        }
+        # 1st scan (__init__): healthy labels.
+        # 2nd scan (refresh): transient failure — empty.
+        scans = [live_labels, {}]
+        def scripted_scan(self, window):
+            return scans.pop(0) if scans else {}
+
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels", scripted_scan,
+        ):
+            comm = TmuxComm(self._base_config())
+            healthy = dict(comm.get_pane_mapping())
+            # Force the refresh branch.
+            from orchestrator.tmux_comm import _PANE_MAPPING_REFRESH_TTL_SEC
+            comm._pane_mapping_refreshed_at -= (
+                _PANE_MAPPING_REFRESH_TTL_SEC + 1
+            )
+            comm.get_target("macmini")
+        assert comm.get_pane_mapping() == healthy, (
+            "empty scan must NOT regress a healthy mapping to the "
+            "config-order fallback — that is the pre-#92 misrouting "
+            "scenario we are trying to avoid.\n"
+            f"  before: {healthy}\n  after: {comm.get_pane_mapping()}"
+        )
+
     def test_rescan_is_silent_when_mapping_unchanged(self, caplog):
         """No log spam when the rescan returns the same mapping."""
         import logging

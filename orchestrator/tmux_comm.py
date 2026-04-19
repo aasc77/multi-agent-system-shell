@@ -349,17 +349,25 @@ class TmuxComm:
                 continue
         return mapping
 
-    def _build_pane_mapping(self) -> dict[str, int]:
-        """Return a fresh agent→pane-index mapping from current tmux
-        ``@label`` state, with config-order fallback.
+    def _build_pane_mapping(
+        self,
+        label_to_index: dict[str, int] | None = None,
+    ) -> dict[str, int]:
+        """Return a fresh agent→pane-index mapping.
 
-        Shared between the initial ``__init__`` build and the lazy
-        refresh path. Precedence per agent is unchanged:
+        When *label_to_index* is ``None`` the method scans the live
+        tmux state. Refresh callers scan themselves (to distinguish
+        an empty scan from a genuine no-change) and pass the result
+        in; the ``__init__`` path leaves it ``None`` so the scan
+        happens here.
+
+        Precedence per agent is unchanged:
         ``label_to_index[configured_label]``
         > ``label_to_index[agent_name]``
         > config-order index.
         """
-        label_to_index = self._scan_agents_pane_labels()
+        if label_to_index is None:
+            label_to_index = self._scan_agents_pane_labels()
         mapping: dict[str, int] = {}
         for fallback_idx, (name, agent_cfg) in enumerate(self._pane_agents):
             configured_label = agent_cfg.get("label", name)
@@ -383,6 +391,16 @@ class TmuxComm:
         picks up the live layout without requiring an orchestrator
         bounce.
 
+        Empty-scan guard: a transient ``tmux list-panes`` failure
+        (tmux server busy, socket race, signal interruption, …)
+        makes the scan return ``{}``. Treating that as ground truth
+        would rebuild the mapping from pure config-order fallback
+        and stomp the healthy mapping for up to one TTL window.
+        Skip the swap in that case — a stale correct mapping beats a
+        freshly-computed wrong one. The TTL still ticks, so the
+        next retry happens on the next ``get_target`` past the
+        cooldown.
+
         Cost: one ``tmux list-panes`` call per
         ``_PANE_MAPPING_REFRESH_TTL_SEC`` window, regardless of how
         many ``get_target`` calls happen in between. The actual dict
@@ -394,7 +412,11 @@ class TmuxComm:
                 < _PANE_MAPPING_REFRESH_TTL_SEC):
             return
         self._pane_mapping_refreshed_at = now
-        new_mapping = self._build_pane_mapping()
+        label_to_index = self._scan_agents_pane_labels()
+        if not label_to_index:
+            # Transient scan failure — don't regress to config-order.
+            return
+        new_mapping = self._build_pane_mapping(label_to_index)
         if new_mapping != self._pane_mapping:
             logger.info(
                 "Pane mapping refreshed via @label rescan: %s -> %s",
