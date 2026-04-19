@@ -954,30 +954,35 @@ iterm2_is_running() {
 }
 
 open_two_windows() {
+    # Terminal-launcher failures (osascript refused, iTerm2 scripting
+    # blocked, permissions prompt dismissed) must NEVER kill start.sh —
+    # the grouped tmux sessions were pre-created above and the user can
+    # always attach manually with `tmux attach -t <session>-{control,agents}`.
+    # Hence `|| true` on every osascript invocation.
     if command -v osascript &>/dev/null && iterm2_is_running; then
         # macOS + iTerm2 (only if actually running)
         osascript -e 'tell application "iTerm2"
             activate
             create window with default profile command "'"${TMUX_CMD_CONTROL}"'"
-        end tell' 2>/dev/null
+        end tell' 2>/dev/null || true
         sleep 1
         osascript -e 'tell application "iTerm2"
             create window with default profile command "'"${TMUX_CMD_AGENTS}"'"
-        end tell' 2>/dev/null
+        end tell' 2>/dev/null || true
         echo "Opened iTerm windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
 
     elif command -v osascript &>/dev/null; then
         # macOS + Terminal.app fallback. Terminal.app doesn't accept a
         # command via `create window`, so we use `do script` which opens
         # a new window and runs the command there.
-        osascript <<APPLESCRIPT 2>/dev/null
+        osascript <<APPLESCRIPT 2>/dev/null || true
 tell application "Terminal"
     activate
     do script "${TMUX_CMD_CONTROL}"
 end tell
 APPLESCRIPT
         sleep 1
-        osascript <<APPLESCRIPT 2>/dev/null
+        osascript <<APPLESCRIPT 2>/dev/null || true
 tell application "Terminal"
     do script "${TMUX_CMD_AGENTS}"
 end tell
