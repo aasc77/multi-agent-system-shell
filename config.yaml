@@ -19,3 +19,21 @@ providers:
   tts:
     backend: piper
     url: http://192.168.1.51:5111
+  # Voice understanding (audio -> text + optional tool_call). Runtime-callable
+  # via orchestrator.providers.voice.get_voice_provider(cfg["providers"]["voice"]).
+  # Switch backends by flipping `backend` -- other keys may stay in place and
+  # are read on-demand. See README "Voice provider" section for the HTTP
+  # contract and the Phi-4 Multimodal swap example.
+  voice:
+    backend: whisper_llm  # voxtral | whisper_llm | phi4_multimodal | null
+    voxtral:
+      url: http://192.168.1.41:5100      # RTX5090 Voxtral endpoint (#16)
+      timeout_seconds: 30
+    whisper_llm:
+      stt_url: http://192.168.1.51:5112  # DGX Whisper /transcribe
+      llm_url: http://192.168.1.51:11434 # DGX Ollama /v1/chat/completions
+      model: qwen3:8b
+      timeout_seconds: 30
+    phi4_multimodal:
+      url: http://192.168.1.41:5100
+      timeout_seconds: 30
