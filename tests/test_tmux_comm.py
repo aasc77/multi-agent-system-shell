@@ -390,6 +390,175 @@ class TestRegularAgentLabelResolution:
 
 
 # ===========================================================================
+# 1c. LAZY @LABEL RESCAN -- startup race self-heal
+# ===========================================================================
+
+
+class TestLazyLabelRescan:
+    """``TmuxComm`` can be constructed before ``start.sh`` has set
+    ``@label`` attributes on the agent panes. When that happens the
+    initial scan returns an empty label map, every agent falls
+    through to config-order indices, and every subsequent nudge
+    goes to the wrong pane. The fix: re-scan on demand via
+    ``_maybe_refresh_pane_mapping`` so the mapping heals itself once
+    labels are present.
+    """
+
+    def _base_config(self):
+        return {
+            "tmux": {
+                "session_name": "remote-test",
+                "nudge_prompt": "check",
+                "nudge_cooldown_seconds": 30,
+                "max_nudge_retries": 20,
+            },
+            "agents": {
+                "hub": {"runtime": "claude_code", "label": "dev"},
+                "macmini": {"runtime": "claude_code", "label": "macmini (qa)"},
+                "hassio": {"runtime": "claude_code"},
+                "RTX5090": {"runtime": "claude_code", "label": "RTX5090"},
+                "dgx": {"runtime": "claude_code", "label": "dgx1"},
+                "dgx2": {"runtime": "claude_code"},
+            },
+        }
+
+    def test_get_target_rescans_after_ttl_and_adopts_new_labels(self):
+        """Startup race: scan is empty at ``__init__`` time (fallback
+        mapping applied), then labels appear. The next ``get_target``
+        call past the TTL re-scans and adopts the live layout."""
+        from unittest.mock import patch
+        # At init: no labels -> fallback config-order mapping.
+        # After init: labels present -> label-based mapping.
+        live_labels = {
+            "dev": 0,
+            "hassio": 1,
+            "dgx1": 2,
+            "macmini (qa)": 3,
+            "RTX5090": 4,
+            "dgx2": 5,
+        }
+        scan_results = [{}, live_labels]
+        def fake_scan(self, window):
+            return scan_results.pop(0) if scan_results else live_labels
+
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels", fake_scan,
+        ):
+            comm = TmuxComm(self._base_config())
+            # Confirm the stale fallback mapping is the one #68 warned
+            # about: macmini == 1 (hassio's pane in the live layout).
+            stale = comm.get_pane_mapping()
+            assert stale["macmini"] == 1
+
+            # Age the cache past TTL, then resolve. This should trigger
+            # the rescan and adopt the live labels.
+            from orchestrator.tmux_comm import _PANE_MAPPING_REFRESH_TTL_SEC
+            comm._pane_mapping_refreshed_at -= (
+                _PANE_MAPPING_REFRESH_TTL_SEC + 1
+            )
+            target = comm.get_target("macmini")
+        assert target == "remote-test:agents.3", (
+            "After rescan, macmini must resolve to its @label pane (3), "
+            f"not the stale fallback pane (1); got {target}"
+        )
+        assert comm.get_pane_mapping()["hassio"] == 1
+        assert comm.get_pane_mapping()["dgx2"] == 5
+
+    def test_rescan_respects_ttl_and_skips_within_window(self):
+        """Inside the TTL window the rescan is a no-op, so a single
+        burst of ``get_target`` calls triggers one scan at most
+        (the one in ``__init__``)."""
+        from unittest.mock import patch
+        calls = {"n": 0}
+        def counting_scan(self, window):
+            calls["n"] += 1
+            return {"dev": 0, "macmini (qa)": 3}
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels", counting_scan,
+        ):
+            comm = TmuxComm(self._base_config())
+            # One scan for agents + one for control (monitors).
+            init_calls = calls["n"]
+            # A tight burst must not rescan.
+            for _ in range(5):
+                comm.get_target("hub")
+            comm.get_target("macmini")
+        assert calls["n"] == init_calls, (
+            f"Expected no rescan inside TTL; "
+            f"counted {calls['n'] - init_calls} extra scan(s)."
+        )
+
+    def test_transient_empty_scan_does_not_regress_healthy_mapping(self):
+        """QA flag on PR #92: a transient ``tmux list-panes`` failure
+        returns ``{}``. Without a guard, the refresh would rebuild
+        the mapping from pure config-order fallback and stomp the
+        healthy post-startup label-based mapping for up to one TTL
+        window. Empty-scan guard: skip the swap when the scan came
+        back empty, keep the existing mapping, let the next TTL
+        window retry."""
+        from unittest.mock import patch
+        live_labels = {
+            "dev": 0,
+            "hassio": 1,
+            "dgx1": 2,
+            "macmini (qa)": 3,
+            "RTX5090": 4,
+            "dgx2": 5,
+        }
+        # 1st scan (__init__): healthy labels.
+        # 2nd scan (refresh): transient failure — empty.
+        scans = [live_labels, {}]
+        def scripted_scan(self, window):
+            return scans.pop(0) if scans else {}
+
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels", scripted_scan,
+        ):
+            comm = TmuxComm(self._base_config())
+            healthy = dict(comm.get_pane_mapping())
+            # Force the refresh branch.
+            from orchestrator.tmux_comm import _PANE_MAPPING_REFRESH_TTL_SEC
+            comm._pane_mapping_refreshed_at -= (
+                _PANE_MAPPING_REFRESH_TTL_SEC + 1
+            )
+            comm.get_target("macmini")
+        assert comm.get_pane_mapping() == healthy, (
+            "empty scan must NOT regress a healthy mapping to the "
+            "config-order fallback — that is the pre-#92 misrouting "
+            "scenario we are trying to avoid.\n"
+            f"  before: {healthy}\n  after: {comm.get_pane_mapping()}"
+        )
+
+    def test_rescan_is_silent_when_mapping_unchanged(self, caplog):
+        """No log spam when the rescan returns the same mapping."""
+        import logging
+        from unittest.mock import patch
+        stable_labels = {
+            "dev": 0, "macmini (qa)": 1, "hassio": 2,
+            "RTX5090": 3, "dgx1": 4, "dgx2": 5,
+        }
+        with patch.object(
+            TmuxComm, "_scan_window_pane_labels",
+            return_value=stable_labels,
+        ):
+            comm = TmuxComm(self._base_config())
+            from orchestrator.tmux_comm import _PANE_MAPPING_REFRESH_TTL_SEC
+            comm._pane_mapping_refreshed_at -= (
+                _PANE_MAPPING_REFRESH_TTL_SEC + 1
+            )
+            with caplog.at_level(logging.INFO, logger="orchestrator.tmux_comm"):
+                comm.get_target("hub")
+        refresh_logs = [
+            r for r in caplog.records
+            if "Pane mapping refreshed" in r.getMessage()
+        ]
+        assert refresh_logs == [], (
+            "rescan must not log when mapping is unchanged; "
+            f"got: {[r.getMessage() for r in refresh_logs]}"
+        )
+
+
+# ===========================================================================
 # 2. CANONICAL TARGET FORMAT
 # ===========================================================================
 

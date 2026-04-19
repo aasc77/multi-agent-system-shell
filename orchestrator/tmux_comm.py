@@ -153,6 +153,13 @@ _SEND_KEYS_DELAY = 0.3       # seconds between text and Enter
 _VERIFY_DELAY = 0.5           # seconds before verifying delivery
 _RETRY_DELAY = 1.0            # seconds between retry attempts
 
+# Pane @label rescan cadence. Small enough to self-heal from the
+# start.sh ordering race (orch launches before agent panes are
+# labeled) on the first post-boot resolution; large enough that
+# steady-state nudging costs one tmux list-panes call per window,
+# not per nudge. See the startup-race note on ``_build_pane_mapping``.
+_PANE_MAPPING_REFRESH_TTL_SEC = 10
+
 # tmux window name for agent panes (matches start.sh convention)
 _AGENTS_WINDOW = "agents"
 
@@ -219,21 +226,24 @@ class TmuxComm:
         #   label_to_index[agent_label]   (preferred)
         #     > label_to_index[agent_name]  (name-as-label fallback)
         #     > config_order_index           (no live tmux / tests)
-        pane_agents = [
+        #
+        # The mapping is rebuilt lazily on demand via
+        # ``_maybe_refresh_pane_mapping`` to self-heal from the
+        # start.sh startup race: the orchestrator can be launched
+        # before agent panes have their ``@label`` attributes set,
+        # which forces every agent through the config-order fallback
+        # and silently misroutes every subsequent nudge to the wrong
+        # pane. The initial build preserves the existing contract
+        # (tests and snapshot observers expect a mapping to exist
+        # right after ``__init__``); the refresh picks up the live
+        # labels once they appear.
+        self._pane_agents: list[tuple[str, dict]] = [
             (name, cfg if isinstance(cfg, dict) else {})
             for name, cfg in config[_CFG_AGENTS].items()
             if not (isinstance(cfg, dict) and cfg.get("role") == "monitor")
         ]
-        label_to_index = self._scan_agents_pane_labels()
-        self._pane_mapping: dict[str, int] = {}
-        for fallback_idx, (name, agent_cfg) in enumerate(pane_agents):
-            configured_label = agent_cfg.get("label", name)
-            idx = label_to_index.get(configured_label)
-            if idx is None:
-                idx = label_to_index.get(name)
-            if idx is None:
-                idx = fallback_idx
-            self._pane_mapping[name] = idx
+        self._pane_mapping: dict[str, int] = self._build_pane_mapping()
+        self._pane_mapping_refreshed_at: float = time.time()
 
         # Monitor agents live in the control window.  Rather than hardcode
         # pane indices (which break if the user rearranges the layout),
@@ -339,6 +349,81 @@ class TmuxComm:
                 continue
         return mapping
 
+    def _build_pane_mapping(
+        self,
+        label_to_index: dict[str, int] | None = None,
+    ) -> dict[str, int]:
+        """Return a fresh agent→pane-index mapping.
+
+        When *label_to_index* is ``None`` the method scans the live
+        tmux state. Refresh callers scan themselves (to distinguish
+        an empty scan from a genuine no-change) and pass the result
+        in; the ``__init__`` path leaves it ``None`` so the scan
+        happens here.
+
+        Precedence per agent is unchanged:
+        ``label_to_index[configured_label]``
+        > ``label_to_index[agent_name]``
+        > config-order index.
+        """
+        if label_to_index is None:
+            label_to_index = self._scan_agents_pane_labels()
+        mapping: dict[str, int] = {}
+        for fallback_idx, (name, agent_cfg) in enumerate(self._pane_agents):
+            configured_label = agent_cfg.get("label", name)
+            idx = label_to_index.get(configured_label)
+            if idx is None:
+                idx = label_to_index.get(name)
+            if idx is None:
+                idx = fallback_idx
+            mapping[name] = idx
+        return mapping
+
+    def _maybe_refresh_pane_mapping(self) -> None:
+        """Re-scan ``@labels`` and adopt the new mapping if it changed.
+
+        Self-heals the start.sh ordering race: TmuxComm can be
+        constructed before the agents-window panes have their
+        ``@label`` attributes set. The initial scan returns an empty
+        label map, every agent falls through to config-order indices,
+        and every subsequent nudge ends up in the wrong pane. Once
+        start.sh finishes labeling the panes, the next resolution
+        picks up the live layout without requiring an orchestrator
+        bounce.
+
+        Empty-scan guard: a transient ``tmux list-panes`` failure
+        (tmux server busy, socket race, signal interruption, …)
+        makes the scan return ``{}``. Treating that as ground truth
+        would rebuild the mapping from pure config-order fallback
+        and stomp the healthy mapping for up to one TTL window.
+        Skip the swap in that case — a stale correct mapping beats a
+        freshly-computed wrong one. The TTL still ticks, so the
+        next retry happens on the next ``get_target`` past the
+        cooldown.
+
+        Cost: one ``tmux list-panes`` call per
+        ``_PANE_MAPPING_REFRESH_TTL_SEC`` window, regardless of how
+        many ``get_target`` calls happen in between. The actual dict
+        swap is only logged/applied when the mapping would change,
+        so steady-state produces no log spam.
+        """
+        now = time.time()
+        if (now - self._pane_mapping_refreshed_at
+                < _PANE_MAPPING_REFRESH_TTL_SEC):
+            return
+        self._pane_mapping_refreshed_at = now
+        label_to_index = self._scan_agents_pane_labels()
+        if not label_to_index:
+            # Transient scan failure — don't regress to config-order.
+            return
+        new_mapping = self._build_pane_mapping(label_to_index)
+        if new_mapping != self._pane_mapping:
+            logger.info(
+                "Pane mapping refreshed via @label rescan: %s -> %s",
+                self._pane_mapping, new_mapping,
+            )
+            self._pane_mapping = new_mapping
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -356,6 +441,7 @@ class TmuxComm:
         Raises:
             TmuxCommError: If *agent* is not in any pane mapping.
         """
+        self._maybe_refresh_pane_mapping()
         if agent in self._pane_mapping:
             return f"{self._session_name}:{_AGENTS_WINDOW}.{self._pane_mapping[agent]}"
         if agent in self._control_pane_mapping:
