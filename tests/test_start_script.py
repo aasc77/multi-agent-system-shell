@@ -41,6 +41,7 @@ Test categories:
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1495,3 +1496,113 @@ class TestProviderSubstitution:
         )
         # No raw provider placeholder survives.
         assert "{{providers.stt.url}}" not in output
+
+
+# ===========================================================================
+# Grouped-session pre-create regression guard
+#
+# Context: PR #48 added `tmux new-session -d -A -s ${SESSION_NAME}-{control,
+# agents} -t ${SESSION_NAME}` calls in start.sh so the grouped sessions exist
+# BEFORE the terminal-launcher (iTerm2 / Terminal.app / wt.exe) tries to
+# attach them. Without that pre-create, the grouped sessions only come into
+# existence if and when the terminal launcher succeeds — and on Terminal.app-
+# only macOS hosts, the iTerm2 osascript silently no-ops, leaving the user
+# with `tmux attach -t <session>-control` returning "can't find session".
+#
+# This fix was subsequently regressed when another feature branch was merged
+# forward from a pre-PR-#48 base, silently re-overwriting start.sh with the
+# older pattern. This structural test fires on every PR (no INTEGRATION gate)
+# so a future regression fails CI instead of only being caught when the user
+# tries to attach and it does not work.
+#
+# What we assert: the exact two `new-session -d -A -s ...-{control,agents}`
+# lines are present. We do NOT pin the surrounding select-window lines or the
+# exact whitespace — that would be too brittle — but the pre-create intent
+# must be clear from the file contents.
+# ===========================================================================
+
+
+class TestGroupedSessionPreCreateRegression:
+    """Pre-create regression guard for the grouped tmux sessions."""
+
+    def test_pre_create_control_grouped_session(self):
+        """``start.sh`` must pre-create ``${SESSION_NAME}-control`` detached.
+
+        Regression: without ``new-session -d -A -s ${SESSION_NAME}-control``,
+        ``tmux attach -t remote-test-control`` returns "can't find session"
+        for Terminal.app users (iTerm2 osascript silent-fail path).
+        """
+        with open(START_SCRIPT, "r") as f:
+            content = f.read()
+
+        # Match: `new-session -d -A -s "${SESSION_NAME}-control"` with
+        # optional whitespace and optional quoting around the name. We also
+        # accept ``\$\{SESSION_NAME\}`` without braces just in case someone
+        # removes the braces in a refactor.
+        assert re.search(
+            r"new-session\s+-d\s+-A\s+-s\s+[\"']?\$\{?SESSION_NAME\}?-control[\"']?",
+            content,
+        ), (
+            "start.sh must pre-create the ${SESSION_NAME}-control grouped "
+            "session detached via `tmux new-session -d -A -s "
+            "${SESSION_NAME}-control -t ${SESSION_NAME}`. Without this, "
+            "Terminal.app users hit \"can't find session: <session>-control\" "
+            "every time they run start.sh."
+        )
+
+    def test_pre_create_agents_grouped_session(self):
+        """``start.sh`` must pre-create ``${SESSION_NAME}-agents`` detached.
+
+        Same regression path as the control test — both grouped sessions
+        need to exist before the terminal launcher runs.
+        """
+        with open(START_SCRIPT, "r") as f:
+            content = f.read()
+
+        assert re.search(
+            r"new-session\s+-d\s+-A\s+-s\s+[\"']?\$\{?SESSION_NAME\}?-agents[\"']?",
+            content,
+        ), (
+            "start.sh must pre-create the ${SESSION_NAME}-agents grouped "
+            "session detached via `tmux new-session -d -A -s "
+            "${SESSION_NAME}-agents -t ${SESSION_NAME}`. Without this, "
+            "Terminal.app users hit \"can't find session: <session>-agents\" "
+            "every time they run start.sh."
+        )
+
+    def test_pre_create_happens_before_terminal_launcher(self):
+        """The pre-create calls must run BEFORE ``open_two_windows``.
+
+        If the pre-create lines live inside ``open_two_windows`` (the iTerm2/
+        Terminal.app launcher), they only fire on the branch that runs, which
+        re-introduces the original regression for any host that does not
+        match that branch. This test pins the ordering: both
+        ``new-session -d -A`` lines must appear before the ``open_two_windows()``
+        function definition.
+        """
+        with open(START_SCRIPT, "r") as f:
+            content = f.read()
+
+        launcher_start = content.find("open_two_windows()")
+        assert launcher_start != -1, (
+            "open_two_windows() function not found in start.sh"
+        )
+
+        pre_create_section = content[:launcher_start]
+
+        assert re.search(
+            r"new-session\s+-d\s+-A\s+-s\s+[\"']?\$\{?SESSION_NAME\}?-control[\"']?",
+            pre_create_section,
+        ), (
+            "The -control grouped-session pre-create must happen BEFORE "
+            "open_two_windows(). Putting it inside the launcher re-introduces "
+            "the Terminal.app-silent-fail regression."
+        )
+        assert re.search(
+            r"new-session\s+-d\s+-A\s+-s\s+[\"']?\$\{?SESSION_NAME\}?-agents[\"']?",
+            pre_create_section,
+        ), (
+            "The -agents grouped-session pre-create must happen BEFORE "
+            "open_two_windows(). Putting it inside the launcher re-introduces "
+            "the Terminal.app-silent-fail regression."
+        )

@@ -925,9 +925,37 @@ ${TMUX_BIN} kill-session -t "${SESSION_NAME}-agents"  2>/dev/null || true
 TMUX_CMD_CONTROL="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-control -t ${SESSION_NAME} \; select-window -t ${CONTROL_WINDOW}"
 TMUX_CMD_AGENTS="${TMUX_BIN} new-session -A -s ${SESSION_NAME}-agents -t ${SESSION_NAME} \; select-window -t ${AGENTS_WINDOW}"
 
+# Create the grouped sessions DETACHED first so they exist regardless of
+# whether we can pop a terminal window to attach them. Without this,
+# Terminal.app users (where the iTerm2 osascript silently fails) end up
+# with no grouped sessions at all and `tmux attach -t <session>-control`
+# returns "can't find session". The `-d` flag keeps them detached; the
+# terminal-launch commands below then just attach to these pre-existing
+# sessions instead of creating them on first launch.
+#
+# select-window pins each session to the right window on first attach —
+# otherwise both sessions land on the primary's active window and
+# `tmux attach -t <session>-agents` opens on the control pane.
+#
+# REGRESSION GUARD: tests/integration/test_start_grouped_sessions_smoke.py
+# asserts both grouped sessions exist after start.sh returns. Any future
+# change that drops these two new-session calls will fail that test.
+${TMUX_BIN} new-session -d -A -s "${SESSION_NAME}-control" -t "${SESSION_NAME}" 2>/dev/null || true
+${TMUX_BIN} select-window -t "${SESSION_NAME}-control:${CONTROL_WINDOW}" 2>/dev/null || true
+${TMUX_BIN} new-session -d -A -s "${SESSION_NAME}-agents"  -t "${SESSION_NAME}" 2>/dev/null || true
+${TMUX_BIN} select-window -t "${SESSION_NAME}-agents:${AGENTS_WINDOW}"   2>/dev/null || true
+
+# Detect whether iTerm2 is actually running (not just installed) so we
+# can fall back to Terminal.app on systems that use it as the default.
+# osascript to a non-running iTerm2 fails silently, which is the bug
+# that leaves Terminal.app users with no attached windows.
+iterm2_is_running() {
+    osascript -e 'tell application "System Events" to (name of processes) contains "iTerm2"' 2>/dev/null | grep -q true
+}
+
 open_two_windows() {
-    if command -v osascript &>/dev/null; then
-        # macOS + iTerm2
+    if command -v osascript &>/dev/null && iterm2_is_running; then
+        # macOS + iTerm2 (only if actually running)
         osascript -e 'tell application "iTerm2"
             activate
             create window with default profile command "'"${TMUX_CMD_CONTROL}"'"
@@ -937,6 +965,24 @@ open_two_windows() {
             create window with default profile command "'"${TMUX_CMD_AGENTS}"'"
         end tell' 2>/dev/null
         echo "Opened iTerm windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
+
+    elif command -v osascript &>/dev/null; then
+        # macOS + Terminal.app fallback. Terminal.app doesn't accept a
+        # command via `create window`, so we use `do script` which opens
+        # a new window and runs the command there.
+        osascript <<APPLESCRIPT 2>/dev/null
+tell application "Terminal"
+    activate
+    do script "${TMUX_CMD_CONTROL}"
+end tell
+APPLESCRIPT
+        sleep 1
+        osascript <<APPLESCRIPT 2>/dev/null
+tell application "Terminal"
+    do script "${TMUX_CMD_AGENTS}"
+end tell
+APPLESCRIPT
+        echo "Opened Terminal.app windows: ${CONTROL_WINDOW} + ${AGENTS_WINDOW}"
 
     elif command -v wt.exe &>/dev/null; then
         # Windows Terminal (WSL)
