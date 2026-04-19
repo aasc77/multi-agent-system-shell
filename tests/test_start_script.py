@@ -852,15 +852,50 @@ class TestAgentsWindow:
             f"Expected at least 2 split-window for 3 agents, got {split_count}"
         )
 
-    def test_tiled_layout_applied(self):
-        """Agents window must use tmux 'tiled' layout."""
-        env = os.environ.copy()
-        env["_TEST_DRY_RUN"] = "true"
+    def test_layout_equalized_not_tiled(self):
+        """Agents window must use an explicit 2x3 grid (select-layout -E),
+        NOT tmux's `tiled` preset.
 
-        result = _run_start_script("demo", env_overrides=env)
-        output = result.stdout + result.stderr
-        assert "tiled" in output.lower(), (
-            "Agents window must use 'tiled' layout"
+        `tiled` puts 6 panes as 3 columns × 2 rows (landscape). We want
+        2 columns × 3 rows (portrait) so the terminal window is taller
+        than wide and each pane gets enough vertical space for a Claude
+        TUI. `select-layout -E` equalizes cell sizes without switching
+        shape; the shape itself is built by explicit `split-window -h`
+        / `split-window -v` calls in setup_agent_panes().
+
+        Previous revision of this test asserted `tiled` was in the
+        dry-run output — that assertion was made stale by PR #47, which
+        intentionally moved to the 2x3 layout. We switched to a
+        structural assertion against start.sh directly because the
+        dry-run code path short-circuits before reaching the final
+        `select-layout -E` call (the split loop needs a real tmux pane
+        id seed which dry-run doesn't provide).
+        """
+        with open(START_SCRIPT, "r") as f:
+            content = f.read()
+
+        # The good pattern: select-layout -E applied to the agents window.
+        assert re.search(
+            r"select-layout\s+[^\n]*-E[^\n]*\$\{?SESSION_NAME\}?:\$\{?AGENTS_WINDOW\}?",
+            content,
+        ) or re.search(
+            r"select-layout\s+-t\s+[\"']?\$\{?SESSION_NAME\}?:\$\{?AGENTS_WINDOW\}?[\"']?\s+-E",
+            content,
+        ), (
+            "start.sh must finalize the agents window with "
+            "`select-layout -E` to equalize the explicit 2x3 grid. "
+            "If you restored `select-layout tiled`, you also restored "
+            "the landscape 3x2 layout bug PR #47 fixed."
+        )
+
+        # The bad pattern: no `select-layout tiled` directive.
+        assert not re.search(
+            r"select-layout\s+[^\n]*\btiled\b",
+            content,
+        ), (
+            "start.sh must NOT apply `select-layout tiled` to the agents "
+            "window. tiled reshapes 6 panes into 3x2 landscape; we need "
+            "the explicit 2x3 portrait grid from PR #47."
         )
 
 
